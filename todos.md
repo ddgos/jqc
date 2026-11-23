@@ -9,8 +9,13 @@ git. Do these in whichever order makes the most sense.
 
 ## Tasks
 
+Do some preparatory work for the typst document production, involving the nix
+flake. Each report should be in a folder `todo-reports/<summary>/<files...>`.
+This should be the first task.
+
 Analyse the current state of the code, and finish up the refactor that is taking
-place. Commit to keep the working tree clean. This should be the first task.
+place. Commit to keep the working tree clean. This should be the first task once
+the typst document prep is done.
 
 Add safeguards around the more memory intensive tests to ensure that the test
 fails before the test uses a certain amount of memory on the machine it is
