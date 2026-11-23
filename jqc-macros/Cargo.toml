@@ -1,0 +1,14 @@
+[package]
+name = "jqc-macros"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Proc macro that compiles a jq filter into native Rust code"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "3", features = ["full"] }

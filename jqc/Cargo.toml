@@ -1,0 +1,19 @@
+[package]
+name = "jqc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Compile jq filters to native Rust code at build time via the jq! macro"
+
+[dependencies]
+jqc-core = { path = "../jqc-core", version = "0.1.0" }
+jqc-macros = { path = "../jqc-macros", version = "0.1.0" }
+
+[dev-dependencies]
+serde_json = "1"
+proptest = "1"
+criterion = "0.8"
+
+[[bench]]
+name = "compiled_filters"
+harness = false
