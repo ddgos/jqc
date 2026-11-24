@@ -95,14 +95,20 @@ and non-recursive `def` (see limitation below), and builtins: `map`,
   (at a couple of smaller sizes, to keep subprocess-spawn overhead from
   dominating `cargo bench`'s own runtime) showing the per-call cost `jq!`
   avoids by baking the filter in at compile time.
-- `cargo test -p jqc-macros --release -- --ignored <name> --nocapture` --
-  `jqc-macros/src/bench.rs` benchmarks the macro-expansion step itself
-  (wall time via `compile_time_benchmarks`, peak RSS via
-  `peak_memory_benchmarks`, plus two cost-cliff regression checks,
-  `unused_defs_scaling_check` and `scaling_check`). All four cap this
-  process's address space first (default: half of physical RAM, capped at
-  64GiB; override with `JQC_TEST_MEM_LIMIT_GB`) so a regression aborts
-  fast instead of being left to the kernel's OOM reaper.
+- `jqc-macros/src/bench.rs` benchmarks and guards the macro-expansion step
+  itself. `unused_defs_scaling_check` and `scaling_check` -- regression
+  checks for a `def_scope` cost cliff that once blew up to 38GB+ of RSS --
+  run as normal tests (part of `cargo test --workspace`, no flags needed).
+  `compile_time_benchmarks` (wall time) and `peak_memory_benchmarks` (peak
+  RSS) stay behind `cargo test -p jqc-macros --release -- --ignored <name>
+  --nocapture`, since they're diagnostics with no pass/fail assertions,
+  not correctness checks; run `peak_memory_benchmarks` alone (an exact
+  `--ignored` name match), not alongside other `#[ignore]`d tests in the
+  same invocation, since its RSS reading is a per-*process* high-water
+  mark that sibling threads' allocations would otherwise inflate. All four
+  cap this process's address space first (default: half of physical RAM,
+  capped at 64GiB; override with `JQC_TEST_MEM_LIMIT_GB`) so a regression
+  aborts fast instead of being left to the kernel's OOM reaper.
 - `cargo tarpaulin --workspace --out Html --output-dir target/tarpaulin` --
   line coverage from the test suite. Only meaningful for `jqc-core` (the
   runtime support crate): `jqc-macros`' lex/parse/lower/codegen pipeline

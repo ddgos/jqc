@@ -114,25 +114,48 @@ fn compile_time_benchmarks() {
 /// def is ever called. N unused defs should be cheap in a real compiler
 /// (jq's own compile time is ~4ms flat up to 200 unused defs -- see the
 /// investigation this is based on); this checks whether jqc's is.
+///
+/// Was `#[ignore]`d: before `def_scope` became an `Rc` (see `lower.rs`),
+/// this took 38GB+ of RSS and had to be killed by hand well before n=400.
+/// Now bounded and asserted on, it runs as a normal regression test
+/// guarding against that cost cliff coming back.
 #[test]
-#[ignore = "run explicitly: cargo test -p jqc-macros --release -- --ignored unused_defs_scaling_check --nocapture"]
 fn unused_defs_scaling_check() {
     cap_memory();
-    for n in [50, 100, 200, 400] {
-        let mut src = String::new();
-        for i in 0..n {
-            src.push_str(&format!("def unused{i}: .; "));
+    run_with_stack(64 * 1024 * 1024, || {
+        for n in [50, 100, 200, 400] {
+            let mut src = String::new();
+            for i in 0..n {
+                src.push_str(&format!("def unused{i}: .; "));
+            }
+            src.push('.');
+            reset_peak_rss();
+            let start = std::time::Instant::now();
+            compile(&src);
+            let elapsed = start.elapsed();
+            eprintln!("n={n} elapsed={elapsed:?} peak_rss={}", fmt_peak_rss());
+            assert!(
+                elapsed < std::time::Duration::from_secs(5),
+                "n={n} unused defs took {elapsed:?} -- def_scope cost-cliff regression?"
+            );
         }
-        src.push('.');
-        reset_peak_rss();
-        let start = std::time::Instant::now();
-        compile(&src);
-        eprintln!(
-            "n={n} elapsed={:?} peak_rss={}",
-            start.elapsed(),
-            fmt_peak_rss()
-        );
-    }
+    });
+}
+
+/// Runs `f` on a fresh thread with `stack_bytes` of stack, propagating any
+/// panic. `lower()` walks a `def` chain's `rest` once per def recursively,
+/// and in debug/unoptimized builds (where frames aren't shrunk the way
+/// `--release` shrinks them) a few hundred sequential defs can overflow
+/// the default ~8MB thread stack well short of where it would under
+/// `--release` -- confirmed by `unused_defs_scaling_check` aborting with
+/// a stack overflow at n=100 in a debug build before this was added.
+fn run_with_stack(stack_bytes: usize, f: impl FnOnce() + Send + 'static) {
+    std::thread::Builder::new()
+        .stack_size(stack_bytes)
+        .spawn(f)
+        .expect("spawn thread")
+        .join()
+        .expect("thread panicked");
 }
 
 /// Peak resident set size (kB) this process has reached so far, via Linux's
@@ -173,6 +196,14 @@ fn fmt_peak_rss() -> String {
 /// costs at runtime. Only meaningful run one fixture at a time (not under
 /// Criterion's repeated-iteration sampling), since `reset_peak_rss` would
 /// otherwise just measure the high-water mark across many iterations.
+///
+/// Also run this test *alone*, not alongside `scaling_check` or
+/// `unused_defs_scaling_check` (e.g. via `--ignored` with no name filter,
+/// which runs every ignored test): `VmHWM` is a per-*process* counter, and
+/// the default test harness runs multiple test functions concurrently as
+/// threads in one process, so a sibling test's allocations inflate this
+/// one's reading. Invoke with `--exact bench::peak_memory_benchmarks` (or
+/// any single matching name) to avoid that.
 #[test]
 #[ignore = "run explicitly: cargo test -p jqc-macros --release -- --ignored peak_memory_benchmarks --nocapture"]
 fn peak_memory_benchmarks() {
@@ -193,11 +224,16 @@ fn peak_memory_benchmarks() {
 /// the per-level cost grows too. Measured wall-clock time roughly doubled
 /// per level up to depth 5, then the ratio itself started climbing
 /// (2.7x, then 4.6x at depth 7); depth 8 was still running after 2.5
-/// minutes and over 30GB of RSS when killed. Capped at 6 here (~30s total)
-/// -- do not raise this without raising `cap_memory`'s limit too, it is
-/// not a typo.
+/// minutes and over 30GB of RSS when killed. Capped at 6 here (~30s total,
+/// pre-fix) -- do not raise this without raising `cap_memory`'s limit too,
+/// it is not a typo. (Depth 6 now completes in single-digit milliseconds
+/// post-fix; the cap stays as a backstop, not because depth 6 is still
+/// expensive.)
+///
+/// Was `#[ignore]`d: the `def_scope` fix that sped this up (see `lower.rs`)
+/// also removed the reason it needed manual, careful invocation. Now
+/// bounded and asserted on, it runs as a normal regression test.
 #[test]
-#[ignore = "run explicitly: cargo test -p jqc-macros --release -- --ignored scaling_check --nocapture"]
 fn scaling_check() {
     cap_memory();
     for depth in 1..=6 {
@@ -210,10 +246,14 @@ fn scaling_check() {
         reset_peak_rss();
         let start = std::time::Instant::now();
         compile(&src);
+        let elapsed = start.elapsed();
         eprintln!(
-            "depth={depth} elapsed={:?} peak_rss={}",
-            start.elapsed(),
+            "depth={depth} elapsed={elapsed:?} peak_rss={}",
             fmt_peak_rss()
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "depth={depth} took {elapsed:?} -- def_scope cost-cliff regression?"
         );
     }
 }

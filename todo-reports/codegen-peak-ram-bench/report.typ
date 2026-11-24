@@ -45,24 +45,47 @@ number to report.
 
 = Results (this run, post def_scope fix)
 
+Each test below was run *alone* (`cargo test -p jqc-macros --release --
+--ignored --exact bench::<name> --nocapture`), not alongside the other
+`#[ignore]`d memory tests. `VmHWM` is a per-*process* counter, and Rust's
+default test harness runs multiple test functions concurrently as
+threads within one process -- running several of these benchmarks
+together inflates each one's reading with sibling threads' allocations.
+(An earlier draft of this report mistakenly used numbers from exactly
+that kind of combined run; the figures below replace them.)
+
 #table(
   columns: 2,
   align: (left, right),
   [*fixture*], [*peak RSS*],
-  [trivial], [5.9 MB],
-  [field\_chain], [6.6 MB],
-  [pipeline], [8.0 MB],
-  [prelude\_heavy], [8.6 MB],
-  [defs\_non\_recursive], [10.4 MB],
-  [recursive\_def], [10.9 MB],
+  [trivial], [5,372 KB],
+  [field\_chain], [5,400 KB],
+  [pipeline], [5,428 KB],
+  [prelude\_heavy], [5,444 KB],
+  [defs\_non\_recursive], [5,532 KB],
+  [recursive\_def], [5,532 KB],
 )
 
 #table(
   columns: 3,
   align: (left, right, right),
-  [*scaling check*], [*size*], [*peak RSS*],
-  [unused defs], [400], [44.7 MB],
-  [recursive-doubling depth], [6], [23.8 MB],
+  [*unused defs (n)*], [*peak RSS*], [],
+  [50], [7,212 KB], [],
+  [100], [9,916 KB], [],
+  [200], [17,756 KB], [],
+  [400], [43,896 KB], [],
+)
+
+#table(
+  columns: 2,
+  align: (left, right),
+  [*recursive-doubling depth*], [*peak RSS*],
+  [1], [5,440 KB],
+  [2], [5,492 KB],
+  [3], [5,552 KB],
+  [4], [5,596 KB],
+  [5], [5,880 KB],
+  [6], [6,480 KB],
 )
 
 All comfortably within normal process overhead -- a useful baseline now
@@ -73,5 +96,5 @@ state.
 
 = Verification
 
-`cargo build/test/clippy/fmt --workspace` all pass; the new and modified
-tests were run directly and produced the table above.
+`cargo build/test/clippy/fmt --workspace` all pass; each test above was
+run in isolation and produced the tables above.
