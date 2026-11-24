@@ -22,9 +22,6 @@ theory be tested. Do not stop until both of these are true.
 Identify some area of the code that could be tidied up, and refactor as desired.
 Do not remove this task until the code is as polished as possible.
 
-Look for opportunities to use SIMD optimisation techniques. Implement as a
-new implementation of the codegen trait.
-
 Persue whatever optimisations possible. Always keep as separate implementations
 of the trait so that comparisons between implementations are easier to make.
 

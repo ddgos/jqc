@@ -30,7 +30,7 @@ use crate::error::{JResult, JqError};
 /// succeeds between 500 and 10000), not merely a cosmetic one, but a
 /// clean, catchable error is still the correct trade against a hard
 /// process-ending stack overflow.
-const MAX_STRUCTURAL_DEPTH: u32 = 500;
+pub(crate) const MAX_STRUCTURAL_DEPTH: u32 = 500;
 
 pub fn type_name(v: &Value) -> &'static str {
     match v {

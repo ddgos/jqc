@@ -19,23 +19,64 @@ use crate::diagnostics::{closest_match, Diagnostic, KNOWN_NAMES};
 pub type CResult<T> = Result<T, Diagnostic>;
 
 /// A backend that turns a lowered jq AST into the Rust `TokenStream` that
-/// `jq!` expands to. [`TreeWalkCodegen`] below is the only implementation
-/// today; the trait exists so alternative backends (SIMD, multi-core --
-/// see `todos.md`) can be added as separate implementations without
-/// touching this one, and compared against it on equal footing.
+/// `jq!` expands to. [`TreeWalkCodegen`] is the default; [`SimdCodegen`]
+/// (selected via `jq!(codegen = "simd", ...)`) produces identical output
+/// for every construct *except* `ascii_downcase`/`ascii_upcase`/
+/// `contains`, which it routes to explicit-SIMD/`memchr`-backed
+/// `jqc-core` implementations instead of the plain scalar ones -- see
+/// `jqc-core/src/simd.rs`'s module doc and the `simd-codegen` todo-report
+/// for why those specific builtins, and why this doesn't attempt a
+/// wholesale SIMD reinterpretation of jq's (inherently branchy,
+/// heterogeneously-typed) semantics.
 pub trait Codegen {
     fn compile_top(&self, expr: &Expr) -> CResult<TokenStream>;
 }
 
-/// The default (and currently only) backend: a direct, recursive tree-walk
-/// that compiles each AST node into nested Rust loops over `Vec<Value>`,
-/// one node at a time, matching jq's cartesian-product generator semantics
-/// structurally in the generated control flow.
+/// Which `jqc-core` function backs a handful of builtins whose
+/// implementation varies by [`Codegen`] backend -- `ascii_downcase`/
+/// `ascii_upcase`/`contains` today, the only ones `compile_call`
+/// actually consults this for. A thread-local (set once, at the top of
+/// `compile_top`, rather than threaded as a parameter through every one
+/// of `compile`/`compile_raw`/`compile_call`'s ~100 recursive call
+/// sites, the overwhelming majority of which have no reason to care
+/// which backend is active) -- sound because macro expansion is single-
+/// threaded per invocation and this is set, read, and reset within one
+/// `compile_top` call, never observed across calls or threads.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Backend {
+    TreeWalk,
+    Simd,
+}
+
+thread_local! {
+    static BACKEND: std::cell::Cell<Backend> = const { std::cell::Cell::new(Backend::TreeWalk) };
+}
+
+/// The default backend: a direct, recursive tree-walk that compiles each
+/// AST node into nested Rust loops over `Vec<Value>`, one node at a time,
+/// matching jq's cartesian-product generator semantics structurally in
+/// the generated control flow.
 pub struct TreeWalkCodegen;
 
 impl Codegen for TreeWalkCodegen {
     fn compile_top(&self, expr: &Expr) -> CResult<TokenStream> {
+        BACKEND.with(|b| b.set(Backend::TreeWalk));
         compile_top(expr)
+    }
+}
+
+/// As [`TreeWalkCodegen`], except `ascii_downcase`/`ascii_upcase`/
+/// `contains` route to `jqc-core`'s SIMD/`memchr`-backed implementations
+/// instead of the plain scalar ones -- see this module's own doc
+/// comment.
+pub struct SimdCodegen;
+
+impl Codegen for SimdCodegen {
+    fn compile_top(&self, expr: &Expr) -> CResult<TokenStream> {
+        BACKEND.with(|b| b.set(Backend::Simd));
+        let result = compile_top(expr);
+        BACKEND.with(|b| b.set(Backend::TreeWalk));
+        result
     }
 }
 
@@ -1030,8 +1071,13 @@ fn compile_call(
         ("fabs", 0) => simple_unary("fabs_value", input),
         ("explode", 0) => simple_unary("explode", input),
         ("implode", 0) => simple_unary("implode", input),
-        ("ascii_downcase", 0) => simple_unary("ascii_downcase", input),
-        ("ascii_upcase", 0) => simple_unary("ascii_upcase", input),
+        ("ascii_downcase", 0) => simple_unary(
+            backend_fn_name("ascii_downcase", "simd_ascii_downcase"),
+            input,
+        ),
+        ("ascii_upcase", 0) => {
+            simple_unary(backend_fn_name("ascii_upcase", "simd_ascii_upcase"), input)
+        }
         ("tonumber", 0) => simple_unary("to_number_value", input),
         ("tostring", 0) => {
             let f = core_path("to_string_value");
@@ -1060,7 +1106,7 @@ fn compile_call(
         // As above, but `contains_value` returns `JResult<bool>` rather
         // than `JResult<Value>`, needing the extra `.map`.
         ("contains", 1) => {
-            let f = core_path("contains_value");
+            let f = core_path(backend_fn_name("contains_value", "simd_contains_value"));
             cartesian_args(args, input, scope, |a| {
                 let arg = &a[0];
                 quote!(#f(#input, &#arg).map(#value_ty::Bool))
@@ -1107,6 +1153,17 @@ fn compile_call(
             };
             Err(err)
         }
+    }
+}
+
+/// Picks `simd_name` under [`SimdCodegen`], `scalar_name` under
+/// [`TreeWalkCodegen`] -- the only place `compile_call` consults
+/// [`BACKEND`], for the handful of builtins (`ascii_downcase`/
+/// `ascii_upcase`/`contains`) `SimdCodegen` implements differently.
+fn backend_fn_name(scalar_name: &'static str, simd_name: &'static str) -> &'static str {
+    match BACKEND.with(|b| b.get()) {
+        Backend::TreeWalk => scalar_name,
+        Backend::Simd => simd_name,
     }
 }
 

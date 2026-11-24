@@ -11,6 +11,12 @@
 //! `jq-1-7`, `jq-1-8`, on `jqc`/`jqc-macros`/`jqc-compiler`); naming a
 //! version whose feature isn't enabled is a compile error.
 //!
+//! `jq!(codegen = "simd", "<filter>")` selects `jqc_compiler::codegen`'s
+//! `SimdCodegen` instead of the default `TreeWalkCodegen` -- identical
+//! output except for `ascii_downcase`/`ascii_upcase`, which it backs
+//! with an explicit-SIMD `jqc-core` implementation. `version` and
+//! `codegen` can both be given, in either order, before the filter.
+//!
 //! Requires the `jqc` crate (not just this one) as a dependency, since the
 //! generated code references `::jqc::core::*`.
 //!
@@ -26,41 +32,45 @@ use proc_macro2::Span;
 use syn::parse::{Parse, ParseStream};
 use syn::{LitStr, Token};
 
-use jqc_compiler::codegen::{Codegen, TreeWalkCodegen};
+use jqc_compiler::codegen::{Codegen, SimdCodegen, TreeWalkCodegen};
 use jqc_compiler::lower;
 use jqc_compiler::version::JqVersion;
 
-/// `jq!("filter")` or `jq!(version = "X.Y", "filter")`.
+/// `jq!("filter")`, `jq!(version = "X.Y", "filter")`,
+/// `jq!(codegen = "simd", "filter")`, or both (in either order) before
+/// the filter.
 struct MacroInput {
     version: Option<LitStr>,
+    codegen: Option<LitStr>,
     filter: LitStr,
 }
 
 impl Parse for MacroInput {
     fn parse(input: ParseStream) -> syn::Result<Self> {
-        if input.peek(syn::Ident) && input.peek2(Token![=]) {
+        let mut version = None;
+        let mut codegen = None;
+        while input.peek(syn::Ident) && input.peek2(Token![=]) {
             let ident: syn::Ident = input.parse()?;
-            if ident != "version" {
+            input.parse::<Token![=]>()?;
+            let value: LitStr = input.parse()?;
+            input.parse::<Token![,]>()?;
+            if ident == "version" {
+                version = Some(value);
+            } else if ident == "codegen" {
+                codegen = Some(value);
+            } else {
                 return Err(syn::Error::new(
                     ident.span(),
-                    format!("jq!: unexpected argument '{ident}', expected 'version'"),
+                    format!("jq!: unexpected argument '{ident}', expected 'version' or 'codegen'"),
                 ));
             }
-            input.parse::<Token![=]>()?;
-            let version: LitStr = input.parse()?;
-            input.parse::<Token![,]>()?;
-            let filter: LitStr = input.parse()?;
-            Ok(MacroInput {
-                version: Some(version),
-                filter,
-            })
-        } else {
-            let filter: LitStr = input.parse()?;
-            Ok(MacroInput {
-                version: None,
-                filter,
-            })
         }
+        let filter: LitStr = input.parse()?;
+        Ok(MacroInput {
+            version,
+            codegen,
+            filter,
+        })
     }
 }
 
@@ -128,6 +138,22 @@ pub fn jq(input: TokenStream) -> TokenStream {
         .into();
     }
 
+    let backend: Box<dyn Codegen> = match &parsed.codegen {
+        None => Box::new(TreeWalkCodegen),
+        Some(lit) => match lit.value().as_str() {
+            "treewalk" => Box::new(TreeWalkCodegen),
+            "simd" => Box::new(SimdCodegen),
+            other => {
+                return syn::Error::new(
+                    lit.span(),
+                    format!("jq!: unknown codegen backend {other:?} (supported: \"treewalk\", \"simd\")"),
+                )
+                .to_compile_error()
+                .into();
+            }
+        },
+    };
+
     let src = parsed.filter.value();
     // parse_and_lower's own errors come back already relocated to `src`'s
     // coordinates; compile_top's don't, since it runs after
@@ -137,7 +163,7 @@ pub fn jq(input: TokenStream) -> TokenStream {
     let compiled = match lower::parse_and_lower(&src, version) {
         Ok(ast) => {
             let (offset, len) = lower::user_src_window(&src);
-            TreeWalkCodegen
+            backend
                 .compile_top(&ast)
                 .map_err(|e| e.relocate(offset, len))
         }

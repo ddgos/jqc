@@ -399,6 +399,54 @@ fn bench_recurse(c: &mut Criterion) {
     group.finish();
 }
 
+/// Compares `TreeWalkCodegen` (the default) against `SimdCodegen`
+/// (`jq!(codegen = "simd", ...)`) for `ascii_downcase` -- the one
+/// builtin they actually implement differently (see
+/// `jqc-core/src/simd.rs`'s doc comment) -- over ASCII strings of
+/// increasing length, the regime SIMD's fixed per-element setup cost
+/// should pay off in most clearly.
+fn bench_ascii_downcase_simd(c: &mut Criterion) {
+    let treewalk = jq!("ascii_downcase");
+    let simd = jq!(codegen = "simd", "ascii_downcase");
+    let mut group = c.benchmark_group("ascii_downcase_simd");
+    for &len in &[16usize, 1_000, 1_000_000] {
+        let s: String = (0..len).map(|i| (b'A' + (i % 26) as u8) as char).collect();
+        let input = json!(s);
+        group.throughput(Throughput::Bytes(len as u64));
+        group.bench_with_input(BenchmarkId::new("treewalk", len), &input, |b, input| {
+            b.iter(|| treewalk(black_box(input)).unwrap());
+        });
+        group.bench_with_input(BenchmarkId::new("simd", len), &input, |b, input| {
+            b.iter(|| simd(black_box(input)).unwrap());
+        });
+    }
+    group.finish();
+}
+
+/// As `bench_ascii_downcase_simd`, for `contains` -- the other builtin
+/// `SimdCodegen` implements differently (via `memchr::memmem` rather
+/// than hand-rolled intrinsics; see `jqc-core/src/simd.rs`'s doc
+/// comment). The needle is never present, forcing a full scan of the
+/// haystack -- the regime a tuned substring search should separate
+/// itself from a naive one most clearly.
+fn bench_contains_simd(c: &mut Criterion) {
+    let treewalk = jq!(r#"contains("needle-not-present")"#);
+    let simd = jq!(codegen = "simd", r#"contains("needle-not-present")"#);
+    let mut group = c.benchmark_group("contains_simd");
+    for &len in &[16usize, 1_000, 1_000_000] {
+        let haystack = "a".repeat(len);
+        let input = json!(haystack);
+        group.throughput(Throughput::Bytes(len as u64));
+        group.bench_with_input(BenchmarkId::new("treewalk", len), &input, |b, input| {
+            b.iter(|| treewalk(black_box(input)).unwrap());
+        });
+        group.bench_with_input(BenchmarkId::new("simd", len), &input, |b, input| {
+            b.iter(|| simd(black_box(input)).unwrap());
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_identity,
@@ -407,5 +455,7 @@ criterion_group!(
     bench_sort_by,
     bench_reduce_sum,
     bench_recurse,
+    bench_ascii_downcase_simd,
+    bench_contains_simd,
 );
 criterion_main!(benches);

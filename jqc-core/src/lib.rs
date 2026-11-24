@@ -8,7 +8,9 @@
 
 mod error;
 mod helpers;
+mod simd;
 
 pub use error::{bubble, bubble1, partial_for, JResult, JqError};
 pub use helpers::*;
 pub use serde_json::{json, Map, Number, Value};
+pub use simd::{simd_ascii_downcase, simd_ascii_upcase, simd_contains_value};
