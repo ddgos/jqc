@@ -63,33 +63,36 @@ fn compile(src: &str) {
     codegen::compile_top(&ast).expect("fixture filter should compile");
 }
 
+/// Shared across the time- and memory-focused benchmarks below so both
+/// measure the exact same filters.
+const FIXTURES: &[(&str, &str)] = &[
+    ("trivial", "."),
+    ("field_chain", ".a.b.c.d.e.f.g.h"),
+    (
+        "pipeline",
+        ".items[] | select(.active) | {name: .name, score: (.score * 2)}",
+    ),
+    (
+        "prelude_heavy",
+        "[recurse] | sort_by(.) | group_by(.) | unique | map(length)",
+    ),
+    (
+        "defs_non_recursive",
+        "def a: . + 1; def b: a | a; def c: b | b; c",
+    ),
+    (
+        "recursive_def",
+        "def fact: if . <= 1 then 1 else (. - 1 | fact) * . end; fact",
+    ),
+];
+
 #[test]
 #[ignore = "run explicitly: cargo test -p jqc-macros --release -- --ignored compile_time_benchmarks --nocapture"]
 fn compile_time_benchmarks() {
     cap_memory();
     let mut c = Criterion::default();
 
-    let fixtures: &[(&str, &str)] = &[
-        ("trivial", "."),
-        ("field_chain", ".a.b.c.d.e.f.g.h"),
-        (
-            "pipeline",
-            ".items[] | select(.active) | {name: .name, score: (.score * 2)}",
-        ),
-        (
-            "prelude_heavy",
-            "[recurse] | sort_by(.) | group_by(.) | unique | map(length)",
-        ),
-        (
-            "defs_non_recursive",
-            "def a: . + 1; def b: a | a; def c: b | b; c",
-        ),
-        (
-            "recursive_def",
-            "def fact: if . <= 1 then 1 else (. - 1 | fact) * . end; fact",
-        ),
-    ];
-    for (name, src) in fixtures {
+    for (name, src) in FIXTURES {
         c.bench_function(name, |b| b.iter(|| compile(src)));
     }
 
@@ -121,9 +124,63 @@ fn unused_defs_scaling_check() {
             src.push_str(&format!("def unused{i}: .; "));
         }
         src.push('.');
+        reset_peak_rss();
         let start = std::time::Instant::now();
         compile(&src);
-        eprintln!("n={n} elapsed={:?}", start.elapsed());
+        eprintln!(
+            "n={n} elapsed={:?} peak_rss={}",
+            start.elapsed(),
+            fmt_peak_rss()
+        );
+    }
+}
+
+/// Peak resident set size (kB) this process has reached so far, via Linux's
+/// `VmHWM` ("high water mark") in `/proc/self/status`. `None` off Linux.
+#[cfg(target_os = "linux")]
+fn peak_rss_kb() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").expect("read /proc/self/status");
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("VmHWM:"))
+        .and_then(|rest| rest.trim().trim_end_matches(" kB").trim().parse().ok())
+}
+#[cfg(not(target_os = "linux"))]
+fn peak_rss_kb() -> Option<u64> {
+    None
+}
+
+/// Resets `VmHWM`/`VmPeak` down to the process's *current* usage, so a
+/// subsequent [`peak_rss_kb`] reports only what happened in between, not
+/// everything since process start. See `proc(5)` on `clear_refs`. No-op off
+/// Linux, where `peak_rss_kb` always returns `None` anyway.
+#[cfg(target_os = "linux")]
+fn reset_peak_rss() {
+    std::fs::write("/proc/self/clear_refs", "5").expect("write /proc/self/clear_refs");
+}
+#[cfg(not(target_os = "linux"))]
+fn reset_peak_rss() {}
+
+fn fmt_peak_rss() -> String {
+    match peak_rss_kb() {
+        Some(kb) => format!("{kb}KB"),
+        None => "N/A (non-Linux)".to_string(),
+    }
+}
+
+/// Peak RAM used by a single macro-expansion of each fixture filter -- i.e.
+/// what `jq!` costs *your build* in memory, not what the generated code
+/// costs at runtime. Only meaningful run one fixture at a time (not under
+/// Criterion's repeated-iteration sampling), since `reset_peak_rss` would
+/// otherwise just measure the high-water mark across many iterations.
+#[test]
+#[ignore = "run explicitly: cargo test -p jqc-macros --release -- --ignored peak_memory_benchmarks --nocapture"]
+fn peak_memory_benchmarks() {
+    cap_memory();
+    for (name, src) in FIXTURES {
+        reset_peak_rss();
+        compile(src);
+        eprintln!("{name}: peak_rss={}", fmt_peak_rss());
     }
 }
 
@@ -150,8 +207,13 @@ fn scaling_check() {
             src.push_str(&format!("def f{i}: f{prev} | f{prev};\n"));
         }
         src.push_str(&format!("f{depth}"));
+        reset_peak_rss();
         let start = std::time::Instant::now();
         compile(&src);
-        eprintln!("depth={depth} elapsed={:?}", start.elapsed());
+        eprintln!(
+            "depth={depth} elapsed={:?} peak_rss={}",
+            start.elapsed(),
+            fmt_peak_rss()
+        );
     }
 }

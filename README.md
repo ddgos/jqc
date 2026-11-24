@@ -93,6 +93,14 @@ and non-recursive `def` (see limitation below), and builtins: `map`,
   (not the macro-expansion step, which only runs once at compile time)
   across input sizes, plus one illustrative subprocess-`jq` comparison
   point showing the cost `jq!` avoids.
+- `cargo test -p jqc-macros --release -- --ignored <name> --nocapture` --
+  `jqc-macros/src/bench.rs` benchmarks the macro-expansion step itself
+  (wall time via `compile_time_benchmarks`, peak RSS via
+  `peak_memory_benchmarks`, plus two cost-cliff regression checks,
+  `unused_defs_scaling_check` and `scaling_check`). All four cap this
+  process's address space first (default: half of physical RAM, capped at
+  64GiB; override with `JQC_TEST_MEM_LIMIT_GB`) so a regression aborts
+  fast instead of being left to the kernel's OOM reaper.
 
 ## Dev shell
 

@@ -9,8 +9,6 @@ git. Do these in whichever order makes the most sense.
 
 ## Tasks
 
-Write benchmarks for the peak RAM usage of the codegen process.
-
 Make the codegen a trait so that different implementations of the codegen can
 co-exist. Make the current codegen implementation implement this trait.
 
