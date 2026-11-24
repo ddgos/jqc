@@ -80,7 +80,18 @@ and non-recursive `def` (see limitation below), and builtins: `map`,
 
 - `cargo test -p jqc --test differential` -- the main correctness suite:
   ~120 filters run through both the compiled closure and the real `jq`
-  binary (needs `jq` on `PATH`; the Nix dev shell provides it) and compared.
+  binary (needs `jq` on `PATH`; the Nix dev shell provides it) and
+  compared. `jqc` itself doesn't call `jq` at any point (it's a
+  from-scratch implementation of a jq subset, not a wrapper around the
+  real interpreter) -- this suite is the only place a specific `jq`
+  *version* is operationally meaningful. The default dev shell's `jq`
+  tracks nixpkgs-unstable's current version (1.8.2 as of writing);
+  `nix develop .#jq-1_6` or `.#jq-1_7` run the identical suite against a
+  reproducibly pinned older jq instead, no test-code changes needed.
+  `jq-1_6` currently fails one case (`if_no_else`): `if cond then x end`
+  without an `else` is a syntax error in jq 1.6, support was added in
+  1.7 -- a real language-version difference, not a `jqc` bug, since
+  `jqc` targets the newest jq by design.
 - `cargo test -p jqc --test fuzz_inputs` -- proptest-generated arbitrary
   JSON inputs run through a curated filter set, differentially checked
   against real `jq`.

@@ -9,11 +9,6 @@ git. Do these in whichever order makes the most sense.
 
 ## Tasks
 
-Add functionality to specify which `jq` version should be used for the macro.
-This should default to the most recent `jq` version (whatever is supported by
-nixpkgs-unstable). Old versions of `jq` should be tested against by including
-them in a nix compatible way for reproducable builds.
-
 Write a proc macro that runs generates tests from a path to the `jq` source code
 repository. This source code should be included as a nix flake dev dependency.
 In particular, generate tests from the examples included in the jq manual. This

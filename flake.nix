@@ -2,17 +2,50 @@
   description = "jqc: compile jq filters to native Rust code via a proc-macro";
 
   inputs = {
+    # The dev shell's `jq` -- and the differential test suite's ground
+    # truth -- tracks whatever jq version nixos-unstable currently ships
+    # (1.8.2 as of writing). The two pinned inputs below provide older jq
+    # versions reproducibly, for testing against them deliberately rather
+    # than whatever happens to be newest.
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    nixpkgs-jq-1-6.url = "github:NixOS/nixpkgs/nixos-23.05"; # last channel shipping jq 1.6
+    nixpkgs-jq-1-7.url = "github:NixOS/nixpkgs/nixos-23.11"; # first channel shipping jq 1.7.1
     typix = {
       url = "github:loqusion/typix";
       inputs.nixpkgs.follows = "nixpkgs";
     };
   };
 
-  outputs = { self, nixpkgs, typix }:
+  outputs = { self, nixpkgs, nixpkgs-jq-1-6, nixpkgs-jq-1-7, typix }:
     let
       systems = [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ];
       forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f system);
+
+      # name -> flake input providing that jq version's `legacyPackages`.
+      oldJqInputs = {
+        "jq-1_6" = nixpkgs-jq-1-6;
+        "jq-1_7" = nixpkgs-jq-1-7;
+      };
+
+      # Same dev-shell contents as `default`, just with `jq` swapped for a
+      # specific version -- everything else (cargo, rustc, …) still comes
+      # from the primary `nixpkgs` input, so this doesn't rebuild a whole
+      # second toolchain just to pin one package.
+      mkDevShell = system: jqPkg:
+        let pkgs = nixpkgs.legacyPackages.${system};
+        in pkgs.mkShell {
+          packages = [
+            pkgs.cargo
+            pkgs.rustc
+            pkgs.rust-analyzer
+            pkgs.rustfmt
+            pkgs.clippy
+            jqPkg
+            pkgs.typst
+            pkgs.cargo-tarpaulin
+          ];
+          RUST_BACKTRACE = "1";
+        };
 
       # Every `todo-reports/<name>/report.typ` becomes its own Typst project,
       # built via typix (https://github.com/loqusion/typix) for reproducible,
@@ -43,23 +76,18 @@
             });
     in
     {
+      # `default` tracks nixpkgs-unstable's current jq (1.8.2). `jq-1_6`/
+      # `jq-1_7` are the same shell with an older jq on PATH instead, e.g.
+      # `nix develop .#jq-1_6 -c cargo test -p jqc --test differential`
+      # runs the exact same differential suite against jq 1.6 as ground
+      # truth, no test-code changes needed.
       devShells = forAllSystems (system:
         let pkgs = nixpkgs.legacyPackages.${system};
         in {
-          default = pkgs.mkShell {
-            packages = [
-              pkgs.cargo
-              pkgs.rustc
-              pkgs.rust-analyzer
-              pkgs.rustfmt
-              pkgs.clippy
-              pkgs.jq
-              pkgs.typst
-              pkgs.cargo-tarpaulin
-            ];
-            RUST_BACKTRACE = "1";
-          };
-        });
+          default = mkDevShell system pkgs.jq;
+        } // nixpkgs.lib.mapAttrs
+          (_: input: mkDevShell system input.legacyPackages.${system}.jq)
+          oldJqInputs);
 
       # `nix run .#build-reports` compiles every todo-reports/<name>/report.typ
       # (each a typix-built derivation) and copies the PDF next to its source.
@@ -83,7 +111,9 @@
 
       packages = forAllSystems (system:
         let pkgs = nixpkgs.legacyPackages.${system};
-        in (reportPackages system) // {
+        in (reportPackages system)
+        // (nixpkgs.lib.mapAttrs (_: input: input.legacyPackages.${system}.jq) oldJqInputs)
+        // {
           default = pkgs.rustPlatform.buildRustPackage {
             pname = "jqc";
             version = "0.1.0";
