@@ -9,6 +9,9 @@ git. Do these in whichever order makes the most sense.
 
 ## Tasks
 
+Make the cli of the generated binaries use the same options as `jq` itself, and
+output in colour etc the same as `jq`, so it can be a drop in replacement.
+
 Work on the known limitations. Fix any which can reasonably be fixed. Only
 remove this task once limitations that are genuine limitations of the project
 remain.
@@ -26,11 +29,12 @@ that could be generated automatically -- e.g. jq's own C test suite
 (`tests/jq.test` and similar in a jq source checkout), as distinct from the
 manual-example generator that already exists (`jqc-manual-tests`).
 
-Make the cli of the generated binaries use the same options as `jq` itself, and
-output in colour etc the same as `jq`, so it can be a drop in replacement.
-
 Look for opportunities to use SIMD optimisation techniques. Implement as a
 new implementation of the codegen trait.
 
 Persue whatever optimisations possible. Always keep as separate implementations
 of the trait so that comparisons between implementations are easier to make.
+
+Investigate the feasibility (and implement if it makes sense) for jqc-build, or
+the jpc-build flake application to build the resulting binary into the nix store
+so that I can run `"$(nix build <flake> <script>)"` and it would run.
