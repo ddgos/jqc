@@ -11,4 +11,4 @@ path = "src/main.rs"
 
 [dependencies]
 jqc = { path = "../jqc" }
-serde_json = "1"
+jqc-cli = { path = "../jqc-cli" }

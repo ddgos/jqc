@@ -62,7 +62,8 @@ fn cap_child_memory(cmd: &mut Command) {
 #[cfg(not(unix))]
 fn cap_child_memory(_cmd: &mut Command) {}
 
-/// Locates the `jqc` crate this scratch project should depend on.
+/// Locates the workspace this scratch project's `jqc`/`jqc-cli`
+/// dependencies live in.
 ///
 /// Dev/`cargo run`-from-workspace case: `jqc-build`'s own manifest dir is
 /// `<repo>/jqc-build`, so its parent is the workspace root. Packaged
@@ -70,16 +71,15 @@ fn cap_child_memory(_cmd: &mut Command) {}
 /// build sandbox is gone): the flake wraps this binary with
 /// `JQC_WORKSPACE_DIR` set to its own source (a permanent store path),
 /// which takes precedence.
-fn jqc_crate_path() -> PathBuf {
-    let workspace = env::var_os("JQC_WORKSPACE_DIR")
+fn workspace_path() -> PathBuf {
+    env::var_os("JQC_WORKSPACE_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
             Path::new(env!("CARGO_MANIFEST_DIR"))
                 .parent()
                 .expect("jqc-build's manifest dir has no parent")
                 .to_path_buf()
-        });
-    workspace.join("jqc")
+        })
 }
 
 fn escape_rust_str_literal(s: &str) -> String {
@@ -157,48 +157,23 @@ fn main() {
         std::process::exit(1);
     });
 
-    let jqc_path = jqc_crate_path();
+    let workspace = workspace_path();
+    let jqc_path = workspace.join("jqc");
+    let jqc_cli_path = workspace.join("jqc-cli");
     let cargo_toml = format!(
         "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
-         [dependencies]\njqc = {{ path = {jqc_path:?} }}\nserde_json = \"1\"\n",
+         [dependencies]\njqc = {{ path = {jqc_path:?} }}\n\
+         jqc-cli = {{ path = {jqc_cli_path:?} }}\n",
     );
     fs::write(scratch.join("Cargo.toml"), cargo_toml).expect("write scratch Cargo.toml");
 
     let escaped = escape_rust_str_literal(&script);
     let main_rs = format!(
-        r#"use std::io::{{self, BufRead, Write}};
-use jqc::core::Value;
-use jqc::jq;
+        r#"use jqc::jq;
 
-fn main() {{
+fn main() -> std::process::ExitCode {{
     let filter = jq!("{escaped}");
-    let stdin = io::stdin();
-    let stdout = io::stdout();
-    let mut out = stdout.lock();
-    for line in stdin.lock().lines() {{
-        let line = line.expect("read stdin");
-        if line.trim().is_empty() {{
-            continue;
-        }}
-        let input: Value = match serde_json::from_str(&line) {{
-            Ok(v) => v,
-            Err(e) => {{
-                eprintln!("invalid JSON input: {{e}}");
-                std::process::exit(1);
-            }}
-        }};
-        match filter(&input) {{
-            Ok(outputs) => {{
-                for v in outputs {{
-                    writeln!(out, "{{v}}").expect("write stdout");
-                }}
-            }}
-            Err(e) => {{
-                eprintln!("jq error: {{e}}");
-                std::process::exit(5);
-            }}
-        }}
-    }}
+    jqc_cli::run(filter)
 }}
 "#,
     );

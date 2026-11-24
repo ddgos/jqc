@@ -5,6 +5,7 @@ members = [
     "jqc-compiler",
     "jqc-macros",
     "jqc",
+    "jqc-cli",
     "jqc-build",
     "examples",
 ]

@@ -45,6 +45,20 @@ process -- unrelated to any currently-known `jqc` bug (see the
 `codegen-size-blowup` todo-report for the one real incident this guarded
 against, since fixed at the root).
 
+### A jq-compatible CLI, for free
+
+Every `jqc-build`-compiled binary (and `examples`' `compiled-filter` demo)
+gets real jq's own CLI via `jqc-cli`, not a hand-rolled one -- `-c`/
+`-r`/`-j`/`-C`/`-M`/`-a`/`-S`/`-R`/`-s`/`-n`/`-e`/`--tab`/`--indent N`/
+`--raw-output0`, plus reading from named files instead of stdin, and
+color/pretty-printed output matching real jq's own `jv_print.c` byte for
+byte (including honoring `JQ_COLORS`). It's a drop-in replacement for
+`jq '<filter>'` for the common case of filtering JSON on stdin/files --
+see `jqc-cli`'s own crate docs for the exact flag list and what's
+deliberately not supported (`-f`, modules, `--stream`/`--seq`, and
+`--arg`/`--argjson`/`$ENV`, which would need new compile-time variable-
+binding support, not just a CLI change).
+
 ### Targeting a specific jq version
 
 `jq!("...")` with no version argument targets the newest jq version this
@@ -92,6 +106,8 @@ is a compile error pointing at that `jq!` call.
   `compiled-filter` demo binary below is reachable via `nix run
   .#default-example` instead, since it's one fixed illustrative filter
   rather than the general-purpose tool.
+- `jqc-cli` -- the jq-compatible argument parsing and colored/pretty
+  output formatting every `jqc-build`-compiled binary embeds (see above).
 - `examples` -- a tiny compiled-filter CLI demonstrating usage.
 
 ## Supported jq subset
@@ -159,6 +175,10 @@ below), and builtins: `map`, `select`, `values`, `recurse(;f)`, `in`,
   build's newest enabled jq version) run through both the compiled
   closure and the real `jq` binary (needs `jq` on `PATH`; the Nix dev
   shell provides it) and compared.
+- `cargo test -p jqc-cli --test differential` -- `jqc-cli`'s own output
+  formatter (pretty/compact/color/sort-keys/indent/tab/ascii, in
+  combination) byte-compared against real `jq -n '.' <flags>` on a set of
+  representative values (needs `jq` on `PATH`, same as above).
 - `cargo test -p jqc --test version_selection` -- covers `jq!(version =
   "...", ...)` itself: an explicit `version = "1.8"` behaving the same as
   no `version` argument, and (with `--features jq-1-6`) jq 1.6 accepting

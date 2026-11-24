@@ -2,43 +2,14 @@
 //! `cargo build --release` produces a standalone binary dedicated to
 //! running exactly this filter -- no jq parser/interpreter is linked in.
 //!
-//! Reads newline-delimited JSON from stdin, runs the filter on each value,
-//! and prints every output value as a JSON line (like `jq` itself).
+//! `jqc_cli::run` gives this binary the same CLI as real `jq` itself
+//! (`-c`/`-r`/`-C`/`-S`/`-s`/`-R`/`-n`/`-e`/`--indent`/`--tab`/…, plus
+//! file arguments) -- see `jqc-cli`'s own docs for the full flag list and
+//! what's deliberately not supported.
 
-use std::io::{self, BufRead, Write};
-
-use jqc::core::Value;
 use jqc::jq;
 
-fn main() {
+fn main() -> std::process::ExitCode {
     let filter = jq!(r#".items[] | select(.active) | {name: .name, score: (.score * 2)}"#);
-
-    let stdin = io::stdin();
-    let stdout = io::stdout();
-    let mut out = stdout.lock();
-
-    for line in stdin.lock().lines() {
-        let line = line.expect("read stdin");
-        if line.trim().is_empty() {
-            continue;
-        }
-        let input: Value = match serde_json::from_str(&line) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("invalid JSON input: {e}");
-                std::process::exit(1);
-            }
-        };
-        match filter(&input) {
-            Ok(outputs) => {
-                for v in outputs {
-                    writeln!(out, "{v}").expect("write stdout");
-                }
-            }
-            Err(e) => {
-                eprintln!("jq error: {e}");
-                std::process::exit(5);
-            }
-        }
-    }
+    jqc_cli::run(filter)
 }

@@ -414,6 +414,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "jqc-cli"
+version = "0.1.0"
+dependencies = [
+ "jqc-core",
+ "serde_json",
+]
+
+[[package]]
 name = "jqc-compiler"
 version = "0.1.0"
 dependencies = [
@@ -435,7 +443,7 @@ name = "jqc-examples"
 version = "0.1.0"
 dependencies = [
  "jqc",
- "serde_json",
+ "jqc-cli",
 ]
 
 [[package]]

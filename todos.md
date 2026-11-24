@@ -9,9 +9,6 @@ git. Do these in whichever order makes the most sense.
 
 ## Tasks
 
-Make the cli of the generated binaries use the same options as `jq` itself, and
-output in colour etc the same as `jq`, so it can be a drop in replacement.
-
 Work on the known limitations. Fix any which can reasonably be fixed. Only
 remove this task once limitations that are genuine limitations of the project
 remain. If at any point new bugs are identified, they should be isolated with
