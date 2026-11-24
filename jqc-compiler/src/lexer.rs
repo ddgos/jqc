@@ -26,6 +26,7 @@ pub enum Tok {
     Minus,
     Star,
     Slash,
+    SlashSlash,
     Percent,
     Eq,
     Ne,
@@ -147,7 +148,14 @@ impl Lexer {
             '+' => Ok(Tok::Plus),
             '-' => Ok(Tok::Minus),
             '*' => Ok(Tok::Star),
-            '/' => Ok(Tok::Slash),
+            '/' => {
+                if self.peek() == Some('/') {
+                    self.bump();
+                    Ok(Tok::SlashSlash)
+                } else {
+                    Ok(Tok::Slash)
+                }
+            }
             '%' => Ok(Tok::Percent),
             '=' => {
                 if self.peek() == Some('=') {

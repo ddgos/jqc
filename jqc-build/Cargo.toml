@@ -9,4 +9,5 @@ description = "CLI: compile a jq script file into a standalone binary via the jq
 name = "jqc-build"
 path = "src/main.rs"
 
-[dependencies]
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

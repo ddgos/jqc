@@ -126,9 +126,9 @@ impl Parser {
         Ok(left)
     }
 
-    /// `EXPR as $x | BODY`, falling through to plain `or`-level expr.
+    /// `EXPR as $x | BODY`, falling through to plain `//`-level expr.
     fn parse_as_binding(&mut self) -> PResult<Expr> {
-        let expr = self.parse_or()?;
+        let expr = self.parse_alt()?;
         if self.is_ident("as") {
             self.bump();
             let var = self.expect_var()?;
@@ -137,6 +137,20 @@ impl Parser {
             return Ok(Expr::VarBind(Box::new(expr), var, Box::new(body)));
         }
         Ok(expr)
+    }
+
+    /// `a // b`, the alternative operator -- looser than `or`/`and`/
+    /// comparisons/arithmetic, tighter than `,`/`as`/`|`; right-
+    /// associative (`a // b // c` is `a // (b // c)`), matching real
+    /// jq's grammar.
+    fn parse_alt(&mut self) -> PResult<Expr> {
+        let left = self.parse_or()?;
+        if *self.peek() == Tok::SlashSlash {
+            self.bump();
+            let right = self.parse_alt()?;
+            return Ok(Expr::Alt(Box::new(left), Box::new(right)));
+        }
+        Ok(left)
     }
 
     /// Pipe-without-comma, used for object-construction values.

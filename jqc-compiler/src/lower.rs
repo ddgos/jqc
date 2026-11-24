@@ -37,6 +37,10 @@ def until(cond; update): def __jqc_until_u: if cond then . else (update | __jqc_
 def repeat(f): def __jqc_repeat_r: f, __jqc_repeat_r; __jqc_repeat_r;
 def not: if . then false else true end;
 def error(msg): msg | error;
+def to_entries: [keys_unsorted[] as $k | {key: $k, value: .[$k]}];
+def from_entries: map({ (.key // .Key // .name // .Name):
+  if has("value") then .value else .Value end }) | add // {};
+def with_entries(f): to_entries | map(f) | from_entries;
 "#;
 
 pub fn parse_and_lower(user_src: &str, version: JqVersion) -> LResult<Expr> {
@@ -139,6 +143,10 @@ fn lower(expr: Expr, scope: &[DefEntry]) -> LResult<Expr> {
             Box::new(lower(*rhs, scope)?),
         )),
         Expr::Or(lhs, rhs) => Ok(Expr::Or(
+            Box::new(lower(*lhs, scope)?),
+            Box::new(lower(*rhs, scope)?),
+        )),
+        Expr::Alt(lhs, rhs) => Ok(Expr::Alt(
             Box::new(lower(*lhs, scope)?),
             Box::new(lower(*rhs, scope)?),
         )),
@@ -309,6 +317,7 @@ fn contains_call(expr: &Expr, name: &str, arity: usize) -> bool {
         | Expr::Comma(a, b)
         | Expr::And(a, b)
         | Expr::Or(a, b)
+        | Expr::Alt(a, b)
         | Expr::BinOp(_, a, b) => contains_call(a, name, arity) || contains_call(b, name, arity),
         Expr::Str(parts) => parts.iter().any(|p| match p {
             StrPart::Lit(_) => false,
@@ -486,6 +495,10 @@ fn rewrite_call0(expr: Expr, target: &str, build: &mut dyn FnMut() -> Expr) -> E
             Box::new(rewrite_call0(*b, target, build)),
         ),
         Expr::Or(a, b) => Expr::Or(
+            Box::new(rewrite_call0(*a, target, build)),
+            Box::new(rewrite_call0(*b, target, build)),
+        ),
+        Expr::Alt(a, b) => Expr::Alt(
             Box::new(rewrite_call0(*a, target, build)),
             Box::new(rewrite_call0(*b, target, build)),
         ),

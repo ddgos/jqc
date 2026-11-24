@@ -113,6 +113,32 @@ difftest!(
 difftest!(and_short_circuit, ".a and .b", r#"{"a":false,"b":null}"#);
 difftest!(or_short_circuit, ".a or .b", r#"{"a":true,"b":null}"#);
 difftest!(not_builtin, ".a | not", r#"{"a":false}"#);
+difftest!(alt_lhs_truthy, "1 // 2", "null");
+difftest!(alt_fallback_null, "null // 2", "null");
+difftest!(alt_fallback_false, "false // 2", "null");
+difftest!(alt_fallback_empty, "empty // 2", "null");
+difftest!(alt_zero_is_truthy, "0 // 99", "null");
+difftest!(
+    alt_filters_falsy_multi,
+    "[(false, 1, null, 2) // 99]",
+    "null"
+);
+difftest!(alt_all_falsy_multi, "[(false, null) // 99]", "null");
+difftest!(alt_rhs_multi, "[(false, null) // (1, 2, 3)]", "null");
+difftest!(alt_precedence_comma, "[false, 1 // 2]", "null");
+difftest!(alt_precedence_or, "false // (true and false)", "null");
+difftest!(alt_precedence_cmp, "null // 1 == 1", "null");
+difftest!(alt_as_binding, "false // 5 as $x | $x + 1", "null");
+difftest!(
+    alt_error_not_caught,
+    "try ((error) // 99) catch \"caught\"",
+    "null"
+);
+difftest!(
+    alt_partial_before_error,
+    "[try ((1, 2, error) // 99) catch \"c\"]",
+    "null"
+);
 difftest!(
     if_then_else,
     "if .a > 0 then \"pos\" else \"nonpos\" end",
@@ -177,6 +203,24 @@ difftest!(length_string, "length", r#""hello""#);
 difftest!(length_null, "length", "null");
 difftest!(keys_basic, "keys", r#"{"b":1,"a":2}"#);
 difftest!(keys_unsorted_basic, "keys_unsorted", r#"{"b":1,"a":2}"#);
+difftest!(to_entries_object, "to_entries", r#"{"b":1,"a":2}"#);
+difftest!(to_entries_array, "to_entries", r#"["x","y"]"#);
+difftest!(
+    from_entries_basic,
+    "from_entries",
+    r#"[{"key":"a","value":1},{"key":"b","value":2}]"#
+);
+difftest!(from_entries_empty, "from_entries", "[]");
+difftest!(
+    from_entries_name_variants,
+    "from_entries",
+    r#"[{"name":"a","value":1},{"Key":"b","Value":2}]"#
+);
+difftest!(
+    with_entries_basic,
+    "with_entries({key, value: (.value * 2)})",
+    r#"{"a":1,"b":2}"#
+);
 difftest!(type_builtin, "[.[] | type]", r#"[1,"a",null,true,[1],{}]"#);
 difftest!(add_builtin, "add", "[1,2,3]");
 difftest!(reverse_array, "reverse", "[1,2,3]");

@@ -17,6 +17,51 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// Caps the `cargo build` child's address space (inherited by the `rustc`
+/// it in turn spawns, since `RLIMIT_AS` carries across `fork`/`exec`) so a
+/// script whose compilation blows up -- e.g. a `def` that nests several
+/// prelude-builtin calls, which can trigger `jqc-compiler`'s lowering
+/// pass's own exponential-ish re-lowering cost (same class of bug as the
+/// `def_scope` cost cliff `jqc-compiler/src/bench.rs` guards against, but
+/// not yet fully fixed) -- fails fast with an OOM in that one process
+/// instead of swapping the whole machine or triggering the kernel's OOM
+/// killer against unrelated processes. Nominally 32GiB, clamped to a
+/// quarter of physical RAM so a machine with less than 128GiB doesn't
+/// still get bitten before the limit is ever reached; override with
+/// `JQC_BUILD_MEM_LIMIT_GB`.
+#[cfg(unix)]
+fn cap_child_memory(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt;
+
+    const NOMINAL_GB: u64 = 32;
+    let phys_gb = unsafe {
+        let pages = libc::sysconf(libc::_SC_PHYS_PAGES);
+        let page_size = libc::sysconf(libc::_SC_PAGE_SIZE);
+        (pages > 0 && page_size > 0).then(|| (pages as u64 * page_size as u64) / (1024 * 1024 * 1024))
+    };
+    let default_gb = phys_gb.map(|gb| (gb / 4).clamp(1, NOMINAL_GB)).unwrap_or(NOMINAL_GB);
+    let gb: u64 = env::var("JQC_BUILD_MEM_LIMIT_GB")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default_gb);
+    let limit_bytes = gb * 1024 * 1024 * 1024;
+    unsafe {
+        cmd.pre_exec(move || {
+            let limit = libc::rlimit {
+                rlim_cur: limit_bytes,
+                rlim_max: limit_bytes,
+            };
+            if libc::setrlimit(libc::RLIMIT_AS, &limit) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(unix))]
+fn cap_child_memory(_cmd: &mut Command) {}
+
 /// Locates the `jqc` crate this scratch project should depend on.
 ///
 /// Dev/`cargo run`-from-workspace case: `jqc-build`'s own manifest dir is
@@ -159,14 +204,14 @@ fn main() {{
     );
     fs::write(scratch.join("src").join("main.rs"), main_rs).expect("write scratch main.rs");
 
-    let status = Command::new("cargo")
-        .args(["build", "--release", "--manifest-path"])
-        .arg(scratch.join("Cargo.toml"))
-        .status()
-        .unwrap_or_else(|e| {
-            eprintln!("jqc-build: spawning cargo (is it on PATH?): {e}");
-            std::process::exit(1);
-        });
+    let mut cmd = Command::new("cargo");
+    cmd.args(["build", "--release", "--manifest-path"])
+        .arg(scratch.join("Cargo.toml"));
+    cap_child_memory(&mut cmd);
+    let status = cmd.status().unwrap_or_else(|e| {
+        eprintln!("jqc-build: spawning cargo (is it on PATH?): {e}");
+        std::process::exit(1);
+    });
     if !status.success() {
         eprintln!("jqc-build: cargo build failed for {}", script_path.display());
         std::process::exit(status.code().unwrap_or(1));

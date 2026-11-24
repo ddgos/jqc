@@ -409,6 +409,9 @@ dependencies = [
 [[package]]
 name = "jqc-build"
 version = "0.1.0"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "jqc-compiler"

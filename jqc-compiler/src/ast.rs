@@ -76,6 +76,10 @@ pub enum Expr {
     BinOp(BinOp, Box<Expr>, Box<Expr>),
     And(Box<Expr>, Box<Expr>),
     Or(Box<Expr>, Box<Expr>),
+    /// `a // b`: the alternative operator. Not the same as `Or` -- this
+    /// filters `a`'s outputs to those that are neither `false` nor
+    /// `null`, falling back to `b` only if that filtered set is empty.
+    Alt(Box<Expr>, Box<Expr>),
     If(Vec<(Expr, Expr)>, Option<Box<Expr>>),
     TryCatch(Box<Expr>, Option<Box<Expr>>),
     Optional(Box<Expr>),

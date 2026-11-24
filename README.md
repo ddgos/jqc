@@ -94,16 +94,18 @@ Identity/field access (`.`, `.a.b`, `."weird key"`), indexing and slicing
 preceding step only -- matches real jq), `|`, `,`, literals incl. string
 interpolation (`"\(expr)"`), array/object construction (incl. `{a}`/`{$a}`
 shorthand and computed `(expr): val` keys), arithmetic (`+ - * / %`,
-jq's type-aware semantics for each), comparisons, `and`/`or`, `if/elif/
-else/end`, `try/catch`, `as $x` bindings, `reduce`, `foreach`, recursive
-and non-recursive `def` (see limitation below), and builtins: `map`,
-`select`, `values`, `recurse(;f)`, `in`, `any`/`all` (0/1/2-arg forms),
-`while`/`until`/`repeat`, `length`, `keys`/`keys_unsorted`, `has`, `type`,
-`not`, `empty`, `error`, `add`, `sort`/`sort_by`/`group_by`/`unique`/
-`unique_by`/`min`/`max`/`min_by`/`max_by`, `reverse`, `range/1,2,3`,
-`first`/`last` (0/1-arg), `floor`/`ceil`/`round`/`sqrt`/`fabs`, `tostring`/
-`tonumber`, `explode`/`implode`, `ascii_downcase`/`ascii_upcase`,
-`startswith`/`endswith`/`contains`/`ltrimstr`/`rtrimstr`/`join`/`split`.
+jq's type-aware semantics for each), comparisons, `and`/`or`, `//`
+(alternative operator), `if/elif/else/end`, `try/catch`, `as $x` bindings,
+`reduce`, `foreach`, recursive and non-recursive `def` (see limitation
+below), and builtins: `map`, `select`, `values`, `recurse(;f)`, `in`,
+`any`/`all` (0/1/2-arg forms), `while`/`until`/`repeat`, `length`,
+`keys`/`keys_unsorted`, `has`, `type`, `not`, `empty`, `error`, `add`,
+`to_entries`/`from_entries`/`with_entries`, `sort`/`sort_by`/`group_by`/
+`unique`/`unique_by`/`min`/`max`/`min_by`/`max_by`, `reverse`,
+`range/1,2,3`, `first`/`last` (0/1-arg), `floor`/`ceil`/`round`/`sqrt`/
+`fabs`, `tostring`/`tonumber`, `explode`/`implode`, `ascii_downcase`/
+`ascii_upcase`, `startswith`/`endswith`/`contains`/`ltrimstr`/`rtrimstr`/
+`join`/`split`.
 
 ## Known limitations
 
@@ -119,9 +121,23 @@ and non-recursive `def` (see limitation below), and builtins: `map`,
   semantics) but that approach can't terminate for a recursive, parameterized
   def, so it's rejected at compile time with a clear error instead of hanging
   or silently looping forever.
-- Not implemented: `%//`-alternative operator, `path`/`paths`/`getpath`/
-  `setpath`/`del`, update-assignment operators (`|=`, `+=`, …), `input`/
-  `inputs`/`$ENV`, `label`/`break`, SQL-style ops, module `import`/`include`.
+- **Non-recursive call-by-name inlining can still blow up disproportionately
+  to the source size**, independently of (and not fixed by) the `def_scope`
+  `Rc` fix above. A `def` whose body nests a few *different* builtin/prelude
+  calls -- one call's filter-argument itself containing another builtin call,
+  e.g. `round | to_entries | map(if (daggers | any(. == .key)) then … end)`
+  -- re-lowers the already-expanded inner content from scratch each time a
+  call-by-name substitution happens one level up, rather than caching it.
+  A single such `def`, called just twice from two different sites, measured
+  tens of seconds and multiple GB of RAM to macro-expand on real-world jq
+  (not synthetic-benchmark-shaped) code -- see the `real-world-script-debugging`
+  todo-report. `jqc-build` now caps the `cargo build` it shells out to at a
+  fraction of physical RAM (`JQC_BUILD_MEM_LIMIT_GB` to override) so a
+  pathological script fails fast and safely instead of risking the host;
+  the underlying lowering-pass inefficiency itself is unfixed.
+- Not implemented: `path`/`paths`/`getpath`/`setpath`/`del`, update-
+  assignment operators (`|=`, `+=`, …), `input`/`inputs`/`$ENV`,
+  `label`/`break`, SQL-style ops, module `import`/`include`.
 - Every clone is a real `Value::clone()` (deep for arrays/objects). Fine for
   typical filter sizes; a future version could switch to `Rc<Value>`
   internally for less copying on heavily-reused sub-results.

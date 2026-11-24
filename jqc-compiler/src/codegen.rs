@@ -276,6 +276,40 @@ fn compile_raw(expr: &Expr, input: &TokenStream, scope: &mut Vec<String>) -> CRe
         Expr::BinOp(op, lhs, rhs) => compile_binop(*op, lhs, rhs, input, scope),
         Expr::And(lhs, rhs) => compile_and_or(lhs, rhs, input, scope, true),
         Expr::Or(lhs, rhs) => compile_and_or(lhs, rhs, input, scope, false),
+        Expr::Alt(lhs, rhs) => {
+            let lhs_c = compile(lhs, input, scope)?;
+            let rhs_c = compile(rhs, input, scope)?;
+            let truthy = core_path("truthy");
+            // `a // b` keeps only `a`'s non-`false`/`null` outputs,
+            // falling back to `b` only if that filtered set ends up
+            // empty -- unlike `?`/`try`, an error in `a` is *not*
+            // caught; it propagates (verified against real jq), so
+            // `partial_aware_for` is exactly right here: it already
+            // keeps whatever `a` had filtered-and-pushed before a later
+            // failure and re-raises with that as `emitted`.
+            let body = quote! {
+                if #truthy(&__v) {
+                    __out.push(__v);
+                }
+            };
+            // `wrap_fallible` (not just a bare `(#lhs_block)?`) matters
+            // here: its explicit closure-return-type annotation is what
+            // pins `#lhs_block`'s `Result`'s error type for rustc --
+            // every *other* `partial_aware_for` use instead gets that
+            // from being passed straight into `bubble`/`bubble1`'s
+            // concretely-typed parameter, which doesn't apply here.
+            let lhs_block = wrap_fallible(partial_aware_for(&lhs_c, &quote!(__v), body));
+            Ok(quote! {
+                {
+                    let __filtered = (#lhs_block)?;
+                    if !__filtered.is_empty() {
+                        Ok(__filtered)
+                    } else {
+                        #rhs_c
+                    }
+                }
+            })
+        }
         Expr::If(branches, else_branch) => {
             compile_if(branches, else_branch.as_deref(), input, scope)
         }
