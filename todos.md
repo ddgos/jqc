@@ -9,8 +9,6 @@ git. Do these in whichever order makes the most sense.
 
 ## Tasks
 
-Generate a code coverage report from tests.
-
 Keep a record of the pareto front to see how performance improves.
 
 Add functionality to specify which `jq` version should be used for the macro.

@@ -103,6 +103,14 @@ and non-recursive `def` (see limitation below), and builtins: `map`,
   process's address space first (default: half of physical RAM, capped at
   64GiB; override with `JQC_TEST_MEM_LIMIT_GB`) so a regression aborts
   fast instead of being left to the kernel's OOM reaper.
+- `cargo tarpaulin --workspace --out Html --output-dir target/tarpaulin` --
+  line coverage from the test suite. Only meaningful for `jqc-core` (the
+  runtime support crate): `jqc-macros`' lex/parse/lower/codegen pipeline
+  runs during the *compilation* of the tests that exercise it (`jq!` is a
+  proc macro), not while the resulting test binary runs, so a runtime
+  coverage tool reports near-0% there regardless of how thoroughly the
+  differential suite exercises it. Read that coverage from differential
+  test results instead, not from tarpaulin's numbers for that crate.
 
 ## Dev shell
 

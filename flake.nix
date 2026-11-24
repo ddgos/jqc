@@ -55,6 +55,7 @@
               pkgs.clippy
               pkgs.jq
               pkgs.typst
+              pkgs.cargo-tarpaulin
             ];
             RUST_BACKTRACE = "1";
           };
