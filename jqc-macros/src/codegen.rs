@@ -18,6 +18,27 @@ use crate::ast::{BinOp, Expr, ObjEntry, StrPart};
 
 pub type CResult<T> = Result<T, String>;
 
+/// A backend that turns a lowered jq AST into the Rust `TokenStream` that
+/// `jq!` expands to. [`TreeWalkCodegen`] below is the only implementation
+/// today; the trait exists so alternative backends (SIMD, multi-core --
+/// see `todos.md`) can be added as separate implementations without
+/// touching this one, and compared against it on equal footing.
+pub trait Codegen {
+    fn compile_top(&self, expr: &Expr) -> CResult<TokenStream>;
+}
+
+/// The default (and currently only) backend: a direct, recursive tree-walk
+/// that compiles each AST node into nested Rust loops over `Vec<Value>`,
+/// one node at a time, matching jq's cartesian-product generator semantics
+/// structurally in the generated control flow.
+pub struct TreeWalkCodegen;
+
+impl Codegen for TreeWalkCodegen {
+    fn compile_top(&self, expr: &Expr) -> CResult<TokenStream> {
+        compile_top(expr)
+    }
+}
+
 const CORE: &str = "::jqc::core";
 
 fn core_path(name: &str) -> TokenStream {

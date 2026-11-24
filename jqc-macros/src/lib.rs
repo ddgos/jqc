@@ -17,6 +17,8 @@ mod parser;
 use proc_macro::TokenStream;
 use syn::LitStr;
 
+use codegen::{Codegen, TreeWalkCodegen};
+
 #[proc_macro]
 pub fn jq(input: TokenStream) -> TokenStream {
     let lit = match syn::parse::<LitStr>(input) {
@@ -24,7 +26,7 @@ pub fn jq(input: TokenStream) -> TokenStream {
         Err(e) => return e.to_compile_error().into(),
     };
     let src = lit.value();
-    match lower::parse_and_lower(&src).and_then(|ast| codegen::compile_top(&ast)) {
+    match lower::parse_and_lower(&src).and_then(|ast| TreeWalkCodegen.compile_top(&ast)) {
         Ok(ts) => ts.into(),
         Err(msg) => syn::Error::new(lit.span(), format!("jq!: {msg}"))
             .to_compile_error()

@@ -9,9 +9,6 @@ git. Do these in whichever order makes the most sense.
 
 ## Tasks
 
-Make the codegen a trait so that different implementations of the codegen can
-co-exist. Make the current codegen implementation implement this trait.
-
 Benchmark the actual `jq` binary to compare with.
 
 Generate a code coverage report from tests.
