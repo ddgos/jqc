@@ -123,44 +123,44 @@ already covers) inside one `def`.
   arrows: ((0, 1), (1, 2), (2, 3), (3, 4)),
 )
 
-== Root cause (understood, not yet fixed)
+== Root cause -- *revised*: see the `codegen-size-blowup` report
 
-`lower_call` (`jqc-compiler/src/lower.rs`) resolves a def call by cloning
-the def's *raw* (un-lowered) body, substituting call-by-name filter
-arguments into it, then running the *entire* lowering pass over the result
-again from scratch. That inner `lower()` call re-resolves every nested
-builtin/prelude call the substituted body contains -- `to_entries`, `map`,
-`any` (itself substituting *its own* raw body and re-lowering *that*) --
-every single time, with no caching across call sites or across the
-(structurally identical) builtin expansions each one re-derives. This is a
-different mechanism from the already-fixed `def_scope`-cloning cost cliff
-(that one was fixed by making the *scope snapshot* `Rc`-shared; this one is
-about redoing the *lowering work itself* on structurally-repeated content),
-and isn't covered by `scaling_check`/`unused_defs_scaling_check`, both of
-which stress a single def referencing itself repeatedly rather than several
-different ones nested together.
+This report originally diagnosed the cause as `lower_call` re-lowering
+already-expanded content from scratch at every call site -- plausible
+given the AST-level shape of the script, but wrong: a follow-up pass
+instrumented `lower_call` directly and found only ~14 total invocations
+for the single-call `leaders_of` repro, nowhere near enough to explain 27
+seconds. The *actual* cause was one level down, in codegen: `jqc-compiler`
+inlined a whole loop/merge shape as raw tokens at *every* pass-through
+node (`Pipe`, `Field`, `BinOp`, …), so nested pass-through structure
+multiplied generated-code size rather than adding to it -- measured at
+*8.7 million characters* of generated Rust for this one small function.
+Fixed at the root (moved that shape into a real runtime function,
+`jqc_core::partial_for`, called instead of inlined) in the
+`codegen-size-blowup` report, which also re-verifies this exact script:
+9.6 seconds, normal memory, correct output. The `JQC_BUILD_MEM_LIMIT_GB`
+safeguard below shipped anyway, as defense-in-depth against the *next*
+unknown cost cliff, not as a workaround for this one specifically.
 
-== What shipped: a safety net, not the fix
+== What shipped: a safety net
 
-Given the scope of a real fix (either memoizing `lower()` so a second pass
-over already-lowered content is cheap, or moving call-by-name filter
-params to actual Rust closure values instead of textual substitution --
-both flagged in `todos.md` for follow-up, not decided between here),
-this pass adds `jqc-build`'s own safeguard instead: it caps its child
-`cargo build`'s address space (`RLIMIT_AS`, inherited by the `rustc`
-`cargo` spawns) to a quarter of physical RAM, nominally capped at 32GiB,
+This pass adds `jqc-build`'s own safeguard: it caps its child `cargo
+build`'s address space (`RLIMIT_AS`, inherited by the `rustc` `cargo`
+spawns) to a quarter of physical RAM, nominally capped at 32GiB,
 overridable via `JQC_BUILD_MEM_LIMIT_GB` -- the same pattern
 `jqc-compiler/src/bench.rs`'s `cap_memory()` already uses for its own test
 suite, now applied to the end-user-facing tool.
 
-Verified against the exact script that caused the incident: under the
-default cap (≈9GB on the 38GB machine this ran on), it now fails cleanly
-in ~93 seconds (`rustc`'s own allocator aborts; `cargo`/`jqc-build` report
-an ordinary build failure) with the host's own memory untouched throughout
-(`free` stayed flat). A 1GB cap (deliberately too tight, to confirm the
-mechanism itself works) correctly aborted even *unrelated* dependency
-compilation (`serde_json`) well before threatening the host, confirming
-the limit applies to the whole child process tree as intended.
+Verified (before the real fix landed) against the exact script that
+caused the incident: under the default cap (≈9GB on the 38GB machine this
+ran on), it failed cleanly in ~93 seconds (`rustc`'s own allocator
+aborts; `cargo`/`jqc-build` report an ordinary build failure) with the
+host's own memory untouched throughout (`free` stayed flat). A 1GB cap
+(deliberately too tight, to confirm the mechanism itself works) correctly
+aborted even *unrelated* dependency compilation (`serde_json`) well
+before threatening the host, confirming the limit applies to the whole
+child process tree as intended. Kept in place after the real fix, as
+general-purpose defense-in-depth -- see the `codegen-size-blowup` report.
 
 = Verification
 

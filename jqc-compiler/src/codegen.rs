@@ -54,10 +54,11 @@ fn fn_ident(name: &str) -> Ident {
     format_ident!("__jqc_fn_{}", name)
 }
 
-/// Builds a `JResult<Vec<Value>>`-typed block that iterates `sub_c`'s
-/// output, binding each element to `item_ident` and running `body` once per
-/// element -- `body` pushes onto the block's own `__out` (directly, or via
-/// `#core_path("bubble"/"bubble1")` if it can itself fail).
+/// Builds a `JResult<Vec<Value>>`-typed expression that iterates `sub_c`'s
+/// output, binding each element to `item_ident` and running `body` once
+/// per element -- `body` extends/pushes onto its `__out: &mut Vec<Value>`
+/// parameter (directly, or via `#core_path("bubble"/"bubble1")`, which
+/// take `&mut Vec<Value>` the same way, if it can itself fail).
 ///
 /// This is for *pass-through* nodes, where each element `sub_c` produces
 /// directly feeds a piece of this node's own output (e.g. `Pipe`'s operand,
@@ -69,28 +70,27 @@ fn fn_ident(name: &str) -> Ident {
 /// this node must still see whatever elements were already produced before
 /// an error -- both elements `body` already pushed for earlier `sub_c`
 /// items, *and*, if `sub_c` itself fails partway through generating items,
-/// the items `sub_c` had already produced (its own `JqError::emitted`).
-/// This builds that: on `sub_c` failure, it still runs `body` over the
-/// partial items `sub_c` managed to emit, then re-raises with `__out`
-/// (now including whatever `body` pushed for those partial items) as the
-/// propagated error's `emitted`.
+/// the items `sub_c` had already produced. [`core::partial_for`] (the
+/// runtime function this calls) handles that; a `return Err(e)` inside
+/// `body` only exits `body`'s own closure, becoming that function's `Err`
+/// the normal way, which it then merges with the accumulator exactly like
+/// a `body` that failed via `?` through `bubble`/`bubble1`.
+///
+/// Deliberately a call into a real function, not raw tokens inlined at
+/// every call site: nesting this per level of pass-through structure in
+/// the source composes additively in *generated code size*, rather than
+/// each level re-inlining the loop/merge shape as more raw tokens (what
+/// this used to do -- see `partial_for`'s own doc comment for the real
+/// blowup that caused).
 fn partial_aware_for(sub_c: &TokenStream, item_ident: &TokenStream, body: TokenStream) -> TokenStream {
+    let partial_for = core_path("partial_for");
+    let value_ty = core_path("Value");
+    let jresult_ty = core_path("JResult");
     quote! {
-        {
-            let mut __out = ::std::vec::Vec::new();
-            match (#sub_c) {
-                ::std::result::Result::Ok(__items) => {
-                    for #item_ident in __items { #body }
-                }
-                ::std::result::Result::Err(mut __e) => {
-                    let __items = ::std::mem::take(&mut __e.emitted);
-                    for #item_ident in __items { #body }
-                    __e.emitted = __out;
-                    return Err(__e);
-                }
-            }
-            Ok(__out)
-        }
+        #partial_for((#sub_c), |__out: &mut ::std::vec::Vec<#value_ty>, #item_ident: #value_ty| -> #jresult_ty<()> {
+            #body
+            Ok(())
+        })
     }
 }
 
@@ -165,10 +165,7 @@ fn compile_raw(expr: &Expr, input: &TokenStream, scope: &mut Vec<String>) -> CRe
             let body = quote! {
                 match #index_field(&__base, #name) {
                     Ok(v) => __out.push(v),
-                    Err(mut e) => if !#optional {
-                        e.emitted = __out;
-                        return Err(e);
-                    },
+                    Err(e) => if !#optional { return Err(e); },
                 }
             };
             Ok(partial_aware_for(&base_c, &quote!(__base), body))
@@ -189,16 +186,13 @@ fn compile_raw(expr: &Expr, input: &TokenStream, scope: &mut Vec<String>) -> CRe
             let inner_body = quote! {
                 match #index_value(&__base, &__key) {
                     Ok(v) => __out.push(v),
-                    Err(mut e) => if !#optional {
-                        e.emitted = __out;
-                        return Err(e);
-                    },
+                    Err(e) => if !#optional { return Err(e); },
                 }
             };
             let inner = partial_aware_for(&base_c, &quote!(__base), inner_body);
             let bubble = core_path("bubble");
             let outer_body = quote! {
-                __out = #bubble(__out, (#inner))?;
+                #bubble(__out, (#inner))?;
             };
             Ok(partial_aware_for(&index_c, &quote!(__key), outer_body))
         }
@@ -221,10 +215,7 @@ fn compile_raw(expr: &Expr, input: &TokenStream, scope: &mut Vec<String>) -> CRe
             let body = quote! {
                 match #iterate(&__base) {
                     Ok(vs) => __out.extend(vs),
-                    Err(mut e) => if !#optional {
-                        e.emitted = __out;
-                        return Err(e);
-                    },
+                    Err(e) => if !#optional { return Err(e); },
                 }
             };
             Ok(partial_aware_for(&base_c, &quote!(__base), body))
@@ -234,7 +225,7 @@ fn compile_raw(expr: &Expr, input: &TokenStream, scope: &mut Vec<String>) -> CRe
             let rhs_c = compile(rhs, &quote!(&__piped), scope)?;
             let bubble = core_path("bubble");
             let body = quote! {
-                __out = #bubble(__out, (#rhs_c))?;
+                #bubble(__out, (#rhs_c))?;
             };
             Ok(partial_aware_for(&lhs_c, &quote!(__piped), body))
         }
@@ -245,8 +236,8 @@ fn compile_raw(expr: &Expr, input: &TokenStream, scope: &mut Vec<String>) -> CRe
             Ok(quote! {
                 {
                     let mut __out = ::std::vec::Vec::new();
-                    __out = #bubble(__out, (#lhs_c))?;
-                    __out = #bubble(__out, (#rhs_c))?;
+                    #bubble(&mut __out, (#lhs_c))?;
+                    #bubble(&mut __out, (#rhs_c))?;
                     Ok(__out)
                 }
             })
@@ -269,7 +260,7 @@ fn compile_raw(expr: &Expr, input: &TokenStream, scope: &mut Vec<String>) -> CRe
             let x_c = compile(x, input, scope)?;
             let bubble1 = core_path("bubble1");
             let body = quote! {
-                __out = #bubble1(__out, #neg_value(__val))?;
+                #bubble1(__out, #neg_value(__val))?;
             };
             Ok(partial_aware_for(&x_c, &quote!(__val), body))
         }
@@ -292,13 +283,7 @@ fn compile_raw(expr: &Expr, input: &TokenStream, scope: &mut Vec<String>) -> CRe
                     __out.push(__v);
                 }
             };
-            // `wrap_fallible` (not just a bare `(#lhs_block)?`) matters
-            // here: its explicit closure-return-type annotation is what
-            // pins `#lhs_block`'s `Result`'s error type for rustc --
-            // every *other* `partial_aware_for` use instead gets that
-            // from being passed straight into `bubble`/`bubble1`'s
-            // concretely-typed parameter, which doesn't apply here.
-            let lhs_block = wrap_fallible(partial_aware_for(&lhs_c, &quote!(__v), body));
+            let lhs_block = partial_aware_for(&lhs_c, &quote!(__v), body);
             Ok(quote! {
                 {
                     let __filtered = (#lhs_block)?;
@@ -327,9 +312,10 @@ fn compile_raw(expr: &Expr, input: &TokenStream, scope: &mut Vec<String>) -> CRe
                     let catch_c = compile(c, &quote!(&__caught), scope)?;
                     quote! {
                         Err(mut e) => {
-                            let __out = ::std::mem::take(&mut e.emitted);
+                            let mut __out = ::std::mem::take(&mut e.emitted);
                             let __caught = e.into_value();
-                            #bubble(__out, (#catch_c))
+                            #bubble(&mut __out, (#catch_c))?;
+                            Ok(__out)
                         }
                     }
                 }
@@ -368,7 +354,7 @@ fn compile_raw(expr: &Expr, input: &TokenStream, scope: &mut Vec<String>) -> CRe
             let body_c = body_c?;
             let bubble = core_path("bubble");
             let body = quote! {
-                __out = #bubble(__out, (#body_c))?;
+                #bubble(__out, (#body_c))?;
             };
             Ok(partial_aware_for(&source_c, &quote!(#jv), body))
         }
@@ -428,7 +414,7 @@ fn compile_raw(expr: &Expr, input: &TokenStream, scope: &mut Vec<String>) -> CRe
             let update_c = update_c?;
             let bubble = core_path("bubble");
             let extract_push = match extract_c? {
-                Some(ec) => quote!(__out = #bubble(__out, (#ec))?;),
+                Some(ec) => quote!(#bubble(&mut __out, (#ec))?;),
                 None => quote!(__out.push(__state.clone());),
             };
             Ok(quote! {
@@ -613,12 +599,12 @@ fn compile_binop(
     // `partial_aware_for` for both keeps already-computed combinations if
     // a later one (or either generator, partway through) fails.
     let inner_body = quote! {
-        __out = #bubble1(__out, (#op_call))?;
+        #bubble1(__out, (#op_call))?;
     };
     let inner = partial_aware_for(&lhs_c, &quote!(__lhs), inner_body);
     let bubble = core_path("bubble");
     let outer_body = quote! {
-        __out = #bubble(__out, (#inner))?;
+        #bubble(__out, (#inner))?;
     };
     Ok(partial_aware_for(&rhs_c, &quote!(__rhs), outer_body))
 }
@@ -644,7 +630,7 @@ fn compile_and_or(
         (quote!(), true)
     };
     let rhs_body = quote! {
-        __out = #bubble1(__out, Ok(#value_ty::Bool(#truthy(&__rhs))))?;
+        #bubble1(__out, Ok(#value_ty::Bool(#truthy(&__rhs))))?;
     };
     let rhs_block = partial_aware_for(&rhs_c, &quote!(__rhs), rhs_body);
     let bubble = core_path("bubble");
@@ -652,7 +638,7 @@ fn compile_and_or(
         if #short_circuit_on #truthy(&__lhs) {
             __out.push(#value_ty::Bool(#short_circuit_value));
         } else {
-            __out = #bubble(__out, (#rhs_block))?;
+            #bubble(__out, (#rhs_block))?;
         }
     };
     Ok(partial_aware_for(&lhs_c, &quote!(__lhs), lhs_body))
@@ -678,9 +664,9 @@ fn compile_if(
     let bubble = core_path("bubble");
     let body = quote! {
         if #truthy(&__cond) {
-            __out = #bubble(__out, (#then_c))?;
+            #bubble(__out, (#then_c))?;
         } else {
-            __out = #bubble(__out, (#else_c))?;
+            #bubble(__out, (#else_c))?;
         }
     };
     Ok(partial_aware_for(&cond_c, &quote!(__cond), body))
@@ -713,10 +699,7 @@ fn compile_slice(
     let base_body = quote! {
         match #slice_value(&__base, __from, __to) {
             Ok(v) => __out.push(v),
-            Err(mut e) => if !#optional {
-                e.emitted = __out;
-                return Err(e);
-            },
+            Err(e) => if !#optional { return Err(e); },
         }
     };
     let base_block = partial_aware_for(&base_c, &quote!(__base), base_body);
@@ -726,12 +709,9 @@ fn compile_slice(
                 match #to_i64(&__to_src) {
                     Ok(__to_val) => {
                         let __to: ::std::option::Option<i64> = ::std::option::Option::Some(__to_val);
-                        __out = #bubble(__out, (#base_block))?;
+                        #bubble(__out, (#base_block))?;
                     }
-                    Err(mut e) => {
-                        e.emitted = __out;
-                        return Err(e);
-                    }
+                    Err(e) => return Err(e),
                 }
             };
             partial_aware_for(&c, &quote!(__to_src), to_body)
@@ -749,12 +729,9 @@ fn compile_slice(
                 match #to_i64(&__from_src) {
                     Ok(__from_val) => {
                         let __from: ::std::option::Option<i64> = ::std::option::Option::Some(__from_val);
-                        __out = #bubble(__out, (#with_to))?;
+                        #bubble(__out, (#with_to))?;
                     }
-                    Err(mut e) => {
-                        e.emitted = __out;
-                        return Err(e);
-                    }
+                    Err(e) => return Err(e),
                 }
             };
             partial_aware_for(&c, &quote!(__from_src), from_body)
@@ -796,13 +773,13 @@ fn cartesian_args(
     let mut block: TokenStream = quote! {
         {
             let mut __out = ::std::vec::Vec::new();
-            __out = #bubble1(__out, (#pushed))?;
+            #bubble1(&mut __out, (#pushed))?;
             Ok(__out)
         }
     };
     for (name, c) in names.iter().zip(compiled.iter()).rev() {
         let body = quote! {
-            __out = #bubble(__out, (#block))?;
+            #bubble(__out, (#block))?;
         };
         block = partial_aware_for(c, &quote!(#name), body);
     }
@@ -984,7 +961,7 @@ fn compile_call(
             let bubble = core_path("bubble");
             let jresult_ty = core_path("JResult");
             let body = quote! {
-                __out = #bubble(__out, (|| -> #jresult_ty<::std::vec::Vec<#value_ty>> {
+                #bubble(__out, (|| -> #jresult_ty<::std::vec::Vec<#value_ty>> {
                     Ok(#range_values(0.0, #to_f64(&__to)?, 1.0))
                 })())?;
             };
@@ -1027,22 +1004,22 @@ fn compile_range(
         Some(s) => {
             let step_c = compile(s, input, scope)?;
             let step_body = quote! {
-                __out = #bubble(__out, (|| -> #jresult_ty<::std::vec::Vec<#value_ty>> {
+                #bubble(__out, (|| -> #jresult_ty<::std::vec::Vec<#value_ty>> {
                     Ok(#range_values(#to_f64(&__from)?, #to_f64(&__to)?, #to_f64(&__step)?))
                 })())?;
             };
             let step_block = partial_aware_for(&step_c, &quote!(__step), step_body);
-            quote! { __out = #bubble(__out, (#step_block))?; }
+            quote! { #bubble(__out, (#step_block))?; }
         }
         None => quote! {
-            __out = #bubble(__out, (|| -> #jresult_ty<::std::vec::Vec<#value_ty>> {
+            #bubble(__out, (|| -> #jresult_ty<::std::vec::Vec<#value_ty>> {
                 Ok(#range_values(#to_f64(&__from)?, #to_f64(&__to)?, 1.0))
             })())?;
         },
     };
     let to_block = partial_aware_for(&to_c, &quote!(__to), to_body);
     let from_body = quote! {
-        __out = #bubble(__out, (#to_block))?;
+        #bubble(__out, (#to_block))?;
     };
     Ok(partial_aware_for(&from_c, &quote!(__from), from_body))
 }

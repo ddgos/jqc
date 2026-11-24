@@ -9,6 +9,6 @@
 mod error;
 mod helpers;
 
-pub use error::{bubble, bubble1, JResult, JqError};
+pub use error::{bubble, bubble1, partial_for, JResult, JqError};
 pub use helpers::*;
 pub use serde_json::{json, Map, Number, Value};

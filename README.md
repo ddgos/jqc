@@ -38,6 +38,13 @@ builds `jqc-build/examples/select-active.jq` this way as a Nix derivation
 (reproducibly, offline -- see `mkJqScript` in `flake.nix`, exposed as
 `lib.mkJqScript` for other flakes to build their own scripts this way).
 
+It caps the `cargo build` it shells out to at a fraction of physical RAM
+(`JQC_BUILD_MEM_LIMIT_GB` to override) as defense-in-depth against a
+pathological script's compile blowing up the host rather than just that one
+process -- unrelated to any currently-known `jqc` bug (see the
+`codegen-size-blowup` todo-report for the one real incident this guarded
+against, since fixed at the root).
+
 ### Targeting a specific jq version
 
 `jq!("...")` with no version argument targets the newest jq version this
@@ -121,20 +128,6 @@ below), and builtins: `map`, `select`, `values`, `recurse(;f)`, `in`,
   semantics) but that approach can't terminate for a recursive, parameterized
   def, so it's rejected at compile time with a clear error instead of hanging
   or silently looping forever.
-- **Non-recursive call-by-name inlining can still blow up disproportionately
-  to the source size**, independently of (and not fixed by) the `def_scope`
-  `Rc` fix above. A `def` whose body nests a few *different* builtin/prelude
-  calls -- one call's filter-argument itself containing another builtin call,
-  e.g. `round | to_entries | map(if (daggers | any(. == .key)) then … end)`
-  -- re-lowers the already-expanded inner content from scratch each time a
-  call-by-name substitution happens one level up, rather than caching it.
-  A single such `def`, called just twice from two different sites, measured
-  tens of seconds and multiple GB of RAM to macro-expand on real-world jq
-  (not synthetic-benchmark-shaped) code -- see the `real-world-script-debugging`
-  todo-report. `jqc-build` now caps the `cargo build` it shells out to at a
-  fraction of physical RAM (`JQC_BUILD_MEM_LIMIT_GB` to override) so a
-  pathological script fails fast and safely instead of risking the host;
-  the underlying lowering-pass inefficiency itself is unfixed.
 - Not implemented: `path`/`paths`/`getpath`/`setpath`/`del`, update-
   assignment operators (`|=`, `+=`, …), `input`/`inputs`/`$ENV`,
   `label`/`break`, SQL-style ops, module `import`/`include`.

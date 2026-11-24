@@ -130,7 +130,23 @@ pub fn jq(input: TokenStream) -> TokenStream {
 
     let src = parsed.filter.value();
     match lower::parse_and_lower(&src, version).and_then(|ast| TreeWalkCodegen.compile_top(&ast)) {
-        Ok(ts) => ts.into(),
+        Ok(ts) => {
+            // A cheap early-warning canary for codegen-size blowups (see
+            // `jqc_core::partial_for`'s doc comment for the incident this
+            // is here because of): no assertion, since "how big is too
+            // big" depends on the filter, but printing it makes a future
+            // regression visible immediately instead of only showing up
+            // as a mysteriously slow/memory-hungry downstream build.
+            if std::env::var_os("JQC_DEBUG_EXPAND_SIZE").is_some() {
+                let s = ts.to_string();
+                eprintln!(
+                    "jq!({src:?}): expanded to {} chars, {} braces",
+                    s.len(),
+                    s.matches('{').count()
+                );
+            }
+            ts.into()
+        }
         Err(msg) => syn::Error::new(parsed.filter.span(), format!("jq!: {msg}"))
             .to_compile_error()
             .into(),

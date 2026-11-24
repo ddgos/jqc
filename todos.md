@@ -13,21 +13,6 @@ Work on the known limitations. Fix any which can reasonably be fixed. Only
 remove this task once limitations that are genuine limitations of the project
 remain.
 
-Fix the lowering-pass scaling bug found via a real user script (see the
-`real-world-script-debugging` todo-report): a `def` whose body nests a few different
-builtin/prelude calls -- one call's filter-argument itself containing another
-builtin call -- re-lowers the already-expanded inner content from scratch at
-each call-by-name substitution site instead of caching it, and a single such
-`def` called from just two sites measured tens of seconds and multiple GB to
-macro-expand. `jqc-build` now caps its child `cargo build`'s memory so this
-fails safely rather than risking the host, but the underlying inefficiency in
-`jqc-compiler/src/lower.rs`'s `lower_call` is not yet fixed. Likely needs
-either memoizing `lower()` on already-lowered subtrees (making a second pass
-over one genuinely idempotent instead of just "a no-op modulo tree-walk
-cost") or moving to a different compilation strategy for call-by-name filter
-params (e.g. actual Rust closures passed as values, rather than textual
-substitution) -- investigate both before committing to one.
-
 Improve upon the script and input fuzzing. Part of this should be using
 arbitrary utf-8 strings for the scripts and input. Part of this should be to
 work up the proptest generators until every valid script and input will in
