@@ -9,15 +9,11 @@ git. Do these in whichever order makes the most sense.
 
 ## Tasks
 
-Write tests to cover every known discrepancy between our results and the true
-`jq` results. These should be marked as xfail, or the Rust equivalent. One is
-already tracked (`[repeat(.*2, error)?]`, in
-`jqc-manual-tests-macros`'s `KNOWN_RUNTIME_DISCREPANCIES`) -- check whether
-`jqc/tests/differential.rs`'s hand-written suite needs the same treatment, or
-whether this is already complete.
-
 Improve compliance by removing xfail from a test, and making it go green. Do not
-remove this task until there are no longer xfail tests.
+remove this task until there are no longer xfail tests. Currently one xfail:
+`repeat_error_optional` in `jqc/tests/differential.rs` (and its twin in
+`jqc-manual-tests-macros`'s `KNOWN_RUNTIME_DISCREPANCIES`) -- `[repeat(.*2,
+error)?]` on input `1` gives `[]`, real jq gives `[2]`.
 
 Once codegen is generic, and compliance with `jq` is 100%, add a feature flag to
 the crate to enable multi-core utilisation by the generated code. This codegen

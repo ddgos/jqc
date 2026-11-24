@@ -53,6 +53,36 @@ macro_rules! difftest {
     };
 }
 
+/// A known, tracked discrepancy: compiles and runs without erroring, but
+/// its output doesn't match real `jq`. Unlike `difftest!`, this asserts
+/// the *current* (wrong) output, so the test goes red -- not silently
+/// stays green -- the moment `jqc` is fixed, which is the signal to
+/// delete the `$want_now` override and promote it to a plain `difftest!`.
+/// See `jqc-manual-tests-macros`'s `KNOWN_RUNTIME_DISCREPANCIES` for the
+/// auto-generated-suite's equivalent.
+macro_rules! xfail_difftest {
+    ($name:ident, $src:literal, $input:literal, want_now: $want_now:expr, $reason:literal) => {
+        #[test]
+        fn $name() {
+            let compiled = jqc::jq!($src);
+            let input: Value = serde_json::from_str($input).expect("test input must be valid JSON");
+            let got = compiled(&input)
+                .unwrap_or_else(|e| panic!("compiled filter {:?} errored: {e}", $src));
+            let real_jq = run_real_jq($src, $input);
+            assert_ne!(
+                got, real_jq,
+                "filter {:?} on input {} now matches real jq -- promote to difftest! ({})",
+                $src, $input, $reason
+            );
+            assert_eq!(
+                got, $want_now,
+                "filter {:?} on input {}: current output changed",
+                $src, $input
+            );
+        }
+    };
+}
+
 difftest!(identity, ".", r#"{"a":1}"#);
 difftest!(field, ".a", r#"{"a":1,"b":2}"#);
 difftest!(nested_field, ".a.b", r#"{"a":{"b":42}}"#);
@@ -218,6 +248,15 @@ difftest!(
 );
 difftest!(while_builtin, "[while(. < 100; . * 2)]", "1");
 difftest!(until_builtin, "until(. >= 100; . * 2)", "1");
+xfail_difftest!(
+    repeat_error_optional,
+    "[repeat(.*2, error)?]",
+    "1",
+    want_now: vec![jqc::core::json!([])],
+    "jqc's repeat()/error interaction with `?` doesn't match real jq's \
+     lazy-generator short-circuit semantics yet (jqc: [], real jq: [2]); \
+     found via jqc-manual-tests' generated suite (jq 1.8 manual example)"
+);
 difftest!(optional_chain, ".a.b?.c", r#"{"a":1}"#);
 difftest!(
     array_of_objects,
