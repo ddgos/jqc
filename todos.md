@@ -14,7 +14,8 @@ output in colour etc the same as `jq`, so it can be a drop in replacement.
 
 Work on the known limitations. Fix any which can reasonably be fixed. Only
 remove this task once limitations that are genuine limitations of the project
-remain.
+remain. If at any point new bugs are identified, they should be isolated with
+xfail tests, then fixed as part of this task, rather than fixed immediately.
 
 Improve upon the script and input fuzzing. Part of this should be using
 arbitrary utf-8 strings for the scripts and input. Part of this should be to
@@ -23,11 +24,6 @@ theory be tested. Do not stop until both of these are true.
 
 Identify some area of the code that could be tidied up, and refactor as desired.
 Do not remove this task until the code is as polished as possible.
-
-Look at the `jq` source code (not just the manual) to identify more test cases
-that could be generated automatically -- e.g. jq's own C test suite
-(`tests/jq.test` and similar in a jq source checkout), as distinct from the
-manual-example generator that already exists (`jqc-manual-tests`).
 
 Look for opportunities to use SIMD optimisation techniques. Implement as a
 new implementation of the codegen trait.

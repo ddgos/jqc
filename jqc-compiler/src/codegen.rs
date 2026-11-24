@@ -65,6 +65,31 @@ fn label_key(name: &str) -> String {
     format!("\0label\0{name}")
 }
 
+/// `let #binding = #fetch_or_bubble(...)` fetches a fallible step's own
+/// `Vec<Value>` result into `binding` (for further per-element processing
+/// right there, unlike [`partial_aware_for`]'s pass-through case) while
+/// still merging a pre-existing `__out: Vec<Value>` accumulator into the
+/// error's `emitted` on failure, the same way [`core::bubble`] would --
+/// used by `Expr::Reduce`/`Expr::Foreach`'s `update` clause, which must
+/// fetch (not just extend-and-discard) its own result to drive the next
+/// iteration's state, but can still fail (e.g. a `break` from inside it)
+/// after `__out` already holds completed earlier iterations' output. A
+/// bare `(#expr)?` here -- what this replaced -- would propagate that
+/// error while silently discarding everything `__out` already had.
+fn fetch_or_bubble(binding: TokenStream, expr: TokenStream) -> TokenStream {
+    quote! {
+        let #binding = match #expr {
+            ::std::result::Result::Ok(v) => v,
+            ::std::result::Result::Err(mut e) => {
+                let mut __taken = ::std::mem::take(&mut __out);
+                __taken.append(&mut e.emitted);
+                e.emitted = __taken;
+                return Err(e);
+            }
+        };
+    }
+}
+
 /// Builds a `JResult<Vec<Value>>`-typed expression that iterates `sub_c`'s
 /// output, binding each element to `item_ident` and running `body` once
 /// per element -- `body` extends/pushes onto its `__out: &mut Vec<Value>`
@@ -161,8 +186,25 @@ fn compile_raw(expr: &Expr, input: &TokenStream, scope: &mut Vec<String>) -> CRe
         Expr::Number(n) => {
             let value_ty = core_path("Value");
             let number_from_f64 = core_path("number_from_f64");
+            // A bare float literal token can't represent a non-finite
+            // value (`quote`'s `ToTokens` for `f64` asserts `is_finite()`
+            // and panics otherwise) -- an overflowing literal like
+            // `1e999999999` (real jq keeps such literals' exact decimal
+            // text and prints them back verbatim; jqc's `Value` is a
+            // plain `f64`, so this is already a divergence, not a new
+            // one) parses to `f64::INFINITY` and must be spelled as that
+            // expression instead of a literal.
+            let n_expr = if n.is_finite() {
+                quote!(#n)
+            } else if n.is_nan() {
+                quote!(::std::primitive::f64::NAN)
+            } else if *n > 0.0 {
+                quote!(::std::primitive::f64::INFINITY)
+            } else {
+                quote!(::std::primitive::f64::NEG_INFINITY)
+            };
             Ok(quote!(Ok(
-                ::std::vec![#value_ty::Number(#number_from_f64(#n))]
+                ::std::vec![#value_ty::Number(#number_from_f64(#n_expr))]
             )))
         }
         Expr::Str(parts) => compile_str(parts, input, scope),
@@ -466,13 +508,14 @@ fn compile_raw(expr: &Expr, input: &TokenStream, scope: &mut Vec<String>) -> CRe
             scope.pop();
             let update_c = update_c?;
             let value_ty = core_path("Value");
+            let fetch_updates = fetch_or_bubble(quote!(__updates), quote!(#update_c));
             Ok(quote! {
                 {
                     let mut __out = ::std::vec::Vec::new();
                     for __init in (#init_c)? {
                         let mut __state = __init;
                         for #jv in (#source_c)? {
-                            let __updates = (#update_c)?;
+                            #fetch_updates
                             __state = __updates.into_iter().last().unwrap_or(#value_ty::Null);
                         }
                         __out.push(__state);
@@ -504,13 +547,14 @@ fn compile_raw(expr: &Expr, input: &TokenStream, scope: &mut Vec<String>) -> CRe
                 Some(ec) => quote!(#bubble(&mut __out, (#ec))?;),
                 None => quote!(__out.push(__state.clone());),
             };
+            let fetch_updates = fetch_or_bubble(quote!(__updates), quote!(#update_c));
             Ok(quote! {
                 {
                     let mut __out = ::std::vec::Vec::new();
                     for __init in (#init_c)? {
                         let mut __state = __init;
                         for #jv in (#source_c)? {
-                            let __updates = (#update_c)?;
+                            #fetch_updates
                             for __next_state in __updates {
                                 __state = __next_state;
                                 #extract_push

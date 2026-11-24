@@ -487,8 +487,17 @@ fn contains_call(expr: &Expr, name: &str, arity: usize) -> bool {
             rest,
             ..
         } => {
+            // If this nested def redefines `name` at the same arity, it
+            // shadows it for *both* its own body (self-recursion refers
+            // to the inner def) and its rest (which is lexically inside
+            // the inner def's scope too, all the way to wherever that
+            // scope ends) -- not just the body alone. Getting this wrong
+            // previously caused a real div-by-zero-grade bug: a `g`
+            // mentioned in `rest` that actually refers to a *shadowing*
+            // inner `def g` was miscounted as a call to the *outer* `g`,
+            // misclassifying an outer non-recursive def as recursive.
             let shadowed = inner_name == name && params.len() == arity;
-            (!shadowed && contains_call(body, name, arity)) || contains_call(rest, name, arity)
+            !shadowed && (contains_call(body, name, arity) || contains_call(rest, name, arity))
         }
         Expr::RecFn0 {
             name: inner_name,
@@ -496,7 +505,7 @@ fn contains_call(expr: &Expr, name: &str, arity: usize) -> bool {
             rest,
         } => {
             let shadowed = inner_name == name && arity == 0;
-            (!shadowed && contains_call(body, name, arity)) || contains_call(rest, name, arity)
+            !shadowed && (contains_call(body, name, arity) || contains_call(rest, name, arity))
         }
     }
 }
@@ -688,32 +697,42 @@ fn rewrite_call0(expr: Expr, target: &str, build: &mut dyn FnMut() -> Expr) -> E
             rest,
             span,
         } => {
+            // As in `contains_call`: a nested def that redefines `target`
+            // shadows it for *both* its body and its rest, so neither
+            // should have `target`'s own calls rewritten -- any `target`
+            // mentioned there refers to *this* def, not the one being
+            // rewritten. Previously only `body` got this protection,
+            // which corrupted a legitimately-shadowed reference in
+            // `rest` into e.g. a `RecCall` meant for an unrelated outer
+            // def, producing genuine infinite recursion at runtime.
             let shadowed = name == target && params.is_empty();
-            let body = if shadowed {
-                body
+            let (body, rest) = if shadowed {
+                (body, rest)
             } else {
-                Box::new(rewrite_call0(*body, target, build))
+                (
+                    Box::new(rewrite_call0(*body, target, build)),
+                    Box::new(rewrite_call0(*rest, target, build)),
+                )
             };
             Expr::FuncDef {
                 name,
                 params,
                 body,
-                rest: Box::new(rewrite_call0(*rest, target, build)),
+                rest,
                 span,
             }
         }
         Expr::RecFn0 { name, body, rest } => {
             let shadowed = name == target;
-            let body = if shadowed {
-                body
+            let (body, rest) = if shadowed {
+                (body, rest)
             } else {
-                Box::new(rewrite_call0(*body, target, build))
+                (
+                    Box::new(rewrite_call0(*body, target, build)),
+                    Box::new(rewrite_call0(*rest, target, build)),
+                )
             };
-            Expr::RecFn0 {
-                name,
-                body,
-                rest: Box::new(rewrite_call0(*rest, target, build)),
-            }
+            Expr::RecFn0 { name, body, rest }
         }
     }
 }

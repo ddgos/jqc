@@ -1,0 +1,15 @@
+[package]
+name = "jqc-c-tests"
+# `workspace.exclude`d (see the root Cargo.toml), so this can't inherit
+# `[workspace.package]` -- kept in sync with it by hand.
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Differential tests generated from jq's own C test suite (see jqc-c-tests-macros). Excluded from the main workspace: needs $JQ_SRC (the Nix dev shell provides it) at compile time, run via `cargo test --manifest-path jqc-c-tests/Cargo.toml`."
+publish = false
+
+[dependencies]
+jqc = { path = "../jqc", version = "0.1.0" }
+jqc-compiler = { path = "../jqc-compiler", version = "0.1.0" }
+jqc-c-tests-macros = { path = "../jqc-c-tests-macros", version = "0.1.0" }
+serde_json = "1"

@@ -281,6 +281,35 @@ difftest!(
     "[label $a | (label $b | (1,2,3) as $x | if $x == 2 then break $a else $x end), 99]",
     "null"
 );
+#[test]
+fn overflowing_number_literal_does_not_panic_codegen() {
+    // `1e999999999` overflows f64 to infinity at lex time -- a bare
+    // float literal can't spell that in generated Rust (`quote`'s
+    // `ToTokens` for `f64` asserts `is_finite()`), so this used to panic
+    // macro expansion outright rather than merely producing output that
+    // disagrees with real jq (which keeps the literal's exact decimal
+    // text rather than evaluating it as a plain f64, printing it back as
+    // `1E+999999999` -- a real, accepted divergence given jqc's `Value`
+    // is a plain f64, not worth chasing; this test only guards against
+    // the crash, not a `jq`-equivalent result).
+    let filter = jqc::jq!("1e999999999");
+    let input = jqc::core::json!(null);
+    let got = filter(&input).expect("should compile and run without panicking");
+    assert_eq!(got, vec![jqc::core::json!(0)]);
+}
+difftest!(
+    nested_def_shadows_outer_same_name_in_its_own_rest,
+    // Found via jq's own C test suite (jqc-c-tests): the inner `def g`'s
+    // `rest` (`f | g | f`) is lexically inside *its* scope, so `g` there
+    // means the inner `.+100` def, not the outer one -- getting this
+    // wrong misclassified the (actually non-recursive) outer `g` as
+    // recursive and, separately, could rewrite a legitimately-shadowed
+    // call into a `RecCall` for an unrelated def, producing genuine
+    // infinite recursion (a real stack overflow, not just a wrong
+    // answer) until fixed in contains_call/rewrite_call0.
+    "def f: . + 1; def g: def g: . + 100; f | g | f; (f | g), g",
+    "3"
+);
 difftest!(limit_basic, "[limit(2; range(0; 5))]", "null");
 difftest!(limit_zero, "[limit(0; range(0; 5))]", "null");
 difftest!(limit_more_than_available, "[limit(10; range(0; 3))]", "null");
@@ -356,3 +385,4 @@ fn optional_only_suppresses_its_own_step() {
     let input: Value = serde_json::from_str(r#"{"a":1}"#).unwrap();
     assert!(compiled(&input).is_err());
 }
+

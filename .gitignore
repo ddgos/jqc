@@ -5,3 +5,5 @@
 # build as their own standalone crate, with their own target dir.
 /jqc-manual-tests/target
 /jqc-manual-tests-macros/target
+/jqc-c-tests/target
+/jqc-c-tests-macros/target

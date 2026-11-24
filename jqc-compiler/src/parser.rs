@@ -830,10 +830,14 @@ impl Parser {
                 let span = self.cur_span();
                 self.bump();
                 if *self.peek() == Tok::Colon {
+                    // `$x: val` -- confirmed against real jq: unlike the
+                    // no-colon shorthand below, the key here is `$x`'s
+                    // own *value* (same as a parenthesized computed key
+                    // `($x): val` would be), not the literal name "x".
                     self.bump();
                     let val = self.parse_pipe_no_comma()?;
                     Ok(ObjEntry {
-                        key: str_literal(name),
+                        key: Expr::VarRef(name, span),
                         val,
                     })
                 } else {

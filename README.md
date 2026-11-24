@@ -186,6 +186,20 @@ below), and builtins: `map`, `select`, `values`, `recurse(;f)`, `in`,
   shell. Re-run with a different `version = "..."` in
   `jqc-manual-tests/tests/generated.rs` to generate against a different
   jq release's manual instead.
+- `cargo test --manifest-path jqc-c-tests/Cargo.toml` -- differential
+  tests generated from jq's *own* C test suite (`tests/jq.test` in the
+  same `$JQ_SRC` checkout), parsed with the same two-line-marker/blank-
+  or-comment-terminated grouping algorithm as jq's own test runner
+  (`src/jq_test.c`). Same three-way split as the manual-tests suite
+  above (real differential test / xfail-unsupported / `#[ignore]`d known
+  discrepancy), plus a fourth: a `%%FAIL` case, expected to fail to
+  compile, generates an xfail asserting exactly that (with its own small
+  `#[ignore]`d list for the few jq rejects that `jqc` currently accepts).
+  Unlike the manual's curated examples, jq's C suite is deliberately
+  adversarial -- plenty of cases expect a *runtime* error on that input,
+  so the generated test tolerates either side erroring as long as they
+  agree about *which*. Also `workspace.exclude`d for the same `$JQ_SRC`-
+  at-compile-time reason as jqc-manual-tests.
 - `cargo bench -p jqc` -- criterion benchmarks of the generated code itself
   (not the macro-expansion step, which only runs once at compile time)
   across input sizes, each with a real-`jq`-subprocess series alongside it

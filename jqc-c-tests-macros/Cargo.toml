@@ -1,0 +1,17 @@
+[package]
+name = "jqc-c-tests-macros"
+# `workspace.exclude`d (see the root Cargo.toml), so this can't inherit
+# `[workspace.package]` -- kept in sync with it by hand.
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "generate_c_tests!(): reads jq's own C test suite (tests/jq.test in a jq source checkout, via $JQ_SRC) and emits one differential test per case jqc can currently compile, plus an xfail test per case it can't -- distinct from jqc-manual-tests-macros, which generates from the manual's documentation examples instead"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "3", features = ["full"] }
+jqc-compiler = { path = "../jqc-compiler", version = "0.1.0" }

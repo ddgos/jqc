@@ -8,16 +8,19 @@ members = [
     "jqc-build",
     "examples",
 ]
-# jqc-manual-tests(-macros) need $JQ_SRC (a jq source checkout; the Nix
-# dev shell provides it) at compile time, not just at test-run time like
-# the differential suite's $PATH jq. `exclude` (not just omitting them
-# from `members`) keeps them out of *every* `--workspace` command, not
-# only the no-argument default -- `cargo test --workspace` would
-# otherwise still build them and fail for anyone outside the dev shell.
-# Reach them via `cargo test --manifest-path jqc-manual-tests/Cargo.toml`.
+# jqc-manual-tests(-macros) and jqc-c-tests(-macros) need $JQ_SRC (a jq
+# source checkout; the Nix dev shell provides it) at compile time, not
+# just at test-run time like the differential suite's $PATH jq. `exclude`
+# (not just omitting them from `members`) keeps them out of *every*
+# `--workspace` command, not only the no-argument default -- `cargo test
+# --workspace` would otherwise still build them and fail for anyone
+# outside the dev shell. Reach them via `cargo test --manifest-path
+# jqc-manual-tests/Cargo.toml` / `jqc-c-tests/Cargo.toml`.
 exclude = [
     "jqc-manual-tests-macros",
     "jqc-manual-tests",
+    "jqc-c-tests-macros",
+    "jqc-c-tests",
 ]
 
 [workspace.package]

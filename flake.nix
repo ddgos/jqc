@@ -249,9 +249,10 @@
       #   fuzz_inputs, the jqc-compiler scaling-check regression guards,
       #   doc-tests -- everything README.md lists as part of a plain
       #   `cargo test --workspace`).
-      # - `manual-tests` covers the one workspace-excluded suite
-      #   (jqc-manual-tests, excluded because it needs `$JQ_SRC` at
-      #   *compile* time, which a plain `--workspace` run can't assume).
+      # - `manual-tests` / `c-tests` cover the two workspace-excluded
+      #   suites (jqc-manual-tests, jqc-c-tests -- both excluded because
+      #   they need `$JQ_SRC` at *compile* time, which a plain
+      #   `--workspace` run can't assume).
       # Deliberately not included: `fuzz_scripts -- --ignored` (README
       # calls out as slow/off-by-default) and the wall-time/peak-RSS
       # benchmarks under `--ignored` (diagnostics, not pass/fail checks).
@@ -269,6 +270,19 @@
             # Needed at compile time, not just test-run time: the
             # generate_manual_tests! proc macro reads manual.yml from
             # here while expanding, during `cargo test`'s own build step.
+            JQ_SRC = "${jq-src}";
+            dontBuild = true;
+            installPhase = "mkdir -p $out";
+          };
+          c-tests = pkgs.rustPlatform.buildRustPackage {
+            pname = "jqc-c-tests";
+            version = "0.1.0";
+            src = self;
+            sourceRoot = "source/jqc-c-tests";
+            cargoLock.lockFile = ./jqc-c-tests/Cargo.lock;
+            nativeCheckInputs = [ pkgs.jq ];
+            # As with manual-tests above: generate_c_tests! reads jq.test
+            # from here while expanding, during `cargo test`'s build step.
             JQ_SRC = "${jq-src}";
             dontBuild = true;
             installPhase = "mkdir -p $out";
