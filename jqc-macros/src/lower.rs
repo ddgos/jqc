@@ -11,6 +11,8 @@
 //! - Mutually-recursive and parameterized-recursive defs are out of scope
 //!   and rejected with a clear error rather than silently miscompiled.
 
+use std::rc::Rc;
+
 use crate::ast::{Expr, ObjEntry, Param, StrPart};
 use crate::parser::parse_program;
 
@@ -48,7 +50,12 @@ struct DefEntry {
     arity: usize,
     params: Vec<Param>,
     raw_body: Expr,
-    def_scope: Vec<DefEntry>,
+    // `Rc`, not `Vec`: each def_scope already contains the full history of
+    // prior defs, so a plain `Vec<DefEntry>` clone (e.g. in `scope.to_vec()`
+    // below) would recursively deep-clone every entry's own def_scope too --
+    // O(2^n) total memory for n sequential defs, independent of whether any
+    // of them are ever called. Sharing via `Rc` makes every such clone O(1).
+    def_scope: Rc<Vec<DefEntry>>,
 }
 
 fn lower(expr: Expr, scope: &[DefEntry]) -> LResult<Expr> {
@@ -223,7 +230,7 @@ fn lower_funcdef(
         arity,
         params,
         raw_body: body,
-        def_scope: def_scope.clone(),
+        def_scope: Rc::new(def_scope.clone()),
     };
     def_scope.push(entry);
     lower(rest, &def_scope)

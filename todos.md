@@ -9,11 +9,6 @@ git. Do these in whichever order makes the most sense.
 
 ## Tasks
 
-Fix the memory explosion in `lower_funcdef`: it clones the recursively-nested
-`def_scope` at every `def`, used or not, which blew up to 38GB+ RSS (and was
-killed before OOM-reaping the machine) compiling just 400 trivial unused defs
-during safeguard testing. Root-cause fix, not just the rlimit safeguard above.
-
 Write benchmarks for the peak RAM usage of the codegen process.
 
 Make the codegen a trait so that different implementations of the codegen can
