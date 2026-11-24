@@ -31,3 +31,6 @@ of the trait so that comparisons between implementations are easier to make.
 Investigate the feasibility (and implement if it makes sense) for jqc-build, or
 the jpc-build flake application to build the resulting binary into the nix store
 so that I can run `"$(nix build <flake> <script>)"` and it would run.
+
+Audit the existing code for situations where an external crate may allow for
+simplifying this project.
