@@ -9,6 +9,14 @@ git. Do these in whichever order makes the most sense.
 
 ## Tasks
 
+Make the change from eager evaluation to lazy evaluation. Being 100% compliant
+with real `jq` is a goal of this project.
+
+Audit the current usage of serde. Is it a good fit for the project? This project
+is only concerned with json data, so using a specialist crate might provide
+advantages. Futhermore, some of the default behaviour provided by serde may not
+be a good match for this project, making the code rough around the edges.
+
 Work on the known limitations. Fix any which can reasonably be fixed. Only
 remove this task once limitations that are genuine limitations of the project
 remain. If at any point new bugs are identified, they should be isolated with
@@ -23,6 +31,7 @@ guaranteed to be valid utf-8, so differences from real `jq` on invalid-utf-8
 input could currently be going unnoticed.
 
 Identify some area of the code that could be tidied up, and refactor as desired.
+An example of this would be seemingly duplicate functions for `fn run_real_jq`.
 Do not remove this task until the code is as polished as possible.
 
 Persue whatever optimisations possible. Always keep as separate implementations
