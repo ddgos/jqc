@@ -11,6 +11,16 @@ git. Do these in whichever order makes the most sense.
 
 Remove the binary produced by this crate.
 
+I'm not sure that the benchmarks comparing this project with true `jq` is fair.
+The benchmarks for this project are not interacting with the file i/o system so
+naturally have a significant advantage. Remove the true `jq` benchmarks if this
+is the case. Add a task at the end of the task list to make some fair benchmarks
+(such as by using the result of the binary producing derivation in a later task)
+to compare against true `jq`.
+
+Consider adding `gnuplot` to the dev shell for producing benchmark graphs, but
+don't discount using `plotters` since it seems like a good project too.
+
 Improve compliance by removing xfail from a test, and making it go green. Do not
 remove this task until there are no longer xfail tests. Currently one xfail:
 `repeat_error_optional` in `jqc/tests/differential.rs` (and its twin in
@@ -22,8 +32,11 @@ by nixpkgs-unstable does not provide all of these functions. Override the
 provided jq package such that all of the math functions work in the nix develop
 environment's jq.
 
-Consider using github:oxalica/rust-overlay and github:numtide/flake-utils for
-the flake to simplify.
+Consider using github:oxalica/rust-overlay, github:numtide/flake-utils, and
+https://github.com/ipetkov/crane for the flake.
+
+Allow using https://github.com/criterion-rs/cargo-criterion in the dev shell
+so that `cargo criterion` works as expected.
 
 The dev environment should have access to every version of `jq` supported by the
 crate simultaneously so that tests can be run from a single environment.
@@ -66,6 +79,9 @@ theory be tested. Do not stop until both of these are true.
 
 Identify some area of the code that could be tidied up, and refactor as desired.
 Do not remove this task until the code is as polished as possible.
+
+Look at the `jq` source code to identify more test cases that could be generated
+automatically, like the tests from the examples in the manual.
 
 When I run `nix build` I see an error. When I run `nix develop -c cargo test`,
 I don't. Seems like `jq` is not on path for `nix build`.
