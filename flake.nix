@@ -10,13 +10,21 @@
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     nixpkgs-jq-1-6.url = "github:NixOS/nixpkgs/nixos-23.05"; # last channel shipping jq 1.6
     nixpkgs-jq-1-7.url = "github:NixOS/nixpkgs/nixos-23.11"; # first channel shipping jq 1.7.1
+    # jq's own source, pinned to match the default jq version above --
+    # docs/content/manual/ in this checkout holds the manual's worked
+    # examples for every jq release (v1.3 through this one), which
+    # jqc-manual-tests generates differential tests from.
+    jq-src = {
+      url = "github:jqlang/jq/jq-1.8.2";
+      flake = false;
+    };
     typix = {
       url = "github:loqusion/typix";
       inputs.nixpkgs.follows = "nixpkgs";
     };
   };
 
-  outputs = { self, nixpkgs, nixpkgs-jq-1-6, nixpkgs-jq-1-7, typix }:
+  outputs = { self, nixpkgs, nixpkgs-jq-1-6, nixpkgs-jq-1-7, jq-src, typix }:
     let
       systems = [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ];
       forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f system);
@@ -45,6 +53,10 @@
             pkgs.cargo-tarpaulin
           ];
           RUST_BACKTRACE = "1";
+          # jqc-manual-tests-macros reads jq's own manual examples from
+          # here (docs/content/manual/**/manual.yml) to generate
+          # differential tests; see jq-src in `inputs` above.
+          JQ_SRC = "${jq-src}";
         };
 
       # Every `todo-reports/<name>/report.typ` becomes its own Typst project,

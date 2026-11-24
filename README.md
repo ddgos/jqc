@@ -131,6 +131,21 @@ and non-recursive `def` (see limitation below), and builtins: `map`,
   macro-expansion time, this works around it by writing each generated
   script into a scratch crate and rebuilding it per case, so it's slow
   (~1s/case) and off by default.
+- `cargo test --manifest-path jqc-manual-tests/Cargo.toml` -- differential
+  tests generated from jq's *own* manual examples (`docs/content/manual/
+  v<X.Y>/manual.yml` in a jq source checkout at `$JQ_SRC`, which the Nix
+  dev shell provides via the `jq-src` flake input). One real differential
+  test per example `jqc` can currently compile; one xfail test per
+  example it can't yet (asserting compilation still fails, so it flips
+  to a hard failure -- prompting promotion to a real test -- the moment
+  `jqc` gains the needed support); a hand-maintained list of known
+  runtime (not syntax) discrepancies get `#[ignore]`d instead of failing
+  outright. Not part of `cargo test --workspace`: needs `$JQ_SRC` at
+  *compile* time (not just test-run time), so it's `workspace.exclude`d
+  to avoid breaking a plain `--workspace` run for anyone outside the dev
+  shell. Re-run with a different `version = "..."` in
+  `jqc-manual-tests/tests/generated.rs` to generate against a different
+  jq release's manual instead.
 - `cargo bench -p jqc` -- criterion benchmarks of the generated code itself
   (not the macro-expansion step, which only runs once at compile time)
   across input sizes, each with a real-`jq`-subprocess series alongside it

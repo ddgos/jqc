@@ -1,2 +1,6 @@
 /target
 /todo-reports/**/*.pdf
+# jqc-manual-tests(-macros) are `workspace.exclude`d (see Cargo.toml) and
+# build as their own standalone crate, with their own target dir.
+/jqc-manual-tests/target
+/jqc-manual-tests-macros/target

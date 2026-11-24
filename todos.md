@@ -9,13 +9,12 @@ git. Do these in whichever order makes the most sense.
 
 ## Tasks
 
-Write a proc macro that runs generates tests from a path to the `jq` source code
-repository. This source code should be included as a nix flake dev dependency.
-In particular, generate tests from the examples included in the jq manual. This
-procedure should also be `jq` version aware.
-
 Write tests to cover every known discrepancy between our results and the true
-`jq` results. These should be marked as xfail, or the Rust equivalent.
+`jq` results. These should be marked as xfail, or the Rust equivalent. One is
+already tracked (`[repeat(.*2, error)?]`, in
+`jqc-manual-tests-macros`'s `KNOWN_RUNTIME_DISCREPANCIES`) -- check whether
+`jqc/tests/differential.rs`'s hand-written suite needs the same treatment, or
+whether this is already complete.
 
 Improve compliance by removing xfail from a test, and making it go green. Do not
 remove this task until there are no longer xfail tests.

@@ -1,0 +1,19 @@
+[package]
+name = "jqc-manual-tests-macros"
+# `workspace.exclude`d (see the root Cargo.toml), so this can't inherit
+# `[workspace.package]` -- kept in sync with it by hand.
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "generate_manual_tests!(): reads jq's own manual examples (docs/content/manual/**/manual.yml in a jq source checkout, via $JQ_SRC) and emits one differential test per example jqc can currently compile, plus an xfail test per example it can't"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "3", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+jqc-compiler = { path = "../jqc-compiler", version = "0.1.0" }

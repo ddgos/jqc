@@ -1,5 +1,22 @@
 {
   "nodes": {
+    "jq-src": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1781956686,
+        "narHash": "sha256-Im8Vv/92x9SYoBSALWNH6IQy2qUUrpy90mlOx0svuBE=",
+        "owner": "jqlang",
+        "repo": "jq",
+        "rev": "34f7186b86743a083a589741b6cea95293524108",
+        "type": "github"
+      },
+      "original": {
+        "owner": "jqlang",
+        "ref": "jq-1.8.2",
+        "repo": "jq",
+        "type": "github"
+      }
+    },
     "nixpkgs": {
       "locked": {
         "lastModified": 1795234589,
@@ -50,6 +67,7 @@
     },
     "root": {
       "inputs": {
+        "jq-src": "jq-src",
         "nixpkgs": "nixpkgs",
         "nixpkgs-jq-1-6": "nixpkgs-jq-1-6",
         "nixpkgs-jq-1-7": "nixpkgs-jq-1-7",
