@@ -21,10 +21,6 @@ theory be tested. Do not stop until both of these are true.
 Identify some area of the code that could be tidied up, and refactor as desired.
 Do not remove this task until the code is as polished as possible.
 
-Improve the quality of the error messages produced by `jqc-build`. Rust's error
-messages should be seen as the gold standard, where the location of the error is
-pinned down and fixes are suggested.
-
 Look at the `jq` source code (not just the manual) to identify more test cases
 that could be generated automatically -- e.g. jq's own C test suite
 (`tests/jq.test` and similar in a jq source checkout), as distinct from the

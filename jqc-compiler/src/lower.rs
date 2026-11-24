@@ -14,10 +14,11 @@
 use std::rc::Rc;
 
 use crate::ast::{Expr, ObjEntry, Param, StrPart};
+use crate::diagnostics::{Diagnostic, Span};
 use crate::parser::parse_program;
 use crate::version::JqVersion;
 
-pub type LResult<T> = Result<T, String>;
+pub type LResult<T> = Result<T, Diagnostic>;
 
 const PRELUDE: &str = r#"
 def map(f): [.[] | f];
@@ -43,10 +44,37 @@ def from_entries: map({ (.key // .Key // .name // .Name):
 def with_entries(f): to_entries | map(f) | from_entries;
 "#;
 
+/// `user_src`'s char offset and length within the string `parse_and_lower`
+/// actually lexes/parses/lowers (`PRELUDE` plus a wrapping `(`/`)`) --
+/// exposed so a caller that also runs [`crate::codegen`] on the resulting
+/// `Expr` (whose spans are still relative to that larger string, since
+/// codegen runs after `parse_and_lower` has already returned) can relocate
+/// a codegen-stage error back to `user_src`'s own coordinates the same way
+/// `parse_and_lower` relocates its own parse/lower-stage errors.
+pub fn user_src_window(user_src: &str) -> (usize, usize) {
+    (PRELUDE.chars().count() + 1 /* '\n' */, user_src.chars().count())
+}
+
 pub fn parse_and_lower(user_src: &str, version: JqVersion) -> LResult<Expr> {
-    let full = format!("{PRELUDE}\n({user_src}\n)");
-    let ast = parse_program(&full, version).map_err(|e| format!("jq parse error: {e}"))?;
-    lower(ast, &[])
+    // Every span produced while lexing/parsing/lowering `full` is relative
+    // to `full`, not `user_src` -- translate back before handing an error
+    // further up, so a caller rendering against `user_src` (not `full`,
+    // which it was never given) points at the right place, and so a
+    // "found ..." token description never names a token that only exists
+    // because of PRELUDE's own trailing wrapper (there is none now --
+    // `user_src` is simply the last thing in `full`, not parenthesized,
+    // since the prelude's final `;` already closes off everything before
+    // it and nothing here needs user_src's own top-level parse bounded any
+    // tighter than `parse_pipe` already bounds it). A span that lands
+    // entirely outside the window would be a bug in `PRELUDE` itself, not
+    // explainable in terms of the user's own source, so `relocate` drops
+    // it rather than mistranslating; one that runs past the very end
+    // (reaching real EOF) is clamped instead, so it still gets *a*
+    // location, right after the user's last character.
+    let (offset, len) = user_src_window(user_src);
+    let full = format!("{PRELUDE}\n{user_src}");
+    let ast = parse_program(&full, version).map_err(|e| e.relocate(offset, len))?;
+    lower(ast, &[]).map_err(|e| e.relocate(offset, len))
 }
 
 #[derive(Clone)]
@@ -66,8 +94,11 @@ struct DefEntry {
 fn lower(expr: Expr, scope: &[DefEntry]) -> LResult<Expr> {
     match expr {
         Expr::Identity | Expr::Null | Expr::Bool(_) | Expr::Number(_) => Ok(expr),
-        Expr::RecurseDefault => lower_call("recurse".to_string(), vec![], scope),
-        Expr::VarRef(_) | Expr::RecCall(_) => Ok(expr),
+        // `..` always resolves to the prelude's `recurse` def, so this
+        // call can never hit lower_call's "unresolved, pass through to
+        // codegen" path that would need a real span -- 0..0 is a dummy.
+        Expr::RecurseDefault => lower_call("recurse".to_string(), vec![], 0..0, scope),
+        Expr::VarRef(..) | Expr::RecCall(_) => Ok(expr),
         Expr::Field {
             base,
             name,
@@ -204,8 +235,9 @@ fn lower(expr: Expr, scope: &[DefEntry]) -> LResult<Expr> {
             params,
             body,
             rest,
-        } => lower_funcdef(name, params, *body, *rest, scope),
-        Expr::Call(name, args) => lower_call(name, args, scope),
+            span,
+        } => lower_funcdef(name, params, *body, *rest, span, scope),
+        Expr::Call(name, args, span) => lower_call(name, args, span, scope),
     }
 }
 
@@ -214,16 +246,20 @@ fn lower_funcdef(
     params: Vec<Param>,
     body: Expr,
     rest: Expr,
+    span: Span,
     scope: &[DefEntry],
 ) -> LResult<Expr> {
     let arity = params.len();
     let recursive = contains_call(&body, &name, arity);
     if recursive {
         if arity != 0 {
-            return Err(format!(
-                "jqc: recursive function '{name}/{arity}' with parameters is not supported \
-                 (only 0-argument recursive defs can be compiled; try a `reduce`/`foreach` loop instead)"
-            ));
+            return Err(Diagnostic::at(
+                span,
+                format!("recursive function '{name}/{arity}' with parameters is not supported"),
+            )
+            .help("only 0-argument recursive defs can be compiled (parameterized defs are \
+                   inlined call-by-name, which can't terminate if they recurse); \
+                   try a `reduce`/`foreach` loop instead"));
         }
         let body = rewrite_self_calls(body, &name);
         let rest = rewrite_self_calls(rest, &name);
@@ -245,7 +281,7 @@ fn lower_funcdef(
     lower(rest, &def_scope)
 }
 
-fn lower_call(name: String, args: Vec<Expr>, scope: &[DefEntry]) -> LResult<Expr> {
+fn lower_call(name: String, args: Vec<Expr>, span: Span, scope: &[DefEntry]) -> LResult<Expr> {
     if let Some(entry) = scope
         .iter()
         .rev()
@@ -281,7 +317,7 @@ fn lower_call(name: String, args: Vec<Expr>, scope: &[DefEntry]) -> LResult<Expr
         .into_iter()
         .map(|a| lower(a, scope))
         .collect::<LResult<Vec<_>>>()?;
-    Ok(Expr::Call(name, lowered_args))
+    Ok(Expr::Call(name, lowered_args, span))
 }
 
 /// Does `expr` call `name/arity` anywhere (used to detect recursive defs)?
@@ -289,7 +325,7 @@ fn lower_call(name: String, args: Vec<Expr>, scope: &[DefEntry]) -> LResult<Expr
 /// same name at the same arity, since that call refers to the inner def.
 fn contains_call(expr: &Expr, name: &str, arity: usize) -> bool {
     match expr {
-        Expr::Call(n, args) => {
+        Expr::Call(n, args, _) => {
             (n == name && args.len() == arity) || args.iter().any(|a| contains_call(a, name, arity))
         }
         Expr::RecCall(n) => n == name && arity == 0,
@@ -298,7 +334,7 @@ fn contains_call(expr: &Expr, name: &str, arity: usize) -> bool {
         | Expr::Null
         | Expr::Bool(_)
         | Expr::Number(_)
-        | Expr::VarRef(_) => false,
+        | Expr::VarRef(..) => false,
         Expr::Field { base, .. } | Expr::IterateAll { base, .. } => {
             contains_call(base, name, arity)
         }
@@ -375,6 +411,7 @@ fn contains_call(expr: &Expr, name: &str, arity: usize) -> bool {
             params,
             body,
             rest,
+            ..
         } => {
             let shadowed = inner_name == name && params.len() == arity;
             (!shadowed && contains_call(body, name, arity)) || contains_call(rest, name, arity)
@@ -409,7 +446,7 @@ fn subst_call0(expr: Expr, pname: &str, replacement: &Expr) -> Expr {
 /// (necessarily also at arity 0) shadows it -- `target`'s body is left
 /// untouched in that case, since those calls refer to the inner def.
 fn rewrite_call0(expr: Expr, target: &str, build: &mut dyn FnMut() -> Expr) -> Expr {
-    if matches!(&expr, Expr::Call(n, args) if n == target && args.is_empty()) {
+    if matches!(&expr, Expr::Call(n, args, _) if n == target && args.is_empty()) {
         return build();
     }
     match expr {
@@ -418,7 +455,7 @@ fn rewrite_call0(expr: Expr, target: &str, build: &mut dyn FnMut() -> Expr) -> E
         | Expr::Null
         | Expr::Bool(_)
         | Expr::Number(_)
-        | Expr::VarRef(_)
+        | Expr::VarRef(..)
         | Expr::RecCall(_)) => e,
         Expr::Field {
             base,
@@ -548,17 +585,19 @@ fn rewrite_call0(expr: Expr, target: &str, build: &mut dyn FnMut() -> Expr) -> E
             update: Box::new(rewrite_call0(*update, target, build)),
             extract: extract.map(|e| Box::new(rewrite_call0(*e, target, build))),
         },
-        Expr::Call(n, args) => Expr::Call(
+        Expr::Call(n, args, span) => Expr::Call(
             n,
             args.into_iter()
                 .map(|a| rewrite_call0(a, target, build))
                 .collect(),
+            span,
         ),
         Expr::FuncDef {
             name,
             params,
             body,
             rest,
+            span,
         } => {
             let shadowed = name == target && params.is_empty();
             let body = if shadowed {
@@ -571,6 +610,7 @@ fn rewrite_call0(expr: Expr, target: &str, build: &mut dyn FnMut() -> Expr) -> E
                 params,
                 body,
                 rest: Box::new(rewrite_call0(*rest, target, build)),
+                span,
             }
         }
         Expr::RecFn0 { name, body, rest } => {
@@ -593,11 +633,111 @@ fn rewrite_call0(expr: Expr, target: &str, build: &mut dyn FnMut() -> Expr) -> E
 mod tests {
     use super::*;
 
+    /// Asserts a user source fails to compile, with a rendered diagnostic
+    /// (relocated into the user's own source coordinates, as a real caller
+    /// sees it) that contains every one of `expected`.
+    fn assert_error_contains(user_src: &str, expected: &[&str]) {
+        use crate::codegen::{Codegen, TreeWalkCodegen};
+        let version = JqVersion::default_available().unwrap();
+        // Mirrors jqc-macros: parse_and_lower's own errors come back
+        // already relocated to user_src's coordinates; compile_top's
+        // don't, since it runs after parse_and_lower has already
+        // returned, so those need relocating here instead.
+        let err = match parse_and_lower(user_src, version) {
+            Err(e) => e,
+            Ok(ast) => {
+                let (offset, len) = user_src_window(user_src);
+                TreeWalkCodegen
+                    .compile_top(&ast)
+                    .map_err(|e| e.relocate(offset, len))
+                    .expect_err("expected this filter to fail to compile")
+            }
+        };
+        let rendered = err.render(user_src);
+        for e in expected {
+            assert!(
+                rendered.contains(e),
+                "expected rendered error to contain {e:?}, got:\n{rendered}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "manual visual check, run with --ignored --nocapture"]
+    fn print_demo() {
+        use crate::codegen::{Codegen, TreeWalkCodegen};
+        let version = JqVersion::default_available().unwrap();
+        for src in [
+            "(1 + 2",
+            ".a | selct",
+            "$nope",
+            "def f(x): f(x); f(1)",
+            "\"abc",
+            "1 +",
+            "if . then 1 end",
+        ] {
+            let result = match parse_and_lower(src, version) {
+                Err(e) => Err(e),
+                Ok(ast) => {
+                    let (offset, len) = user_src_window(src);
+                    TreeWalkCodegen.compile_top(&ast).map_err(|e| e.relocate(offset, len))
+                }
+            };
+            println!("=== {src:?} ===");
+            match result {
+                Ok(_) => println!("(compiled fine)"),
+                Err(e) => println!("{}", e.render(src)),
+            }
+        }
+    }
+
+    #[test]
+    fn unclosed_paren_points_at_both_ends() {
+        // The user source starts after PRELUDE + "(\n" -- relocation must
+        // land the span back on `(1 + 2`, not somewhere in the prelude.
+        assert_error_contains(
+            "(1 + 2",
+            &["-->", "note:", "unclosed '(' opened here"],
+        );
+    }
+
+    #[test]
+    fn unknown_function_suggests_a_near_miss() {
+        assert_error_contains(".a | selct", &["unknown jq function", "did you mean `select`?"]);
+    }
+
+    #[test]
+    fn undefined_variable_points_at_the_dollar_name() {
+        assert_error_contains("$nope", &["undefined variable $nope", "-->", "$nope"]);
+    }
+
+    #[test]
+    fn recursive_def_with_params_is_rejected_with_a_suggestion() {
+        assert_error_contains(
+            "def f(x): f(x); f(1)",
+            &["recursive function 'f/1' with parameters", "reduce"],
+        );
+    }
+
+    #[test]
+    fn unterminated_string_points_at_the_opening_quote() {
+        assert_error_contains(r#""abc"#, &["unterminated string literal", "-->"]);
+    }
+
+    #[test]
+    fn error_inside_string_interpolation_relocates_correctly() {
+        assert_error_contains(r#""result: \(1 + )""#, &["-->"]);
+    }
+
     #[test]
     fn prelude_parses() {
         for version in JqVersion::ALL.into_iter().filter(|v| v.is_available()) {
             if let Err(e) = parse_and_lower(".", version) {
-                panic!("prelude failed to parse under jq {}: {e}", version.as_str());
+                panic!(
+                    "prelude failed to parse under jq {}:\n{}",
+                    version.as_str(),
+                    e.render(".")
+                );
             }
         }
     }

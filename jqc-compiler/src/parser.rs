@@ -2,10 +2,49 @@
 //! produced by [`crate::lexer`].
 
 use crate::ast::{convert_str_parts, str_literal, BinOp, Expr, Param};
+use crate::diagnostics::{Diagnostic, Span};
 use crate::lexer::{Lexer, StrPart, Tok};
 use crate::version::JqVersion;
 
-pub type PResult<T> = Result<T, String>;
+pub type PResult<T> = Result<T, Diagnostic>;
+
+/// A human-readable description of a token for error messages, e.g.
+/// "`)`" or "identifier `foo`" -- used in place of `{:?}` Debug output.
+fn describe(t: &Tok) -> String {
+    match t {
+        Tok::Dot => "`.`".into(),
+        Tok::DotDot => "`..`".into(),
+        Tok::LBracket => "`[`".into(),
+        Tok::RBracket => "`]`".into(),
+        Tok::LBrace => "`{`".into(),
+        Tok::RBrace => "`}`".into(),
+        Tok::LParen => "`(`".into(),
+        Tok::RParen => "`)`".into(),
+        Tok::Pipe => "`|`".into(),
+        Tok::Comma => "`,`".into(),
+        Tok::Colon => "`:`".into(),
+        Tok::Semi => "`;`".into(),
+        Tok::Question => "`?`".into(),
+        Tok::Plus => "`+`".into(),
+        Tok::Minus => "`-`".into(),
+        Tok::Star => "`*`".into(),
+        Tok::Slash => "`/`".into(),
+        Tok::SlashSlash => "`//`".into(),
+        Tok::Percent => "`%`".into(),
+        Tok::Eq => "`==`".into(),
+        Tok::Ne => "`!=`".into(),
+        Tok::Lt => "`<`".into(),
+        Tok::Le => "`<=`".into(),
+        Tok::Gt => "`>`".into(),
+        Tok::Ge => "`>=`".into(),
+        Tok::Ident(name) => format!("identifier `{name}`"),
+        Tok::Var(name) => format!("variable `${name}`"),
+        Tok::Number(n) => format!("number `{n}`"),
+        Tok::Str(_) => "a string literal".into(),
+        Tok::Eof => "end of input".into(),
+    }
+}
+
 
 /// Reserved words that must never be swallowed as a field name by `.name`
 /// (e.g. `if f then . else empty end` -- the `.` there must stay the bare
@@ -29,13 +68,13 @@ fn is_keyword(s: &str) -> bool {
 }
 
 pub fn parse_program(src: &str, version: JqVersion) -> PResult<Expr> {
-    let toks = Lexer::new(src)
-        .tokenize()
-        .map_err(|e| format!("jq lex error: {e}"))?;
+    let (toks, spans) = Lexer::new(src).tokenize()?;
     let mut parser = Parser {
         toks,
+        spans,
         pos: 0,
         version,
+        open_stack: Vec::new(),
     };
     let expr = parser.parse_pipe()?;
     parser.expect_eof()?;
@@ -44,19 +83,29 @@ pub fn parse_program(src: &str, version: JqVersion) -> PResult<Expr> {
 
 /// Used for recursively parsing `\( ... )` string-interpolation bodies,
 /// which must target the same version as the enclosing parse.
-fn parse_sub_expr(src: &str, version: JqVersion) -> Result<Expr, String> {
+fn parse_sub_expr(src: &str, version: JqVersion) -> Result<Expr, Diagnostic> {
     parse_program(src, version)
 }
 
 struct Parser {
     toks: Vec<Tok>,
+    spans: Vec<Span>,
     pos: usize,
     version: JqVersion,
+    /// Spans of currently-open `(`/`[`/`{` delimiters, pushed on open and
+    /// popped on a successful matching close -- lets an unmatched-
+    /// delimiter error point back at where it was opened, the way rustc's
+    /// does.
+    open_stack: Vec<(char, Span)>,
 }
 
 impl Parser {
     fn peek(&self) -> &Tok {
         &self.toks[self.pos]
+    }
+
+    fn cur_span(&self) -> Span {
+        self.spans[self.pos].clone()
     }
 
     fn bump(&mut self) -> Tok {
@@ -67,11 +116,62 @@ impl Parser {
         t
     }
 
+    fn err(&self, message: impl Into<String>) -> Diagnostic {
+        Diagnostic::at(self.cur_span(), message)
+    }
+
+    /// Consumes an opening delimiter, remembering its span for a later
+    /// unmatched-close error. Only valid when `peek()` is already known to
+    /// be that delimiter.
+    fn open_delim(&mut self, ch: char) {
+        let span = self.cur_span();
+        self.bump();
+        self.open_stack.push((ch, span));
+    }
+
+    /// Like [`Self::expect`], but for an opening delimiter: also records
+    /// its span via [`Self::open_delim`] on success, for a later
+    /// [`Self::expect_close`] to point back at.
+    fn expect_open(&mut self, t: Tok, ch: char) -> PResult<()> {
+        if *self.peek() == t {
+            self.open_delim(ch);
+            Ok(())
+        } else {
+            Err(self.err(format!(
+                "expected {}, found {}",
+                describe(&t),
+                describe(self.peek())
+            )))
+        }
+    }
+
+    /// Expects `close`, failing with a message that also points back at
+    /// the matching open delimiter pushed by [`Self::open_delim`].
+    fn expect_close(&mut self, close: Tok) -> PResult<()> {
+        let (open_ch, open_span) = self
+            .open_stack
+            .pop()
+            .expect("expect_close called without a matching open_delim");
+        if *self.peek() == close {
+            self.bump();
+            Ok(())
+        } else {
+            Err(Diagnostic::at(
+                self.cur_span(),
+                format!("expected {}, found {}", describe(&close), describe(self.peek())),
+            )
+            .note(open_span, format!("unclosed '{open_ch}' opened here")))
+        }
+    }
+
     fn expect_eof(&self) -> PResult<()> {
         if *self.peek() == Tok::Eof {
             Ok(())
         } else {
-            Err(format!("unexpected trailing tokens near {:?}", self.peek()))
+            Err(self.err(format!(
+                "unexpected trailing input: {}",
+                describe(self.peek())
+            )))
         }
     }
 
@@ -84,7 +184,7 @@ impl Parser {
             self.bump();
             Ok(())
         } else {
-            Err(format!("expected '{s}', found {:?}", self.peek()))
+            Err(self.err(format!("expected '{s}', found {}", describe(self.peek()))))
         }
     }
 
@@ -93,15 +193,32 @@ impl Parser {
             self.bump();
             Ok(())
         } else {
-            Err(format!("expected {:?}, found {:?}", t, self.peek()))
+            Err(self.err(format!(
+                "expected {}, found {}",
+                describe(&t),
+                describe(self.peek())
+            )))
         }
     }
 
     fn expect_var(&mut self) -> PResult<String> {
+        let span = self.cur_span();
         match self.bump() {
             Tok::Var(name) => Ok(name),
-            other => Err(format!("expected variable, found {other:?}")),
+            other => Err(Diagnostic::at(
+                span,
+                format!("expected a variable (e.g. `$x`), found {}", describe(&other)),
+            )),
         }
+    }
+
+    /// Consumes `close`, which the caller has already confirmed is
+    /// [`Self::peek`] -- used for the paths that close a delimiter
+    /// successfully without going through [`Self::expect_close`] (so the
+    /// matching [`Self::open_delim`] entry still gets popped).
+    fn close_delim(&mut self) -> Tok {
+        self.open_stack.pop();
+        self.bump()
     }
 
     // --- precedence ladder --------------------------------------------
@@ -259,12 +376,15 @@ impl Parser {
                             base = field(base, name, false);
                         }
                         other => {
-                            return Err(format!("expected field name after '.', found {other:?}"))
+                            return Err(Diagnostic::at(
+                                self.spans[self.pos - 1].clone(),
+                                format!("expected field name after '.', found {}", describe(&other)),
+                            ))
                         }
                     }
                 }
                 Tok::LBracket => {
-                    self.bump();
+                    self.open_delim('[');
                     base = self.parse_bracket_suffix(base)?;
                 }
                 Tok::Question => {
@@ -283,7 +403,7 @@ impl Parser {
     /// `.[0,1]`-style comma-generator indices work.
     fn parse_bracket_suffix(&mut self, base: Expr) -> PResult<Expr> {
         if *self.peek() == Tok::RBracket {
-            self.bump();
+            self.close_delim();
             return Ok(Expr::IterateAll {
                 base: Box::new(base),
                 optional: false,
@@ -292,7 +412,7 @@ impl Parser {
         if *self.peek() == Tok::Colon {
             self.bump();
             let to = self.parse_pipe()?;
-            self.expect(Tok::RBracket)?;
+            self.expect_close(Tok::RBracket)?;
             return Ok(Expr::Slice {
                 base: Box::new(base),
                 from: None,
@@ -304,7 +424,7 @@ impl Parser {
         if *self.peek() == Tok::Colon {
             self.bump();
             if *self.peek() == Tok::RBracket {
-                self.bump();
+                self.close_delim();
                 return Ok(Expr::Slice {
                     base: Box::new(base),
                     from: Some(Box::new(first)),
@@ -313,7 +433,7 @@ impl Parser {
                 });
             }
             let to = self.parse_pipe()?;
-            self.expect(Tok::RBracket)?;
+            self.expect_close(Tok::RBracket)?;
             return Ok(Expr::Slice {
                 base: Box::new(base),
                 from: Some(Box::new(first)),
@@ -321,7 +441,7 @@ impl Parser {
                 optional: false,
             });
         }
-        self.expect(Tok::RBracket)?;
+        self.expect_close(Tok::RBracket)?;
         Ok(Expr::Index {
             base: Box::new(base),
             index: Box::new(first),
@@ -360,28 +480,29 @@ impl Parser {
                 Ok(Expr::Str(converted))
             }
             Tok::Var(name) => {
+                let span = self.cur_span();
                 self.bump();
-                Ok(Expr::VarRef(name))
+                Ok(Expr::VarRef(name, span))
             }
             Tok::LParen => {
-                self.bump();
+                self.open_delim('(');
                 let expr = self.parse_pipe()?;
-                self.expect(Tok::RParen)?;
+                self.expect_close(Tok::RParen)?;
                 Ok(expr)
             }
             Tok::LBracket => {
-                self.bump();
+                self.open_delim('[');
                 if *self.peek() == Tok::RBracket {
-                    self.bump();
+                    self.close_delim();
                     return Ok(Expr::ArrayConstruct(None));
                 }
                 let inner = self.parse_pipe()?;
-                self.expect(Tok::RBracket)?;
+                self.expect_close(Tok::RBracket)?;
                 Ok(Expr::ArrayConstruct(Some(Box::new(inner))))
             }
             Tok::LBrace => self.parse_object(),
             Tok::Ident(name) => self.parse_ident_primary(name),
-            other => Err(format!("unexpected token {other:?}")),
+            other => Err(self.err(format!("unexpected token: {}", describe(&other)))),
         }
     }
 
@@ -405,7 +526,7 @@ impl Parser {
             "foreach" => self.parse_foreach(),
             "def" => self.parse_def(),
             "and" | "or" | "as" | "then" | "elif" | "else" | "end" | "catch" => {
-                Err(format!("unexpected keyword '{name}'"))
+                Err(self.err(format!("unexpected keyword '{name}' here")))
             }
             _ => self.parse_call(name),
         }
@@ -415,11 +536,12 @@ impl Parser {
     /// ordinary union/generator operator, not argument separators (`;` is
     /// the separator) -- so each one is parsed with `parse_pipe`.
     fn parse_call(&mut self, name: String) -> PResult<Expr> {
+        let name_span = self.cur_span();
         self.bump();
         if *self.peek() != Tok::LParen {
-            return Ok(Expr::Call(name, vec![]));
+            return Ok(Expr::Call(name, vec![], name_span));
         }
-        self.bump();
+        self.open_delim('(');
         let mut args = Vec::new();
         if *self.peek() != Tok::RParen {
             loop {
@@ -431,11 +553,12 @@ impl Parser {
                 break;
             }
         }
-        self.expect(Tok::RParen)?;
-        Ok(Expr::Call(name, args))
+        self.expect_close(Tok::RParen)?;
+        Ok(Expr::Call(name, args, name_span))
     }
 
     fn parse_if(&mut self) -> PResult<Expr> {
+        let if_span = self.cur_span();
         self.eat_ident("if")?;
         let mut branches = Vec::new();
         let cond = self.parse_pipe()?;
@@ -456,12 +579,15 @@ impl Parser {
             None
         };
         if else_e.is_none() && self.version.if_requires_else() {
-            return Err(
-                "jq 1.6 requires an explicit 'else' clause in 'if'/'then'/'end' \
-                 (support for omitting it was added in jq 1.7); add 'else .' \
-                 or select a newer jq-version feature"
-                    .to_string(),
-            );
+            return Err(Diagnostic::at(
+                if_span,
+                format!(
+                    "jq {} requires an explicit 'else' clause in 'if'/'then'/'end'",
+                    self.version.as_str()
+                ),
+            )
+            .help("add 'else .' before 'end', or select a jq-version feature from 1.7 onward \
+                   (support for omitting 'else' was added in jq 1.7)"));
         }
         self.eat_ident("end")?;
         Ok(Expr::If(branches, else_e))
@@ -484,11 +610,11 @@ impl Parser {
         let source = self.parse_postfix()?;
         self.eat_ident("as")?;
         let var = self.expect_var()?;
-        self.expect(Tok::LParen)?;
+        self.expect_open(Tok::LParen, '(')?;
         let init = self.parse_pipe()?;
         self.expect(Tok::Semi)?;
         let update = self.parse_pipe()?;
-        self.expect(Tok::RParen)?;
+        self.expect_close(Tok::RParen)?;
         Ok(Expr::Reduce {
             source: Box::new(source),
             var,
@@ -502,7 +628,7 @@ impl Parser {
         let source = self.parse_postfix()?;
         self.eat_ident("as")?;
         let var = self.expect_var()?;
-        self.expect(Tok::LParen)?;
+        self.expect_open(Tok::LParen, '(')?;
         let init = self.parse_pipe()?;
         self.expect(Tok::Semi)?;
         let update = self.parse_pipe()?;
@@ -512,7 +638,7 @@ impl Parser {
         } else {
             None
         };
-        self.expect(Tok::RParen)?;
+        self.expect_close(Tok::RParen)?;
         Ok(Expr::Foreach {
             source: Box::new(source),
             var,
@@ -524,18 +650,21 @@ impl Parser {
 
     fn parse_def(&mut self) -> PResult<Expr> {
         self.eat_ident("def")?;
+        let name_span = self.cur_span();
         let name = match self.bump() {
             Tok::Ident(n) => n,
             other => {
-                return Err(format!(
-                    "expected function name after 'def', found {other:?}"
+                return Err(Diagnostic::at(
+                    name_span,
+                    format!("expected function name after 'def', found {}", describe(&other)),
                 ))
             }
         };
         let mut params = Vec::new();
         if *self.peek() == Tok::LParen {
-            self.bump();
+            self.open_delim('(');
             loop {
+                let span = self.cur_span();
                 match self.bump() {
                     Tok::Ident(name) => params.push(Param {
                         name,
@@ -545,7 +674,12 @@ impl Parser {
                         name,
                         is_value: true,
                     }),
-                    other => return Err(format!("expected parameter name, found {other:?}")),
+                    other => {
+                        return Err(Diagnostic::at(
+                            span,
+                            format!("expected parameter name, found {}", describe(&other)),
+                        ))
+                    }
                 }
                 if *self.peek() == Tok::Semi {
                     self.bump();
@@ -553,7 +687,7 @@ impl Parser {
                 }
                 break;
             }
-            self.expect(Tok::RParen)?;
+            self.expect_close(Tok::RParen)?;
         }
         self.expect(Tok::Colon)?;
         let body = self.parse_pipe()?;
@@ -564,11 +698,12 @@ impl Parser {
             params,
             body: Box::new(body),
             rest: Box::new(rest),
+            span: name_span,
         })
     }
 
     fn parse_object(&mut self) -> PResult<Expr> {
-        self.expect(Tok::LBrace)?;
+        self.open_delim('{');
         let mut entries = Vec::new();
         if *self.peek() != Tok::RBrace {
             loop {
@@ -580,7 +715,7 @@ impl Parser {
                 break;
             }
         }
-        self.expect(Tok::RBrace)?;
+        self.expect_close(Tok::RBrace)?;
         Ok(Expr::ObjectConstruct(entries))
     }
 
@@ -588,6 +723,7 @@ impl Parser {
         use crate::ast::ObjEntry;
         match self.peek().clone() {
             Tok::Var(name) => {
+                let span = self.cur_span();
                 self.bump();
                 if *self.peek() == Tok::Colon {
                     self.bump();
@@ -599,7 +735,7 @@ impl Parser {
                 } else {
                     Ok(ObjEntry {
                         key: str_literal(name.clone()),
-                        val: Expr::VarRef(name),
+                        val: Expr::VarRef(name, span),
                     })
                 }
             }
@@ -630,16 +766,17 @@ impl Parser {
                 })
             }
             Tok::LParen => {
-                self.bump();
+                self.open_delim('(');
                 let key = self.parse_pipe()?;
-                self.expect(Tok::RParen)?;
+                self.expect_close(Tok::RParen)?;
                 self.expect(Tok::Colon)?;
                 let val = self.parse_pipe_no_comma()?;
                 Ok(ObjEntry { key, val })
             }
-            other => Err(format!(
-                "unexpected token in object construction: {other:?}"
-            )),
+            other => Err(self.err(format!(
+                "unexpected token in object construction: {}",
+                describe(&other)
+            ))),
         }
     }
 }
@@ -682,6 +819,9 @@ fn lit_str_only(parts: &[StrPart]) -> PResult<String> {
     match parts {
         [StrPart::Lit(s)] => Ok(s.clone()),
         [] => Ok(String::new()),
-        _ => Err("interpolated strings are not allowed as field names".to_string()),
+        _ => Err(Diagnostic::new(
+            "interpolated strings are not allowed as field names",
+        )
+        .help("use a plain string, e.g. `.\"literal-name\"`, or `.[expr]` for a computed key")),
     }
 }

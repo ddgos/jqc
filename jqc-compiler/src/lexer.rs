@@ -1,10 +1,16 @@
 //! Hand-rolled lexer for the subset of jq syntax this crate compiles.
 
+use crate::diagnostics::{Diagnostic, Span};
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum StrPart {
     Lit(String),
-    /// Raw jq source text found inside `\( ... )`, re-lexed/parsed recursively.
-    Interp(String),
+    /// Raw jq source text found inside `\( ... )`, re-lexed/parsed
+    /// recursively -- paired with the char offset (into the source the
+    /// lexer was reading) of the interpolation's first character, so
+    /// errors found while re-parsing it can be relocated back to that
+    /// outer source.
+    Interp(String, usize),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -46,7 +52,7 @@ pub struct Lexer {
     pos: usize,
 }
 
-pub type LexResult<T> = Result<T, String>;
+pub type LexResult<T> = Result<T, Diagnostic>;
 
 impl Lexer {
     pub fn new(src: &str) -> Self {
@@ -90,21 +96,26 @@ impl Lexer {
         }
     }
 
-    pub fn tokenize(mut self) -> LexResult<Vec<Tok>> {
-        let mut out = Vec::new();
+    /// Returns tokens paired with their char-index span in the source,
+    /// one-to-one -- `spans[i]` is where `toks[i]` came from.
+    pub fn tokenize(mut self) -> LexResult<(Vec<Tok>, Vec<Span>)> {
+        let mut toks = Vec::new();
+        let mut spans = Vec::new();
         loop {
+            self.skip_ws_and_comments();
+            let start = self.pos;
             let t = self.next_token()?;
-            if t == Tok::Eof {
-                out.push(t);
+            let is_eof = t == Tok::Eof;
+            toks.push(t);
+            spans.push(start..self.pos);
+            if is_eof {
                 break;
             }
-            out.push(t);
         }
-        Ok(out)
+        Ok((toks, spans))
     }
 
     fn next_token(&mut self) -> LexResult<Tok> {
-        self.skip_ws_and_comments();
         let c = match self.peek() {
             None => return Ok(Tok::Eof),
             Some(c) => c,
@@ -162,7 +173,9 @@ impl Lexer {
                     self.bump();
                     Ok(Tok::Eq)
                 } else {
-                    Err("assignment operators are not supported".to_string())
+                    Err(Diagnostic::at(self.pos - 1..self.pos, "assignment operators are not supported")
+                        .help("update-assignment (`=`, `|=`, `+=`, ...) isn't implemented yet; \
+                               see the README's \"Known limitations\""))
                 }
             }
             '!' => {
@@ -170,7 +183,8 @@ impl Lexer {
                     self.bump();
                     Ok(Tok::Ne)
                 } else {
-                    Err("unexpected '!'".to_string())
+                    Err(Diagnostic::at(self.pos - 1..self.pos, "unexpected '!'")
+                        .help("jq has no unary `!`; use `not` instead, e.g. `.a | not`"))
                 }
             }
             '<' => {
@@ -189,7 +203,10 @@ impl Lexer {
                     Ok(Tok::Gt)
                 }
             }
-            other => Err(format!("unexpected character '{other}'")),
+            other => Err(Diagnostic::at(
+                self.pos - 1..self.pos,
+                format!("unexpected character '{other}'"),
+            )),
         }
     }
 
@@ -227,18 +244,22 @@ impl Lexer {
             }
         }
         let text: String = self.chars[start..self.pos].iter().collect();
-        text.parse::<f64>()
-            .map(Tok::Number)
-            .map_err(|_| format!("invalid number literal '{text}'"))
+        text.parse::<f64>().map(Tok::Number).map_err(|_| {
+            Diagnostic::at(start..self.pos, format!("invalid number literal '{text}'"))
+        })
     }
 
     fn lex_string(&mut self) -> LexResult<Tok> {
+        let open = self.pos;
         self.bump();
         let mut parts = Vec::new();
         let mut cur = String::new();
         loop {
             match self.bump() {
-                None => return Err("unterminated string literal".to_string()),
+                None => {
+                    return Err(Diagnostic::at(open..open + 1, "unterminated string literal")
+                        .help("add a closing '\"' to match this one"))
+                }
                 Some('"') => break,
                 Some('\\') => match self.bump() {
                     Some('n') => cur.push('\n'),
@@ -248,9 +269,12 @@ impl Lexer {
                     Some('\\') => cur.push('\\'),
                     Some('/') => cur.push('/'),
                     Some('u') => {
+                        let hex_start = self.pos;
                         let hex: String = (0..4).filter_map(|_| self.bump()).collect();
-                        let code = u32::from_str_radix(&hex, 16)
-                            .map_err(|_| "invalid \\u escape".to_string())?;
+                        let code = u32::from_str_radix(&hex, 16).map_err(|_| {
+                            Diagnostic::at(hex_start..self.pos, "invalid \\u escape")
+                                .help("\\u must be followed by exactly 4 hex digits, e.g. \\u00e9")
+                        })?;
                         if let Some(ch) = char::from_u32(code) {
                             cur.push(ch);
                         }
@@ -259,11 +283,22 @@ impl Lexer {
                         if !cur.is_empty() {
                             parts.push(StrPart::Lit(std::mem::take(&mut cur)));
                         }
+                        let inner_start = self.pos;
                         let inner = self.lex_balanced_parens()?;
-                        parts.push(StrPart::Interp(inner));
+                        parts.push(StrPart::Interp(inner, inner_start));
                     }
-                    Some(other) => return Err(format!("invalid escape '\\{other}'")),
-                    None => return Err("unterminated escape sequence".to_string()),
+                    Some(other) => {
+                        return Err(Diagnostic::at(
+                            self.pos - 1..self.pos,
+                            format!("invalid escape '\\{other}'"),
+                        ))
+                    }
+                    None => {
+                        return Err(Diagnostic::at(
+                            self.pos - 1..self.pos,
+                            "unterminated escape sequence",
+                        ))
+                    }
                 },
                 Some(c) => cur.push(c),
             }
@@ -278,10 +313,17 @@ impl Lexer {
     /// matching `)`, respecting nested parens and nested string literals.
     fn lex_balanced_parens(&mut self) -> LexResult<String> {
         let start = self.pos;
+        let open = start - 2; // the `\(` that led here
         let mut depth: i32 = 1;
         loop {
             match self.bump() {
-                None => return Err("unterminated string interpolation".to_string()),
+                None => {
+                    return Err(Diagnostic::at(
+                        open..open + 2,
+                        "unterminated string interpolation",
+                    )
+                    .help("add a closing ')' to match this '\\('"))
+                }
                 Some('(') => depth += 1,
                 Some(')') => {
                     depth -= 1;
@@ -294,9 +336,10 @@ impl Lexer {
                     loop {
                         match self.bump() {
                             None => {
-                                return Err(
-                                    "unterminated string literal in interpolation".to_string()
-                                )
+                                return Err(Diagnostic::at(
+                                    open..open + 2,
+                                    "unterminated string literal in interpolation",
+                                ))
                             }
                             Some('"') => break,
                             Some('\\') => {

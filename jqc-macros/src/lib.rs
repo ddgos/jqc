@@ -129,7 +129,21 @@ pub fn jq(input: TokenStream) -> TokenStream {
     }
 
     let src = parsed.filter.value();
-    match lower::parse_and_lower(&src, version).and_then(|ast| TreeWalkCodegen.compile_top(&ast)) {
+    // parse_and_lower's own errors come back already relocated to `src`'s
+    // coordinates; compile_top's don't, since it runs after
+    // parse_and_lower has already returned a plain `Expr` with no memory
+    // of where the prelude/wrapper it was parsed alongside ended, so those
+    // get relocated here instead, right before rendering.
+    let compiled = match lower::parse_and_lower(&src, version) {
+        Ok(ast) => {
+            let (offset, len) = lower::user_src_window(&src);
+            TreeWalkCodegen
+                .compile_top(&ast)
+                .map_err(|e| e.relocate(offset, len))
+        }
+        Err(e) => Err(e),
+    };
+    match compiled {
         Ok(ts) => {
             // A cheap early-warning canary for codegen-size blowups (see
             // `jqc_core::partial_for`'s doc comment for the incident this
@@ -147,8 +161,11 @@ pub fn jq(input: TokenStream) -> TokenStream {
             }
             ts.into()
         }
-        Err(msg) => syn::Error::new(parsed.filter.span(), format!("jq!: {msg}"))
-            .to_compile_error()
-            .into(),
+        Err(diag) => syn::Error::new(
+            parsed.filter.span(),
+            format!("jq!:\n{}", diag.render(&src)),
+        )
+        .to_compile_error()
+        .into(),
     }
 }

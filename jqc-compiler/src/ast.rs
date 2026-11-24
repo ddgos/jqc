@@ -1,5 +1,6 @@
 //! AST for the supported jq subset.
 
+use crate::diagnostics::{Diagnostic, Span};
 use crate::lexer::StrPart as LexStrPart;
 
 #[derive(Debug, Clone)]
@@ -83,9 +84,13 @@ pub enum Expr {
     If(Vec<(Expr, Expr)>, Option<Box<Expr>>),
     TryCatch(Box<Expr>, Option<Box<Expr>>),
     Optional(Box<Expr>),
-    Call(String, Vec<Expr>),
+    /// `span` covers just the function name at the call site, for
+    /// "unknown function"/"did you mean" diagnostics.
+    Call(String, Vec<Expr>, Span),
     VarBind(Box<Expr>, String, Box<Expr>),
-    VarRef(String),
+    /// `span` covers the `$name` reference itself, for "undefined
+    /// variable" diagnostics.
+    VarRef(String, Span),
     /// Introduced by the lowering pass: a call to the [`Expr::RecFn0`]
     /// currently being compiled (as opposed to a builtin or inlineable def).
     RecCall(String),
@@ -107,6 +112,9 @@ pub enum Expr {
         params: Vec<Param>,
         body: Box<Expr>,
         rest: Box<Expr>,
+        /// Covers the function name after `def`, for "recursive def with
+        /// parameters" diagnostics.
+        span: Span,
     },
     /// Introduced by the lowering pass for defs that recurse: compiled as a
     /// genuine recursive Rust function rather than inlined at call sites.
@@ -121,15 +129,21 @@ pub fn str_literal(s: impl Into<String>) -> Expr {
     Expr::Str(vec![StrPart::Lit(s.into())])
 }
 
+/// `parse_sub` re-parses a `\( ... )` interpolation's raw text in
+/// isolation, so any error it returns has a span relative to *that* text;
+/// relocated here by `offset` back to the enclosing string literal's own
+/// source coordinates before being handed further up.
 pub fn convert_str_parts(
     parts: Vec<LexStrPart>,
-    parse_sub: &mut dyn FnMut(&str) -> Result<Expr, String>,
-) -> Result<Vec<StrPart>, String> {
+    parse_sub: &mut dyn FnMut(&str) -> Result<Expr, Diagnostic>,
+) -> Result<Vec<StrPart>, Diagnostic> {
     parts
         .into_iter()
         .map(|p| match p {
             LexStrPart::Lit(s) => Ok(StrPart::Lit(s)),
-            LexStrPart::Interp(src) => parse_sub(&src).map(|e| StrPart::Interp(Box::new(e))),
+            LexStrPart::Interp(src, offset) => parse_sub(&src)
+                .map(|e| StrPart::Interp(Box::new(e)))
+                .map_err(|e| e.shift(offset)),
         })
         .collect()
 }

@@ -14,8 +14,9 @@ use proc_macro2::{Ident, TokenStream};
 use quote::{format_ident, quote};
 
 use crate::ast::{BinOp, Expr, ObjEntry, StrPart};
+use crate::diagnostics::{closest_match, Diagnostic, KNOWN_NAMES};
 
-pub type CResult<T> = Result<T, String>;
+pub type CResult<T> = Result<T, Diagnostic>;
 
 /// A backend that turns a lowered jq AST into the Rust `TokenStream` that
 /// `jq!` expands to. [`TreeWalkCodegen`] below is the only implementation
@@ -136,9 +137,9 @@ fn wrap_fallible(inner: TokenStream) -> TokenStream {
 fn compile_raw(expr: &Expr, input: &TokenStream, scope: &mut Vec<String>) -> CResult<TokenStream> {
     match expr {
         Expr::Identity => Ok(quote!(Ok(::std::vec![(#input).clone()]))),
-        Expr::RecurseDefault => {
-            Err("internal error: RecurseDefault should have been lowered".to_string())
-        }
+        Expr::RecurseDefault => Err(Diagnostic::new(
+            "internal error: RecurseDefault should have been lowered",
+        )),
         Expr::Null => {
             let value_ty = core_path("Value");
             Ok(quote!(Ok(::std::vec![#value_ty::Null])))
@@ -358,9 +359,17 @@ fn compile_raw(expr: &Expr, input: &TokenStream, scope: &mut Vec<String>) -> CRe
             };
             Ok(partial_aware_for(&source_c, &quote!(#jv), body))
         }
-        Expr::VarRef(name) => {
+        Expr::VarRef(name, span) => {
             if !scope.iter().any(|s| s == name) {
-                return Err(format!("undefined variable ${name}"));
+                let mut err = Diagnostic::at(span.clone(), format!("undefined variable ${name}"));
+                err = match closest_match(name, scope.iter().map(String::as_str)) {
+                    Some(sugg) => err.help(format!("did you mean ${sugg}?")),
+                    None if scope.is_empty() => {
+                        err.help("no variables are in scope here")
+                    }
+                    None => err,
+                };
+                return Err(err);
             }
             let jv = jv_ident(name);
             Ok(quote!(Ok(::std::vec![#jv.clone()])))
@@ -453,10 +462,10 @@ fn compile_raw(expr: &Expr, input: &TokenStream, scope: &mut Vec<String>) -> CRe
                 }
             })
         }
-        Expr::FuncDef { .. } => {
-            Err("internal error: FuncDef should have been resolved by lowering".to_string())
-        }
-        Expr::Call(name, args) => compile_call(name, args, input, scope),
+        Expr::FuncDef { .. } => Err(Diagnostic::new(
+            "internal error: FuncDef should have been resolved by lowering",
+        )),
+        Expr::Call(name, args, span) => compile_call(name, args, span, input, scope),
     }
 }
 
@@ -789,6 +798,7 @@ fn cartesian_args(
 fn compile_call(
     name: &str,
     args: &[Expr],
+    span: &crate::diagnostics::Span,
     input: &TokenStream,
     scope: &mut Vec<String>,
 ) -> CResult<TokenStream> {
@@ -974,10 +984,27 @@ fn compile_call(
         ("unique_by", 1) => compile_by(args, input, scope, "unique_by_keys", true),
         ("min_by", 1) => compile_by(args, input, scope, "min_by_keys", false),
         ("max_by", 1) => compile_by(args, input, scope, "max_by_keys", false),
-        _ => Err(format!(
-            "jqc: unsupported or unknown jq function '{name}/{}'",
-            args.len()
-        )),
+        _ => {
+            let arity = args.len();
+            let err = Diagnostic::at(
+                span.clone(),
+                format!("unsupported or unknown jq function '{name}/{arity}'"),
+            );
+            let err = if KNOWN_NAMES.contains(&name) {
+                err.help(format!(
+                    "`{name}` is known, but not with {arity} argument{} -- check the arity",
+                    if arity == 1 { "" } else { "s" }
+                ))
+            } else {
+                match closest_match(name, KNOWN_NAMES.iter().copied()) {
+                    Some(sugg) => err.help(format!("did you mean `{sugg}`?")),
+                    None => err.help(
+                        "see the README's \"Supported jq subset\" for what's implemented",
+                    ),
+                }
+            };
+            Err(err)
+        }
     }
 }
 
