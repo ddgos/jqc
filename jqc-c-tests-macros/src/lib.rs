@@ -162,18 +162,22 @@ const KNOWN_RUNTIME_DISCREPANCIES: &[(&str, &str)] = &[
         "same asymmetric slice-bound-rounding gap as .[1.2:3.5] above",
     ),
     (
-        "[range(10)] | .[1.7:3.5]",
-        "same asymmetric slice-bound-rounding gap as .[1.2:3.5] above",
-    ),
-    (
         ".[] as [$x, $y] | try [\"ok\", ($x | ltrimstr($y))] catch [\"ko\", .]",
-        "real jq's ltrimstr/rtrimstr require *both* operands to be strings (they delegate to \
-         startswith/endswith, which error otherwise); jqc's ltrimstr doesn't validate $y's type \
-         and just returns unchanged instead of erroring",
+        "ltrimstr/rtrimstr now correctly validate both operands are strings (fixed via jqc's own \
+         fuzz_inputs suite finding {} | join(null)-adjacent cases; see jqc-core's ltrimstr doc \
+         comment) -- but that now-real error, raised *inside* the `[\"ok\", ...]` array literal, \
+         exposes the same still-unfixed collector-node class of bug as `[[.[]|[.a,.a]]?]` below: \
+         a partial array construction that errors partway through should produce no value at all \
+         for `try`/`catch` to replace with one clean `[\"ko\", ...]`, not leak the already-built \
+         `\"ok\"` prefix as its own separate top-level output alongside it",
     ),
     (
         ".[] as [$x, $y] | try [\"ok\", ($x | rtrimstr($y))] catch [\"ko\", .]",
-        "same missing type-check gap as ltrimstr above",
+        "same now-exposed collector-node bug as the ltrimstr case above, via rtrimstr/endswith",
+    ),
+    (
+        "[range(10)] | .[1.7:3.5]",
+        "same asymmetric slice-bound-rounding gap as .[1.2:3.5] above",
     ),
     //
     // The following cluster (jq.test lines ~2568-2633) are upstream jq's
@@ -269,12 +273,6 @@ const KNOWN_RUNTIME_DISCREPANCIES: &[(&str, &str)] = &[
          doesn't match real jq's actual (permissive) behavior for this specific case",
     ),
     (
-        "join(\",\")",
-        "real jq's join errors on a non-scalar (array/object) element (delegates to `+`, which \
-         itself errors mixing a string with an array/object); jqc's join silently stringifies \
-         the nested value instead of validating its type first",
-    ),
-    (
         "def id(x):x; 2000 as $x | def f(x):1 as $x | id([$x, x, x]); def g(x): 100 as $x | f($x,$x+x); g($x)",
         "a deeper version of the nested-def-shadowing class of bug fixed earlier in this same \
          session (see the nested_def_shadows_outer_same_name_in_its_own_rest differential test) \
@@ -311,12 +309,6 @@ const KNOWN_RUNTIME_DISCREPANCIES: &[(&str, &str)] = &[
     (
         "(1e999999999, 10e999999999) > (1e-1147483646, 0.1e-1147483646)",
         "same wrong-comparison-at-extreme-magnitude bug as the 5E500000000 case above",
-    ),
-    (
-        "try join(\",\") catch .",
-        "real jq's join errors on a non-scalar (array/object) element (delegates to `+`, which \
-         itself errors mixing a string with an array/object); jqc's join silently stringifies \
-         the nested value instead of validating its type first",
     ),
     (
         "try (1/0) catch .",

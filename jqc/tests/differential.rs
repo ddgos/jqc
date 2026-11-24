@@ -312,7 +312,11 @@ difftest!(
 );
 difftest!(limit_basic, "[limit(2; range(0; 5))]", "null");
 difftest!(limit_zero, "[limit(0; range(0; 5))]", "null");
-difftest!(limit_more_than_available, "[limit(10; range(0; 3))]", "null");
+difftest!(
+    limit_more_than_available,
+    "[limit(10; range(0; 3))]",
+    "null"
+);
 difftest!(until_builtin, "until(. >= 100; . * 2)", "1");
 difftest!(repeat_error_optional, "[repeat(.*2, error)?]", "1");
 difftest!(optional_chain, ".a.b?.c", r#"{"a":1}"#);
@@ -385,4 +389,3 @@ fn optional_only_suppresses_its_own_step() {
     let input: Value = serde_json::from_str(r#"{"a":1}"#).unwrap();
     assert!(compiled(&input).is_err());
 }
-

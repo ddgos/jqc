@@ -298,7 +298,9 @@ fn bench_map_select_pipeline(c: &mut Criterion) {
                 b.iter(|| run_jqc_subprocess("[.[] | select(.active) | .score]", black_box(input)));
             });
             group.bench_with_input(BenchmarkId::new("jqc_warm", n), &input, |b, input| {
-                b.iter(|| run_jqc_subprocess_warm("[.[] | select(.active) | .score]", black_box(input)));
+                b.iter(|| {
+                    run_jqc_subprocess_warm("[.[] | select(.active) | .score]", black_box(input))
+                });
             });
         }
     }
@@ -349,10 +351,14 @@ fn bench_reduce_sum(c: &mut Criterion) {
                 b.iter(|| run_jq_warm("reduce .[] as $x (0; . + $x.score)", black_box(input)));
             });
             group.bench_with_input(BenchmarkId::new("jqc_cold", n), &input, |b, input| {
-                b.iter(|| run_jqc_subprocess("reduce .[] as $x (0; . + $x.score)", black_box(input)));
+                b.iter(|| {
+                    run_jqc_subprocess("reduce .[] as $x (0; . + $x.score)", black_box(input))
+                });
             });
             group.bench_with_input(BenchmarkId::new("jqc_warm", n), &input, |b, input| {
-                b.iter(|| run_jqc_subprocess_warm("reduce .[] as $x (0; . + $x.score)", black_box(input)));
+                b.iter(|| {
+                    run_jqc_subprocess_warm("reduce .[] as $x (0; . + $x.score)", black_box(input))
+                });
             });
         }
     }

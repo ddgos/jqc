@@ -1058,14 +1058,14 @@ fn compile_call(
             let f = core_path("ltrimstr");
             cartesian_args(args, input, scope, |a| {
                 let arg = &a[0];
-                quote!(Ok(#f(#input, &#arg)))
+                quote!(#f(#input, &#arg))
             })
         }
         ("rtrimstr", 1) => {
             let f = core_path("rtrimstr");
             cartesian_args(args, input, scope, |a| {
                 let arg = &a[0];
-                quote!(Ok(#f(#input, &#arg)))
+                quote!(#f(#input, &#arg))
             })
         }
         ("join", 1) => {

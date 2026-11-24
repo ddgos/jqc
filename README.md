@@ -136,10 +136,17 @@ below), and builtins: `map`, `select`, `values`, `recurse(;f)`, `in`,
 
 - **Eager, not lazy.** Every sub-expression evaluates to a fully-materialized
   `Vec<Value>`. This keeps codegen tractable (no generic-iterator-type
-  explosion) but means **infinite generators never terminate** -- `repeat`
-  and `while`/`until`/`recurse` without a condition that eventually goes
-  false will hang, unless wrapped in `label`/`break`/`limit` (supported) to
-  bound them explicitly.
+  explosion) but means **a genuinely infinite generator crashes (stack
+  overflow via its recursive desugaring), it doesn't just run forever**:
+  `repeat`, or `while`/`until`/`recurse` with a condition that never goes
+  false, has to finish producing its *entire* output before anything
+  downstream -- including `limit`/`label`/`break`, whose own desugaring is
+  just as eager -- ever gets a chance to run and cut it short; confirmed
+  directly (`[limit(3; while(true; .))]` stack-overflows, it does not stay
+  bounded at 3). `limit`/`label`/`break` *do* still work for cutting an
+  early exit out of a generator that's merely large, not infinite (e.g.
+  stopping partway through a big but finite `range`), since there the
+  underlying generator actually terminates on its own, eventually.
 - **No `?//` alternative destructuring patterns** (`as [$a] ?// {a: $a}`,
   for matching one of several shapes depending on the input). Plain
   destructuring (`as [$a, $b]`, `as {a: $a, $b}`, nested, computed keys)

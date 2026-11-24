@@ -549,13 +549,7 @@ pub fn run(filter: impl Fn(&Value) -> JResult<Vec<Value>>) -> ExitCode {
     let stdout = io::stdout();
     let is_tty = stdout.is_terminal();
     let mut lock = stdout.lock();
-    let code = run_with(
-        filter,
-        &args,
-        || read_all_inputs(&files),
-        &mut lock,
-        is_tty,
-    );
+    let code = run_with(filter, &args, || read_all_inputs(&files), &mut lock, is_tty);
     ExitCode::from(code as u8)
 }
 
@@ -578,8 +572,8 @@ mod tests {
 
     #[test]
     fn files_are_positional() {
-        let a = Args::parse(["-c".to_string(), "a.json".to_string(), "b.json".to_string()])
-            .unwrap();
+        let a =
+            Args::parse(["-c".to_string(), "a.json".to_string(), "b.json".to_string()]).unwrap();
         assert_eq!(a.files, vec!["a.json", "b.json"]);
     }
 

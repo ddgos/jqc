@@ -443,8 +443,13 @@ pub fn keys_of(v: &Value, sorted: bool) -> JResult<Value> {
     }
 }
 
+/// Real jq's `jv_has` (`src/jv_aux.c`) special-cases a `null` container:
+/// always `false`, regardless of the key's own type -- confirmed via
+/// `jqc`'s own fuzz_scripts suite, which found `null | has(...)` (via
+/// `in`, which delegates to `has`) erroring here instead.
 pub fn has_key(v: &Value, key: &Value) -> JResult<Value> {
     Ok(Value::Bool(match (v, key) {
+        (Value::Null, _) => false,
         (Value::Object(m), Value::String(s)) => m.contains_key(s),
         (Value::Array(a), Value::Number(n)) => {
             let i = num_f64(n) as i64;
@@ -656,7 +661,37 @@ pub fn as_str(v: &Value) -> JResult<&str> {
     }
 }
 
+/// Real jq's `f_contains` (`src/builtin.c`) checks this -- same
+/// `jv_kind` -- only once, at the top level, before ever recursing; a
+/// *nested* kind mismatch (an array element of the wrong kind, say) isn't
+/// an error, just a reason that one element doesn't match (`contains_at`
+/// below already gets that right structurally, via `eq_values` returning
+/// `false` for mismatched kinds rather than erroring).
 pub fn contains_value(lhs: &Value, rhs: &Value) -> JResult<bool> {
+    // jq's `jv_kind` (what `f_contains` actually compares) distinguishes
+    // `true`/`false` as separate kinds, unlike `type_name` (both report
+    // "boolean") -- `true | contains(false)` really does error in real
+    // jq, confirmed directly, not just a same-`type_name` same-type case.
+    fn kind(v: &Value) -> u8 {
+        match v {
+            Value::Null => 0,
+            Value::Bool(false) => 1,
+            Value::Bool(true) => 2,
+            Value::Number(_) => 3,
+            Value::String(_) => 4,
+            Value::Array(_) => 5,
+            Value::Object(_) => 6,
+        }
+    }
+    if kind(lhs) != kind(rhs) {
+        return Err(JqError::msg(format!(
+            "{} ({}) and {} ({}) cannot have their containment checked",
+            type_name(lhs),
+            lhs,
+            type_name(rhs),
+            rhs
+        )));
+    }
     contains_at(lhs, rhs, 0)
 }
 
@@ -702,39 +737,64 @@ pub fn endswith(v: &Value, suffix: &Value) -> JResult<Value> {
     Ok(Value::Bool(as_str(v)?.ends_with(as_str(suffix)?)))
 }
 
-pub fn ltrimstr(v: &Value, prefix: &Value) -> Value {
-    match (v, prefix) {
-        (Value::String(s), Value::String(p)) => {
-            Value::String(s.strip_prefix(p.as_str()).unwrap_or(s).to_string())
-        }
-        _ => v.clone(),
-    }
+/// Real jq defines this as `if startswith($left) then .[$left|length:] end`
+/// (`src/builtin.jq`): `startswith` requires both operands to be strings
+/// and errors otherwise, so `ltrimstr`/`rtrimstr` do too -- confirmed via
+/// `jqc`'s own fuzz_inputs suite, which found this returning `.` unchanged
+/// instead of erroring for a non-string input/prefix.
+pub fn ltrimstr(v: &Value, prefix: &Value) -> JResult<Value> {
+    let s = as_str(v)?;
+    let p = as_str(prefix)?;
+    Ok(Value::String(s.strip_prefix(p).unwrap_or(s).to_string()))
 }
 
-pub fn rtrimstr(v: &Value, suffix: &Value) -> Value {
-    match (v, suffix) {
-        (Value::String(s), Value::String(p)) => {
-            Value::String(s.strip_suffix(p.as_str()).unwrap_or(s).to_string())
-        }
-        _ => v.clone(),
-    }
+pub fn rtrimstr(v: &Value, suffix: &Value) -> JResult<Value> {
+    let s = as_str(v)?;
+    let p = as_str(suffix)?;
+    Ok(Value::String(s.strip_suffix(p).unwrap_or(s).to_string()))
 }
 
+/// Real jq defines this as (`src/builtin.jq`):
+/// ```jq
+/// reduce .[] as $i (null;
+///     (if .==null then "" else .+$x end) +
+///     ($i | if type=="boolean" or type=="number" then tostring else .//"" end)
+/// ) // ""
+/// ```
+/// -- reimplemented structurally (not just "stringify and concatenate")
+/// because its exact edge cases only fall out of that structure: `.[]`
+/// isn't specifically an array, so `join` works on an object's values
+/// too (confirmed via `jqc`'s own fuzz_inputs suite: `{} | join(...)`
+/// succeeds with `""`, same as `[] | join(...)`, since both iterate zero
+/// elements); the separator is combined with `+` (not required to be a
+/// string outright), so jq's own null-absorption applies -- a `null`
+/// separator is silently absorbed rather than erroring, *and* is never
+/// even evaluated at all between fewer than two elements (confirmed:
+/// `{"a":null,"c":null} | join(null)` succeeds with `""`, since `+`
+/// absorbs the null separator, while `[1,2] | join(null)` would still
+/// error, since `+`ing a null separator onto an all-ready-numeric-looking
+/// *string* accumulator is still a string+null, which is absorbed too --
+/// only a non-string-non-null separator ever errors, and only once
+/// there's a second element for it to actually appear between).
 pub fn join_strings(v: &Value, sep: &Value) -> JResult<Value> {
-    let arr = as_array(v)?;
-    let sep = as_str(sep)?;
-    let mut out = String::new();
-    for (i, item) in arr.iter().enumerate() {
-        if i > 0 {
-            out.push_str(sep);
-        }
-        match item {
-            Value::Null => {}
-            Value::String(s) => out.push_str(s),
-            other => out.push_str(&value_to_display_string(other)),
-        }
+    let items = iterate(v)?;
+    let mut acc: Option<Value> = None;
+    for item in &items {
+        let with_sep = match acc {
+            None => Value::String(String::new()),
+            Some(a) => add_values(a, sep.clone())?,
+        };
+        let elem = match item {
+            Value::Bool(_) | Value::Number(_) => Value::String(value_to_display_string(item)),
+            other if truthy(other) => other.clone(),
+            _ => Value::String(String::new()),
+        };
+        acc = Some(add_values(with_sep, elem)?);
     }
-    Ok(Value::String(out))
+    match acc {
+        Some(a) if truthy(&a) => Ok(a),
+        _ => Ok(Value::String(String::new())),
+    }
 }
 
 pub fn split_string(v: &Value, sep: &Value) -> JResult<Value> {
@@ -780,10 +840,91 @@ pub fn ascii_upcase(v: &Value) -> JResult<Value> {
     Ok(Value::String(as_str(v)?.to_ascii_uppercase()))
 }
 
+/// Writes `s` as a JSON string literal matching real jq's own
+/// `jvp_dump_string` (`src/jv_print.c`) exactly: printable ASCII passes
+/// through (escaping only `"`/`\`), the usual control-character
+/// shorthands (`\b\t\r\n\f`) apply where they do, every other control
+/// character (and DEL) becomes `\u00XX`, and non-ASCII passes through as
+/// raw UTF-8 (jq's compact/`tostring` output is never ASCII-escaped,
+/// unlike `-a`/`--ascii-output`, which only affects the CLI's own
+/// printing, not any jq-language-level stringification).
+fn write_jq_json_string(out: &mut String, s: &str) {
+    out.push('"');
+    for c in s.chars() {
+        let code = c as u32;
+        if (0x20..=0x7e).contains(&code) {
+            if c == '"' || c == '\\' {
+                out.push('\\');
+            }
+            out.push(c);
+        } else if code < 0x20 || code == 0x7f {
+            match c {
+                '\u{8}' => out.push_str("\\b"),
+                '\t' => out.push_str("\\t"),
+                '\r' => out.push_str("\\r"),
+                '\n' => out.push_str("\\n"),
+                '\u{c}' => out.push_str("\\f"),
+                _ => out.push_str(&format!("\\u{code:04x}")),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out.push('"');
+}
+
+/// Writes `v` as compact JSON matching real jq's own serialization,
+/// including the one place `serde_json`'s own `Display`/`to_string()`
+/// disagrees with it: a scientific-notation exponent marker is always
+/// uppercased (`"1E+20"`, not `"1e+20"` -- confirmed directly against
+/// jq, not merely assumed). Object keys are written in the map's own
+/// (insertion) order, same as real jq's default (unsorted) output.
+fn write_jq_json(out: &mut String, v: &Value) {
+    match v {
+        Value::Null => out.push_str("null"),
+        Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+        Value::Number(n) => {
+            let s = n.to_string();
+            if s.contains('e') {
+                out.push_str(&s.replace('e', "E"));
+            } else {
+                out.push_str(&s);
+            }
+        }
+        Value::String(s) => write_jq_json_string(out, s),
+        Value::Array(items) => {
+            out.push('[');
+            for (i, item) in items.iter().enumerate() {
+                if i != 0 {
+                    out.push(',');
+                }
+                write_jq_json(out, item);
+            }
+            out.push(']');
+        }
+        Value::Object(map) => {
+            out.push('{');
+            for (i, (k, v)) in map.iter().enumerate() {
+                if i != 0 {
+                    out.push(',');
+                }
+                write_jq_json_string(out, k);
+                out.push(':');
+                write_jq_json(out, v);
+            }
+            out.push('}');
+        }
+    }
+}
+
 pub fn value_to_display_string(v: &Value) -> String {
     match v {
         Value::String(s) => s.clone(),
-        other => other.to_string(),
+        other => {
+            let mut out = String::new();
+            write_jq_json(&mut out, other);
+            out
+        }
     }
 }
 
