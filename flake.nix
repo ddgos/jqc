@@ -215,14 +215,19 @@
             nativeCheckInputs = [ pkgs.jq ];
             # `jqc-build` generates a scratch Cargo project per script and
             # shells out to `cargo build` on it at *its own* runtime (see
-            # jqc-build/src/main.rs), so it needs cargo/rustc on PATH and
-            # a way to find the `jqc` crate to depend on once its own
-            # build sandbox is long gone -- `self` is a permanent store
-            # path, unlike anything under $TMPDIR during this build.
+            # jqc-build/src/main.rs), so it needs cargo/rustc *and* a C
+            # linker on PATH (rustc calls out to `cc` to link the final
+            # binary -- `nix develop`'s `mkShell` provides one via
+            # `stdenv` for free, which masked this when only testing
+            # inside the dev shell; a `wrapProgram`-wrapped binary gets
+            # nothing beyond what's explicitly listed here), plus a way
+            # to find the `jqc` crate to depend on once its own build
+            # sandbox is long gone -- `self` is a permanent store path,
+            # unlike anything under $TMPDIR during this build.
             postInstall = ''
               wrapProgram $out/bin/jqc-build \
                 --set JQC_WORKSPACE_DIR ${self} \
-                --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.cargo pkgs.rustc ]}
+                --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.cargo pkgs.rustc pkgs.stdenv.cc ]}
             '';
           };
           # A concrete, built-in demonstration that `mkJqScript` works:
