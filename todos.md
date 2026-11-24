@@ -9,10 +9,10 @@ git. Do these in whichever order makes the most sense.
 
 ## Tasks
 
-Add safeguards around the more memory intensive tests to ensure that the test
-fails before the test uses a certain amount of memory on the machine it is
-running on. Set this limit to 64GB by default on this machine. Complete this
-task before running the full test suite as OOM reaping will occur otherwise.
+Fix the memory explosion in `lower_funcdef`: it clones the recursively-nested
+`def_scope` at every `def`, used or not, which blew up to 38GB+ RSS (and was
+killed before OOM-reaping the machine) compiling just 400 trivial unused defs
+during safeguard testing. Root-cause fix, not just the rlimit safeguard above.
 
 Write benchmarks for the peak RAM usage of the codegen process.
 

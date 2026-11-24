@@ -16,6 +16,48 @@ use criterion::{BenchmarkId, Criterion};
 
 use crate::{codegen, lower};
 
+/// Physical RAM in bytes, via `sysconf`; `None` if the syscall fails.
+fn physical_memory_bytes() -> Option<u64> {
+    let pages = unsafe { libc::sysconf(libc::_SC_PHYS_PAGES) };
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGE_SIZE) };
+    (pages > 0 && page_size > 0).then(|| pages as u64 * page_size as u64)
+}
+
+/// Caps this process's address space so a runaway allocation in one of
+/// these tests fails fast (an `abort` from the allocator) instead of being
+/// left to the kernel's OOM reaper, which can take an unbounded amount of
+/// time and is liable to kill unrelated processes on the machine rather
+/// than just this test binary.
+///
+/// Nominally 64GiB, but clamped to half of physical RAM: on a machine with
+/// less RAM than that (this one has 38GiB, not 64+), a flat 64GiB limit
+/// would let a single test balloon to the point of swapping the whole
+/// machine to a crawl -- or worse, triggering the OOM killer on unrelated
+/// processes -- long before the rlimit itself is ever hit. Override with
+/// `JQC_TEST_MEM_LIMIT_GB` to force a specific value regardless.
+fn cap_memory() {
+    const NOMINAL_GB: u64 = 64;
+    let default_gb = physical_memory_bytes()
+        .map(|phys| (phys / 2 / (1024 * 1024 * 1024)).clamp(1, NOMINAL_GB))
+        .unwrap_or(NOMINAL_GB);
+    let gb: u64 = std::env::var("JQC_TEST_MEM_LIMIT_GB")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default_gb);
+    let limit_bytes = gb * 1024 * 1024 * 1024;
+    let limit = libc::rlimit {
+        rlim_cur: limit_bytes,
+        rlim_max: limit_bytes,
+    };
+    let rc = unsafe { libc::setrlimit(libc::RLIMIT_AS, &limit) };
+    assert_eq!(
+        rc,
+        0,
+        "setrlimit(RLIMIT_AS, {limit_bytes}) failed: {}",
+        std::io::Error::last_os_error()
+    );
+}
+
 fn compile(src: &str) {
     let ast = lower::parse_and_lower(src).expect("fixture filter should compile");
     codegen::compile_top(&ast).expect("fixture filter should compile");
@@ -24,6 +66,7 @@ fn compile(src: &str) {
 #[test]
 #[ignore = "run explicitly: cargo test -p jqc-macros --release -- --ignored compile_time_benchmarks --nocapture"]
 fn compile_time_benchmarks() {
+    cap_memory();
     let mut c = Criterion::default();
 
     let fixtures: &[(&str, &str)] = &[
@@ -63,25 +106,15 @@ fn compile_time_benchmarks() {
     group.finish();
 }
 
-/// Characterizes a real, severe cost cliff: a chain of non-recursive defs
-/// where each level's body uses the previous level twice (`def f{i}: f{i-1}
-/// | f{i-1};`) blows up *worse* than the 2^depth you'd expect from plain
-/// non-memoized call-by-name duplication alone -- `lower_call`'s
-/// `def_scope: Vec<DefEntry>` snapshot is cloned (recursively, since each
-/// entry's own `def_scope` nests all the earlier ones) at every level, so
-/// the per-level cost grows too. Measured wall-clock time roughly doubled
-/// per level up to depth 5, then the ratio itself started climbing
-/// (2.7x, then 4.6x at depth 7); depth 8 was still running after 2.5
-/// minutes and over 30GB of RSS when killed. Capped at 6 here (~30s total)
-/// -- do not raise this without a memory cap, it is not a typo.
-/// Isolates the *other* cost in `lower_funcdef`: `def_scope: scope.to_vec()`
-/// clones the whole (recursively-nested) scope at every `def`, whether or
-/// not that def is ever called. N unused defs should be cheap in a real
-/// compiler (jq's own compile time is ~4ms flat up to 200 unused defs --
-/// see the investigation this is based on); this checks whether jqc's is.
+/// Isolates one cost in `lower_funcdef`: `def_scope: scope.to_vec()` clones
+/// the whole (recursively-nested) scope at every `def`, whether or not that
+/// def is ever called. N unused defs should be cheap in a real compiler
+/// (jq's own compile time is ~4ms flat up to 200 unused defs -- see the
+/// investigation this is based on); this checks whether jqc's is.
 #[test]
 #[ignore = "run explicitly: cargo test -p jqc-macros --release -- --ignored unused_defs_scaling_check --nocapture"]
 fn unused_defs_scaling_check() {
+    cap_memory();
     for n in [50, 100, 200, 400] {
         let mut src = String::new();
         for i in 0..n {
@@ -94,9 +127,22 @@ fn unused_defs_scaling_check() {
     }
 }
 
+/// Characterizes a real, severe cost cliff: a chain of non-recursive defs
+/// where each level's body uses the previous level twice (`def f{i}: f{i-1}
+/// | f{i-1};`) blows up *worse* than the 2^depth you'd expect from plain
+/// non-memoized call-by-name duplication alone -- `lower_call`'s
+/// `def_scope: Vec<DefEntry>` snapshot is cloned (recursively, since each
+/// entry's own `def_scope` nests all the earlier ones) at every level, so
+/// the per-level cost grows too. Measured wall-clock time roughly doubled
+/// per level up to depth 5, then the ratio itself started climbing
+/// (2.7x, then 4.6x at depth 7); depth 8 was still running after 2.5
+/// minutes and over 30GB of RSS when killed. Capped at 6 here (~30s total)
+/// -- do not raise this without raising `cap_memory`'s limit too, it is
+/// not a typo.
 #[test]
 #[ignore = "run explicitly: cargo test -p jqc-macros --release -- --ignored scaling_check --nocapture"]
 fn scaling_check() {
+    cap_memory();
     for depth in 1..=6 {
         let mut src = String::from("def f0: . + 1;\n");
         for i in 1..=depth {
