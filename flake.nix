@@ -38,8 +38,14 @@
       # Same dev-shell contents as `default`, just with `jq` swapped for a
       # specific version -- everything else (cargo, rustc, …) still comes
       # from the primary `nixpkgs` input, so this doesn't rebuild a whole
-      # second toolchain just to pin one package.
-      mkDevShell = system: jqPkg:
+      # second toolchain just to pin one package. `extraJqBins` (used only
+      # by `default` below) additionally exposes every other pinned jq
+      # version under its own name (`jq-1.6`, `jq-1.7`, …) on the same
+      # PATH, so testing against 1.6/1.7/1.8 doesn't need switching
+      # devShells -- one `nix develop` has all of them at once, e.g.
+      # `jq-1.6 --version` or pointing `differential.rs`'s `run_real_jq`
+      # at a specific one by hand.
+      mkDevShell = system: jqPkg: extraJqBins:
         let pkgs = nixpkgs.legacyPackages.${system};
         in pkgs.mkShell {
           packages = [
@@ -51,13 +57,25 @@
             jqPkg
             pkgs.typst
             pkgs.cargo-tarpaulin
-          ];
+            pkgs.cargo-criterion
+            pkgs.gnuplot
+          ] ++ extraJqBins;
           RUST_BACKTRACE = "1";
           # jqc-manual-tests-macros reads jq's own manual examples from
           # here (docs/content/manual/**/manual.yml) to generate
           # differential tests; see jq-src in `inputs` above.
           JQ_SRC = "${jq-src}";
         };
+
+      # `name-${version}` (`jq-1_6`, …) -> a `pkgs.writeShellScriptBin`
+      # wrapper exposing that version's `jq` binary under `jq-<version>`
+      # (`jq-1.6`, with dots, matching how real jq reports `--version`)
+      # instead of the bare `jq` every `oldJqInputs` package installs as.
+      mkVersionedJqBin = system: versionLabel: input:
+        let pkgs = nixpkgs.legacyPackages.${system};
+        in pkgs.writeShellScriptBin "jq-${versionLabel}" ''
+          exec "${input.legacyPackages.${system}.jq}/bin/jq" "$@"
+        '';
 
       # Every `todo-reports/<name>/report.typ` becomes its own Typst project,
       # built via typix (https://github.com/loqusion/typix) for reproducible,
@@ -86,6 +104,42 @@
               typstSource = "${name}/report.typ";
               typstOpts.root = ".";
             });
+
+      # Given a jq script file, returns a derivation whose `$out/bin/<name>`
+      # is a standalone binary dedicated to that one filter -- the `nix
+      # build`-time equivalent of `nix run . -- <script-file>`, for when the
+      # compiled binary itself (not just a one-off run of it) is the thing
+      # wanted. `name` is the script's file name without its `.jq` suffix.
+      #
+      # This builds `jqc-build` from source, then runs *it* as the
+      # buildPhase (rather than letting `buildRustPackage` build `src`
+      # itself) to compile the script -- `cargoLock.lockFile` still buys
+      # the usual offline vendored-dependency setup, which covers the
+      # `cargo build` `jqc-build` shells out to internally, since it
+      # inherits the same `$CARGO_HOME`.
+      mkJqScript = system: scriptFile:
+        let
+          pkgs = nixpkgs.legacyPackages.${system};
+          name = nixpkgs.lib.removeSuffix ".jq" (builtins.baseNameOf scriptFile);
+        in
+        pkgs.rustPlatform.buildRustPackage {
+          pname = "jqc-script-${name}";
+          version = "0.1.0";
+          src = self;
+          cargoLock.lockFile = ./Cargo.lock;
+          doCheck = false;
+          buildPhase = ''
+            runHook preBuild
+            cargo build --release -p jqc-build
+            JQC_WORKSPACE_DIR=$PWD ./target/release/jqc-build ${scriptFile} -o ${name}
+            runHook postBuild
+          '';
+          installPhase = ''
+            runHook preInstall
+            install -Dm755 ${name} $out/bin/${name}
+            runHook postInstall
+          '';
+        };
     in
     {
       # `default` tracks nixpkgs-unstable's current jq (1.8.2). `jq-1_6`/
@@ -94,20 +148,40 @@
       # runs the exact same differential suite against jq 1.6 as ground
       # truth, no test-code changes needed.
       devShells = forAllSystems (system:
-        let pkgs = nixpkgs.legacyPackages.${system};
+        let
+          pkgs = nixpkgs.legacyPackages.${system};
+          versionedJqBins = nixpkgs.lib.mapAttrsToList
+            (name: input: mkVersionedJqBin system (nixpkgs.lib.replaceStrings [ "_" ] [ "." ] (nixpkgs.lib.removePrefix "jq-" name)) input)
+            oldJqInputs;
         in {
-          default = mkDevShell system pkgs.jq;
+          default = mkDevShell system pkgs.jq versionedJqBins;
         } // nixpkgs.lib.mapAttrs
-          (_: input: mkDevShell system input.legacyPackages.${system}.jq)
+          (_: input: mkDevShell system input.legacyPackages.${system}.jq [ ])
           oldJqInputs);
 
-      # `nix run .#build-reports` compiles every todo-reports/<name>/report.typ
-      # (each a typix-built derivation) and copies the PDF next to its source.
+      # `nix run .` (the default app) is `jqc-build`: `nix run . --
+      # <script-file> [-o <output>]` compiles that jq filter into a
+      # standalone binary, same as `nix build`-ing `mkJqScript` above but
+      # without naming a derivation first. `nix run .#build-reports`
+      # compiles every todo-reports/<name>/report.typ (each a typix-built
+      # derivation) and copies the PDF next to its source. `examples`'
+      # `compiled-filter` demo binary is still built as part of `default`
+      # below and runnable via `nix run .#default-example` -- it's just
+      # not what bare `nix run .` means, since it's one hardcoded filter
+      # rather than the general-purpose tool.
       apps = forAllSystems (system:
         let
           pkgs = nixpkgs.legacyPackages.${system};
           reports = reportPackages system;
         in {
+          default = {
+            type = "app";
+            program = "${self.packages.${system}.default}/bin/jqc-build";
+          };
+          default-example = {
+            type = "app";
+            program = "${self.packages.${system}.default}/bin/compiled-filter";
+          };
           build-reports = {
             type = "app";
             program = toString (pkgs.writeShellScript "build-reports" ''
@@ -132,11 +206,67 @@
             src = self;
             cargoLock.lockFile = ./Cargo.lock;
             nativeBuildInputs = [ pkgs.pkg-config pkgs.makeWrapper ];
-            # jqc-build shells out to `cargo` at runtime to compile generated
-            # projects into standalone binaries, so cargo needs to be on PATH.
+            # The differential test suite (checkPhase runs `cargo test`)
+            # shells out to `jq` as ground truth -- without this, `nix
+            # build` fails that it's not on the sandboxed builder's PATH
+            # even though `nix develop -c cargo test` works fine (the dev
+            # shell provides `jq` itself; `nativeCheckInputs` is the
+            # equivalent for the package build's check phase).
+            nativeCheckInputs = [ pkgs.jq ];
+            # `jqc-build` generates a scratch Cargo project per script and
+            # shells out to `cargo build` on it at *its own* runtime (see
+            # jqc-build/src/main.rs), so it needs cargo/rustc on PATH and
+            # a way to find the `jqc` crate to depend on once its own
+            # build sandbox is long gone -- `self` is a permanent store
+            # path, unlike anything under $TMPDIR during this build.
             postInstall = ''
-              wrapProgram $out/bin/jqc-build --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.cargo pkgs.rustc ]}
+              wrapProgram $out/bin/jqc-build \
+                --set JQC_WORKSPACE_DIR ${self} \
+                --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.cargo pkgs.rustc ]}
             '';
+          };
+          # A concrete, built-in demonstration that `mkJqScript` works:
+          # `nix build .#example-script` produces a binary dedicated to
+          # jqc-build/examples/select-active.jq, reproducibly and offline.
+          example-script = mkJqScript system ./jqc-build/examples/select-active.jq;
+        });
+
+      lib = {
+        inherit mkJqScript;
+      };
+
+      # `nix flake check` *builds* every `checks.*` output (unlike
+      # `packages`/`apps`, which it only evaluates) -- so this is what
+      # actually makes "run the test suite" part of `nix flake check`,
+      # per README.md's Testing section:
+      # - `default` re-uses `packages.default`: its checkPhase is already
+      #   `cargo test --workspace` (differential, version_selection,
+      #   fuzz_inputs, the jqc-compiler scaling-check regression guards,
+      #   doc-tests -- everything README.md lists as part of a plain
+      #   `cargo test --workspace`).
+      # - `manual-tests` covers the one workspace-excluded suite
+      #   (jqc-manual-tests, excluded because it needs `$JQ_SRC` at
+      #   *compile* time, which a plain `--workspace` run can't assume).
+      # Deliberately not included: `fuzz_scripts -- --ignored` (README
+      # calls out as slow/off-by-default) and the wall-time/peak-RSS
+      # benchmarks under `--ignored` (diagnostics, not pass/fail checks).
+      checks = forAllSystems (system:
+        let pkgs = nixpkgs.legacyPackages.${system};
+        in {
+          default = self.packages.${system}.default;
+          manual-tests = pkgs.rustPlatform.buildRustPackage {
+            pname = "jqc-manual-tests";
+            version = "0.1.0";
+            src = self;
+            sourceRoot = "source/jqc-manual-tests";
+            cargoLock.lockFile = ./jqc-manual-tests/Cargo.lock;
+            nativeCheckInputs = [ pkgs.jq ];
+            # Needed at compile time, not just test-run time: the
+            # generate_manual_tests! proc macro reads manual.yml from
+            # here while expanding, during `cargo test`'s own build step.
+            JQ_SRC = "${jq-src}";
+            dontBuild = true;
+            installPhase = "mkdir -p $out";
           };
         });
     };

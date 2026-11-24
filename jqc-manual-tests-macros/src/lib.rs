@@ -61,13 +61,14 @@ struct Example {
 /// is `(exact program text, reason shown as the test's #[ignore] message)`.
 /// Remove an entry once `jqc` is fixed and its generated test goes green
 /// on its own -- this list is the manual-examples half of `todos.md`'s
-/// "no more xfail tests" compliance goal.
-const KNOWN_RUNTIME_DISCREPANCIES: &[(&str, &str)] = &[(
-    "[repeat(.*2, error)?]",
-    "known discrepancy: jqc's repeat()/error interaction with `?` doesn't \
-     match real jq's lazy-generator short-circuit semantics yet (jqc: [], \
-     real jq: [2]) -- see todos.md xfail tracking",
-)];
+/// "no more xfail tests" compliance goal. Empty for now: the one tracked
+/// discrepancy (`repeat()`/`error`/`?` interaction, see
+/// `jqc/tests/differential.rs`'s `repeat_error_optional`) was fixed by
+/// threading partial generator output through errors (`JqError::emitted`,
+/// `jqc_core::bubble`/`bubble1`) so `try`/`?` recovers whatever a
+/// generator already produced before failing, matching jq's lazy
+/// streaming semantics.
+const KNOWN_RUNTIME_DISCREPANCIES: &[(&str, &str)] = &[];
 
 struct MacroInput {
     version: LitStr,

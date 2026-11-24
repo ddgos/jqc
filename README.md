@@ -20,6 +20,24 @@ Build it normally (`cargo build --release`) and you get a standalone binary
 dedicated to running exactly that filter -- see `examples/src/main.rs` for a
 small NDJSON-filtering CLI built this way.
 
+### Compiling a script file directly: `jqc-build`
+
+`jq!`'s filter has to be a literal at *someone's* compile time; `jqc-build`
+supplies that someone, for when you have a `.jq` file rather than a Rust
+crate to put the macro call in:
+
+```
+$ jqc-build select-active.jq -o select-active   # or: nix run . -- select-active.jq
+$ echo '{"items":[{"name":"a","active":true}]}' | ./select-active
+"a"
+```
+
+It generates a scratch Cargo project embedding the script as a `jq!` call,
+builds it, and copies out the resulting binary. `nix build .#example-script`
+builds `jqc-build/examples/select-active.jq` this way as a Nix derivation
+(reproducibly, offline -- see `mkJqScript` in `flake.nix`, exposed as
+`lib.mkJqScript` for other flakes to build their own scripts this way).
+
 ### Targeting a specific jq version
 
 `jq!("...")` with no version argument targets the newest jq version this
@@ -60,6 +78,13 @@ is a compile error pointing at that `jq!` call.
   `jqc::core` (generated code references `::jqc::core::...`, so this is
   what you add to `Cargo.toml`, not `jqc-core`/`jqc-macros`/`jqc-compiler`
   directly) and `jq!` from `jqc-macros`.
+- `jqc-build` -- CLI: compiles a `.jq` script *file* into a standalone
+  binary at `jqc-build`'s own runtime (see above), rather than a filter
+  hand-written into some other crate's `main.rs` at that crate's compile
+  time. `nix run .` (the flake's default app) is this; the Nix package's
+  `compiled-filter` demo binary below is reachable via `nix run
+  .#default-example` instead, since it's one fixed illustrative filter
+  rather than the general-purpose tool.
 - `examples` -- a tiny compiled-filter CLI demonstrating usage.
 
 ## Supported jq subset
@@ -150,8 +175,17 @@ and non-recursive `def` (see limitation below), and builtins: `map`,
   (not the macro-expansion step, which only runs once at compile time)
   across input sizes, each with a real-`jq`-subprocess series alongside it
   (at a couple of smaller sizes, to keep subprocess-spawn overhead from
-  dominating `cargo bench`'s own runtime) showing the per-call cost `jq!`
-  avoids by baking the filter in at compile time.
+  dominating `cargo bench`'s own runtime): `jq_cold` (fresh process per
+  call) and `jq_warm` (one process, many calls piped through it) bracket
+  the per-call cost of shelling out to real `jq`, instead of embedding
+  `jqc`, for a given filter. That's not a fair comparison against the
+  in-process `jqc` series on its own (deliberately -- see `run_jq`'s doc
+  comment), since it's dominated by process-spawn/text-pipe cost rather
+  than jq-the-language's own evaluation time; `jqc_cold`/`jqc_warm` hold
+  *that* constant by running a `jqc-build`-compiled binary of the same
+  filter through identical plumbing, isolating the in-process-vs-
+  subprocess packaging difference from jq-vs-jqc's actual evaluation
+  speed.
 - `jqc-compiler/src/bench.rs` benchmarks and guards the macro-expansion
   step itself. `unused_defs_scaling_check` and `scaling_check` --
   regression checks for a `def_scope` cost cliff that once blew up to
@@ -189,8 +223,15 @@ footing instead of only against whatever ran last.
 ```
 nix develop
 ```
-gives you `cargo`, `rustc`, `rust-analyzer`, `rustfmt`, `clippy`, `jq`
-(needed by the differential tests), and `typst`.
+gives you `cargo`, `rustc`, `rust-analyzer`, `rustfmt`, `clippy`, `typst`,
+`cargo-tarpaulin`, `cargo-criterion`, `gnuplot`, and every pinned `jq`
+version at once: the default `jq` (nixpkgs-unstable's current release,
+1.8.2 as of writing) plus `jq-1.6`/`jq-1.7` wrappers around the other two
+pinned versions, all on `PATH` simultaneously -- no need to switch
+devShells to check something against an older `jq`. `nix develop
+.#jq-1_6` / `.#jq-1_7` additionally swap the *default* `jq` name itself
+to that version (for anything that specifically shells out to `jq` by
+that name, like the differential suite's ground truth).
 
 ## Todo reports
 

@@ -1,0 +1,12 @@
+[package]
+name = "jqc-build"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CLI: compile a jq script file into a standalone binary via the jq! macro, at jqc-build's own runtime rather than some other crate's compile time"
+
+[[bin]]
+name = "jqc-build"
+path = "src/main.rs"
+
+[dependencies]

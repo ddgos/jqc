@@ -5,6 +5,7 @@ members = [
     "jqc-compiler",
     "jqc-macros",
     "jqc",
+    "jqc-build",
     "examples",
 ]
 # jqc-manual-tests(-macros) need $JQ_SRC (a jq source checkout; the Nix

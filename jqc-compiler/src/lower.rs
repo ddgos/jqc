@@ -34,7 +34,7 @@ def all(cond): all(.[]; cond);
 def all: all(.);
 def while(cond; update): def __jqc_while_r: if cond then ., (update | __jqc_while_r) else empty end; __jqc_while_r;
 def until(cond; update): def __jqc_until_u: if cond then . else (update | __jqc_until_u) end; __jqc_until_u;
-def repeat(f): def __jqc_repeat_r: ., (f | __jqc_repeat_r); __jqc_repeat_r;
+def repeat(f): def __jqc_repeat_r: f, __jqc_repeat_r; __jqc_repeat_r;
 def not: if . then false else true end;
 def error(msg): msg | error;
 "#;

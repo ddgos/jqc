@@ -54,6 +54,46 @@ fn fn_ident(name: &str) -> Ident {
     format_ident!("__jqc_fn_{}", name)
 }
 
+/// Builds a `JResult<Vec<Value>>`-typed block that iterates `sub_c`'s
+/// output, binding each element to `item_ident` and running `body` once per
+/// element -- `body` pushes onto the block's own `__out` (directly, or via
+/// `#core_path("bubble"/"bubble1")` if it can itself fail).
+///
+/// This is for *pass-through* nodes, where each element `sub_c` produces
+/// directly feeds a piece of this node's own output (e.g. `Pipe`'s operand,
+/// `Field`'s base, `BinOp`'s operands) -- as opposed to *collector* nodes
+/// (`ArrayConstruct`, string interpolation, …) where `sub_c`'s elements are
+/// folded into one combined output and never individually observable.
+///
+/// For pass-through nodes, jq's lazy generators mean a `try`/`?` around
+/// this node must still see whatever elements were already produced before
+/// an error -- both elements `body` already pushed for earlier `sub_c`
+/// items, *and*, if `sub_c` itself fails partway through generating items,
+/// the items `sub_c` had already produced (its own `JqError::emitted`).
+/// This builds that: on `sub_c` failure, it still runs `body` over the
+/// partial items `sub_c` managed to emit, then re-raises with `__out`
+/// (now including whatever `body` pushed for those partial items) as the
+/// propagated error's `emitted`.
+fn partial_aware_for(sub_c: &TokenStream, item_ident: &TokenStream, body: TokenStream) -> TokenStream {
+    quote! {
+        {
+            let mut __out = ::std::vec::Vec::new();
+            match (#sub_c) {
+                ::std::result::Result::Ok(__items) => {
+                    for #item_ident in __items { #body }
+                }
+                ::std::result::Result::Err(mut __e) => {
+                    let __items = ::std::mem::take(&mut __e.emitted);
+                    for #item_ident in __items { #body }
+                    __e.emitted = __out;
+                    return Err(__e);
+                }
+            }
+            Ok(__out)
+        }
+    }
+}
+
 pub fn compile_top(expr: &Expr) -> CResult<TokenStream> {
     let mut scope: Vec<String> = Vec::new();
     let input_ident = format_ident!("__jqc_input");
@@ -122,18 +162,16 @@ fn compile_raw(expr: &Expr, input: &TokenStream, scope: &mut Vec<String>) -> CRe
         } => {
             let index_field = core_path("index_field");
             let base_c = compile(base, input, scope)?;
-            Ok(quote! {
-                {
-                    let mut __out = ::std::vec::Vec::new();
-                    for __base in (#base_c)? {
-                        match #index_field(&__base, #name) {
-                            Ok(v) => __out.push(v),
-                            Err(e) => if !#optional { return Err(e); },
-                        }
-                    }
-                    Ok(__out)
+            let body = quote! {
+                match #index_field(&__base, #name) {
+                    Ok(v) => __out.push(v),
+                    Err(mut e) => if !#optional {
+                        e.emitted = __out;
+                        return Err(e);
+                    },
                 }
-            })
+            };
+            Ok(partial_aware_for(&base_c, &quote!(__base), body))
         }
         Expr::Index {
             base,
@@ -143,22 +181,26 @@ fn compile_raw(expr: &Expr, input: &TokenStream, scope: &mut Vec<String>) -> CRe
             let index_value = core_path("index_value");
             let base_c = compile(base, input, scope)?;
             let index_c = compile(index, input, scope)?;
-            Ok(quote! {
-                {
-                    let mut __out = ::std::vec::Vec::new();
-                    // As with binops, jq evaluates the bracket expression's
-                    // generator as the outer loop, the base as the inner one.
-                    for __key in (#index_c)? {
-                        for __base in (#base_c)? {
-                            match #index_value(&__base, &__key) {
-                                Ok(v) => __out.push(v),
-                                Err(e) => if !#optional { return Err(e); },
-                            }
-                        }
-                    }
-                    Ok(__out)
+            // As with binops, jq evaluates the bracket expression's
+            // generator as the outer loop, the base as the inner one;
+            // nesting `partial_aware_for` for both means a failure in
+            // either generator (or a non-optional lookup itself) still
+            // keeps whatever lookups already completed.
+            let inner_body = quote! {
+                match #index_value(&__base, &__key) {
+                    Ok(v) => __out.push(v),
+                    Err(mut e) => if !#optional {
+                        e.emitted = __out;
+                        return Err(e);
+                    },
                 }
-            })
+            };
+            let inner = partial_aware_for(&base_c, &quote!(__base), inner_body);
+            let bubble = core_path("bubble");
+            let outer_body = quote! {
+                __out = #bubble(__out, (#inner))?;
+            };
+            Ok(partial_aware_for(&index_c, &quote!(__key), outer_body))
         }
         Expr::Slice {
             base,
@@ -176,39 +218,35 @@ fn compile_raw(expr: &Expr, input: &TokenStream, scope: &mut Vec<String>) -> CRe
         Expr::IterateAll { base, optional } => {
             let iterate = core_path("iterate");
             let base_c = compile(base, input, scope)?;
-            Ok(quote! {
-                {
-                    let mut __out = ::std::vec::Vec::new();
-                    for __base in (#base_c)? {
-                        match #iterate(&__base) {
-                            Ok(vs) => __out.extend(vs),
-                            Err(e) => if !#optional { return Err(e); },
-                        }
-                    }
-                    Ok(__out)
+            let body = quote! {
+                match #iterate(&__base) {
+                    Ok(vs) => __out.extend(vs),
+                    Err(mut e) => if !#optional {
+                        e.emitted = __out;
+                        return Err(e);
+                    },
                 }
-            })
+            };
+            Ok(partial_aware_for(&base_c, &quote!(__base), body))
         }
         Expr::Pipe(lhs, rhs) => {
             let lhs_c = compile(lhs, input, scope)?;
             let rhs_c = compile(rhs, &quote!(&__piped), scope)?;
-            Ok(quote! {
-                {
-                    let mut __out = ::std::vec::Vec::new();
-                    for __piped in (#lhs_c)? {
-                        __out.extend((#rhs_c)?);
-                    }
-                    Ok(__out)
-                }
-            })
+            let bubble = core_path("bubble");
+            let body = quote! {
+                __out = #bubble(__out, (#rhs_c))?;
+            };
+            Ok(partial_aware_for(&lhs_c, &quote!(__piped), body))
         }
         Expr::Comma(lhs, rhs) => {
             let lhs_c = compile(lhs, input, scope)?;
             let rhs_c = compile(rhs, input, scope)?;
+            let bubble = core_path("bubble");
             Ok(quote! {
                 {
-                    let mut __out = (#lhs_c)?;
-                    __out.extend((#rhs_c)?);
+                    let mut __out = ::std::vec::Vec::new();
+                    __out = #bubble(__out, (#lhs_c))?;
+                    __out = #bubble(__out, (#rhs_c))?;
                     Ok(__out)
                 }
             })
@@ -229,15 +267,11 @@ fn compile_raw(expr: &Expr, input: &TokenStream, scope: &mut Vec<String>) -> CRe
         Expr::Neg(x) => {
             let neg_value = core_path("neg_value");
             let x_c = compile(x, input, scope)?;
-            Ok(quote! {
-                {
-                    let mut __out = ::std::vec::Vec::new();
-                    for __val in (#x_c)? {
-                        __out.push(#neg_value(__val)?);
-                    }
-                    Ok(__out)
-                }
-            })
+            let bubble1 = core_path("bubble1");
+            let body = quote! {
+                __out = #bubble1(__out, #neg_value(__val))?;
+            };
+            Ok(partial_aware_for(&x_c, &quote!(__val), body))
         }
         Expr::BinOp(op, lhs, rhs) => compile_binop(*op, lhs, rhs, input, scope),
         Expr::And(lhs, rhs) => compile_and_or(lhs, rhs, input, scope, true),
@@ -248,18 +282,24 @@ fn compile_raw(expr: &Expr, input: &TokenStream, scope: &mut Vec<String>) -> CRe
         Expr::TryCatch(body, catch) => {
             let value_ty = core_path("Value");
             let jresult_ty = core_path("JResult");
+            let bubble = core_path("bubble");
             let body_c = compile(body, input, scope)?;
+            // jq's `try`/`?` only suppresses the error signal -- any
+            // values `body` already produced before erroring were already
+            // streamed out, so they stay in the result (`e.emitted`); a
+            // `catch` handler's own outputs are appended after those.
             let handler = match catch {
                 Some(c) => {
                     let catch_c = compile(c, &quote!(&__caught), scope)?;
                     quote! {
-                        Err(e) => {
+                        Err(mut e) => {
+                            let __out = ::std::mem::take(&mut e.emitted);
                             let __caught = e.into_value();
-                            (#catch_c)
+                            #bubble(__out, (#catch_c))
                         }
                     }
                 }
-                None => quote! { Err(_e) => Ok(::std::vec::Vec::new()) },
+                None => quote! { Err(mut e) => Ok(::std::mem::take(&mut e.emitted)) },
             };
             Ok(quote! {
                 {
@@ -280,7 +320,7 @@ fn compile_raw(expr: &Expr, input: &TokenStream, scope: &mut Vec<String>) -> CRe
                     let __result: #jresult_ty<::std::vec::Vec<#value_ty>> = (|| #body_c)();
                     match __result {
                         Ok(v) => Ok(v),
-                        Err(_) => Ok(::std::vec::Vec::new()),
+                        Err(mut e) => Ok(::std::mem::take(&mut e.emitted)),
                     }
                 }
             })
@@ -292,15 +332,11 @@ fn compile_raw(expr: &Expr, input: &TokenStream, scope: &mut Vec<String>) -> CRe
             let body_c = compile(body, input, scope);
             scope.pop();
             let body_c = body_c?;
-            Ok(quote! {
-                {
-                    let mut __out = ::std::vec::Vec::new();
-                    for #jv in (#source_c)? {
-                        __out.extend((#body_c)?);
-                    }
-                    Ok(__out)
-                }
-            })
+            let bubble = core_path("bubble");
+            let body = quote! {
+                __out = #bubble(__out, (#body_c))?;
+            };
+            Ok(partial_aware_for(&source_c, &quote!(#jv), body))
         }
         Expr::VarRef(name) => {
             if !scope.iter().any(|s| s == name) {
@@ -356,8 +392,9 @@ fn compile_raw(expr: &Expr, input: &TokenStream, scope: &mut Vec<String>) -> CRe
                 .transpose();
             scope.pop();
             let update_c = update_c?;
+            let bubble = core_path("bubble");
             let extract_push = match extract_c? {
-                Some(ec) => quote!(__out.extend((#ec)?);),
+                Some(ec) => quote!(__out = #bubble(__out, (#ec))?;),
                 None => quote!(__out.push(__state.clone());),
             };
             Ok(quote! {
@@ -486,65 +523,70 @@ fn compile_binop(
     let lhs_c = compile(lhs, input, scope)?;
     let rhs_c = compile(rhs, input, scope)?;
     let value_ty = core_path("Value");
+    let bubble1 = core_path("bubble1");
+    // Each op_call evaluates to `JResult<Value>` (even the infallible
+    // comparisons, wrapped in `Ok`) so it can be folded through `bubble1`
+    // uniformly below, preserving already-computed combinations if a later
+    // one fails.
     let op_call = match op {
         BinOp::Add => {
             let f = core_path("add_values");
-            quote!(#f(__lhs, __rhs.clone())?)
+            quote!(#f(__lhs, __rhs.clone()))
         }
         BinOp::Sub => {
             let f = core_path("sub_values");
-            quote!(#f(__lhs, __rhs.clone())?)
+            quote!(#f(__lhs, __rhs.clone()))
         }
         BinOp::Mul => {
             let f = core_path("mul_values");
-            quote!(#f(__lhs, __rhs.clone())?)
+            quote!(#f(__lhs, __rhs.clone()))
         }
         BinOp::Div => {
             let f = core_path("div_values");
-            quote!(#f(__lhs, __rhs.clone())?)
+            quote!(#f(__lhs, __rhs.clone()))
         }
         BinOp::Mod => {
             let f = core_path("mod_values");
-            quote!(#f(__lhs, __rhs.clone())?)
+            quote!(#f(__lhs, __rhs.clone()))
         }
         BinOp::Eq => {
             let f = core_path("eq_values");
-            quote!(#value_ty::Bool(#f(&__lhs, &__rhs)))
+            quote!(Ok(#value_ty::Bool(#f(&__lhs, &__rhs))))
         }
         BinOp::Ne => {
             let f = core_path("eq_values");
-            quote!(#value_ty::Bool(!#f(&__lhs, &__rhs)))
+            quote!(Ok(#value_ty::Bool(!#f(&__lhs, &__rhs))))
         }
         BinOp::Lt => {
             let f = core_path("cmp_values");
-            quote!(#value_ty::Bool(#f(&__lhs, &__rhs) == ::std::cmp::Ordering::Less))
+            quote!(Ok(#value_ty::Bool(#f(&__lhs, &__rhs) == ::std::cmp::Ordering::Less)))
         }
         BinOp::Le => {
             let f = core_path("cmp_values");
-            quote!(#value_ty::Bool(#f(&__lhs, &__rhs) != ::std::cmp::Ordering::Greater))
+            quote!(Ok(#value_ty::Bool(#f(&__lhs, &__rhs) != ::std::cmp::Ordering::Greater)))
         }
         BinOp::Gt => {
             let f = core_path("cmp_values");
-            quote!(#value_ty::Bool(#f(&__lhs, &__rhs) == ::std::cmp::Ordering::Greater))
+            quote!(Ok(#value_ty::Bool(#f(&__lhs, &__rhs) == ::std::cmp::Ordering::Greater)))
         }
         BinOp::Ge => {
             let f = core_path("cmp_values");
-            quote!(#value_ty::Bool(#f(&__lhs, &__rhs) != ::std::cmp::Ordering::Less))
+            quote!(Ok(#value_ty::Bool(#f(&__lhs, &__rhs) != ::std::cmp::Ordering::Less)))
         }
     };
-    Ok(quote! {
-        {
-            let mut __out = ::std::vec::Vec::new();
-            // jq evaluates the right operand's generator as the outer loop
-            // (e.g. `(1,2) + (10,20)` yields `11,12,21,22`, not `11,21,12,22`).
-            for __rhs in (#rhs_c)? {
-                for __lhs in (#lhs_c)? {
-                    __out.push(#op_call);
-                }
-            }
-            Ok(__out)
-        }
-    })
+    // jq evaluates the right operand's generator as the outer loop (e.g.
+    // `(1,2) + (10,20)` yields `11,12,21,22`, not `11,21,12,22`); nesting
+    // `partial_aware_for` for both keeps already-computed combinations if
+    // a later one (or either generator, partway through) fails.
+    let inner_body = quote! {
+        __out = #bubble1(__out, (#op_call))?;
+    };
+    let inner = partial_aware_for(&lhs_c, &quote!(__lhs), inner_body);
+    let bubble = core_path("bubble");
+    let outer_body = quote! {
+        __out = #bubble(__out, (#inner))?;
+    };
+    Ok(partial_aware_for(&rhs_c, &quote!(__rhs), outer_body))
 }
 
 /// `and`/`or` short-circuit: the right operand is only evaluated (and only
@@ -561,26 +603,25 @@ fn compile_and_or(
     let value_ty = core_path("Value");
     let lhs_c = compile(lhs, input, scope)?;
     let rhs_c = compile(rhs, input, scope)?;
+    let bubble1 = core_path("bubble1");
     let (short_circuit_on, short_circuit_value) = if is_and {
         (quote!(!), false)
     } else {
         (quote!(), true)
     };
-    Ok(quote! {
-        {
-            let mut __out = ::std::vec::Vec::new();
-            for __lhs in (#lhs_c)? {
-                if #short_circuit_on #truthy(&__lhs) {
-                    __out.push(#value_ty::Bool(#short_circuit_value));
-                } else {
-                    for __rhs in (#rhs_c)? {
-                        __out.push(#value_ty::Bool(#truthy(&__rhs)));
-                    }
-                }
-            }
-            Ok(__out)
+    let rhs_body = quote! {
+        __out = #bubble1(__out, Ok(#value_ty::Bool(#truthy(&__rhs))))?;
+    };
+    let rhs_block = partial_aware_for(&rhs_c, &quote!(__rhs), rhs_body);
+    let bubble = core_path("bubble");
+    let lhs_body = quote! {
+        if #short_circuit_on #truthy(&__lhs) {
+            __out.push(#value_ty::Bool(#short_circuit_value));
+        } else {
+            __out = #bubble(__out, (#rhs_block))?;
         }
-    })
+    };
+    Ok(partial_aware_for(&lhs_c, &quote!(__lhs), lhs_body))
 }
 
 fn compile_if(
@@ -600,19 +641,15 @@ fn compile_if(
     let then_c = compile(then_e, input, scope)?;
     let else_c = wrap_fallible(compile_if(&branches[1..], else_branch, input, scope)?);
     let truthy = core_path("truthy");
-    Ok(quote! {
-        {
-            let mut __out = ::std::vec::Vec::new();
-            for __cond in (#cond_c)? {
-                if #truthy(&__cond) {
-                    __out.extend((#then_c)?);
-                } else {
-                    __out.extend((#else_c)?);
-                }
-            }
-            Ok(__out)
+    let bubble = core_path("bubble");
+    let body = quote! {
+        if #truthy(&__cond) {
+            __out = #bubble(__out, (#then_c))?;
+        } else {
+            __out = #bubble(__out, (#else_c))?;
         }
-    })
+    };
+    Ok(partial_aware_for(&cond_c, &quote!(__cond), body))
 }
 
 fn compile_slice(
@@ -626,53 +663,77 @@ fn compile_slice(
     let base_c = compile(base, input, scope)?;
     let slice_value = core_path("slice_value");
     let to_i64 = core_path("value_to_i64");
+    let bubble = core_path("bubble");
 
     let from_c = from.map(|e| compile(e, input, scope)).transpose()?;
     let to_c = to.map(|e| compile(e, input, scope)).transpose()?;
 
     // jq nests these outer-to-inner as from, to, base (least significant),
     // mirroring how it treats the bracket expression as outer and the
-    // receiver as inner for plain indexing.
-    let base_loop = quote! {
-        for __base in (#base_c)? {
-            match #slice_value(&__base, __from, __to) {
-                Ok(v) => __out.push(v),
-                Err(e) => if !#optional { return Err(e); },
-            }
+    // receiver as inner for plain indexing. Each level is built as its own
+    // `JResult<Vec<Value>>` block (via `partial_aware_for` when that level
+    // is itself a generator) and folded into the level above via `bubble`,
+    // so a failure anywhere -- the base lookup, a `from`/`to` bound failing
+    // to convert, or either bound's generator failing partway through --
+    // still keeps whatever slices were already produced.
+    let base_body = quote! {
+        match #slice_value(&__base, __from, __to) {
+            Ok(v) => __out.push(v),
+            Err(mut e) => if !#optional {
+                e.emitted = __out;
+                return Err(e);
+            },
         }
     };
+    let base_block = partial_aware_for(&base_c, &quote!(__base), base_body);
     let with_to = match to_c {
-        Some(c) => quote! {
-            for __to_src in (#c)? {
-                let __to: ::std::option::Option<i64> = ::std::option::Option::Some(#to_i64(&__to_src)?);
-                #base_loop
-            }
-        },
+        Some(c) => {
+            let to_body = quote! {
+                match #to_i64(&__to_src) {
+                    Ok(__to_val) => {
+                        let __to: ::std::option::Option<i64> = ::std::option::Option::Some(__to_val);
+                        __out = #bubble(__out, (#base_block))?;
+                    }
+                    Err(mut e) => {
+                        e.emitted = __out;
+                        return Err(e);
+                    }
+                }
+            };
+            partial_aware_for(&c, &quote!(__to_src), to_body)
+        }
         None => quote! {
-            let __to: ::std::option::Option<i64> = ::std::option::Option::None;
-            #base_loop
+            {
+                let __to: ::std::option::Option<i64> = ::std::option::Option::None;
+                #base_block
+            }
         },
     };
     let with_from = match from_c {
-        Some(c) => quote! {
-            for __from_src in (#c)? {
-                let __from: ::std::option::Option<i64> = ::std::option::Option::Some(#to_i64(&__from_src)?);
+        Some(c) => {
+            let from_body = quote! {
+                match #to_i64(&__from_src) {
+                    Ok(__from_val) => {
+                        let __from: ::std::option::Option<i64> = ::std::option::Option::Some(__from_val);
+                        __out = #bubble(__out, (#with_to))?;
+                    }
+                    Err(mut e) => {
+                        e.emitted = __out;
+                        return Err(e);
+                    }
+                }
+            };
+            partial_aware_for(&c, &quote!(__from_src), from_body)
+        }
+        None => quote! {
+            {
+                let __from: ::std::option::Option<i64> = ::std::option::Option::None;
                 #with_to
             }
         },
-        None => quote! {
-            let __from: ::std::option::Option<i64> = ::std::option::Option::None;
-            #with_to
-        },
     };
 
-    Ok(quote! {
-        {
-            let mut __out = ::std::vec::Vec::new();
-            #with_from
-            Ok(__out)
-        }
-    })
+    Ok(with_from)
 }
 
 /// Generic N-ary cartesian product over a builtin call's arguments: each
@@ -691,22 +752,27 @@ fn cartesian_args(
         .collect::<CResult<Vec<_>>>()?;
     let names: Vec<Ident> = (0..args.len()).map(|i| format_ident!("__a{i}")).collect();
     let name_toks: Vec<TokenStream> = names.iter().map(|n| quote!(#n)).collect();
+    // `build` must produce a `JResult<Value>`-typed expression (fallible
+    // helpers used directly, infallible ones `Ok`-wrapped by the caller).
     let pushed = build(&name_toks);
-    let mut body = quote!(__out.push(#pushed););
-    for (name, c) in names.iter().zip(compiled.iter()).rev() {
-        body = quote! {
-            for #name in (#c)? {
-                #body
-            }
-        };
-    }
-    Ok(quote! {
+    let bubble1 = core_path("bubble1");
+    let bubble = core_path("bubble");
+    // Innermost: push one combination's result, merging it with whatever
+    // earlier combinations already pushed if it fails.
+    let mut block: TokenStream = quote! {
         {
             let mut __out = ::std::vec::Vec::new();
-            #body
+            __out = #bubble1(__out, (#pushed))?;
             Ok(__out)
         }
-    })
+    };
+    for (name, c) in names.iter().zip(compiled.iter()).rev() {
+        let body = quote! {
+            __out = #bubble(__out, (#block))?;
+        };
+        block = partial_aware_for(c, &quote!(#name), body);
+    }
+    Ok(block)
 }
 
 fn compile_call(
@@ -817,75 +883,78 @@ fn compile_call(
                 }
             })
         }
+        // `build` closures here all evaluate to a `JResult<Value>`-typed
+        // expression -- `cartesian_args` runs it as-is (no extra `Ok`/`?`
+        // wrapping) through `bubble1`, so a fallible helper is used
+        // directly and an infallible one is wrapped in `Ok` right here.
         ("has", 1) => {
             let f = core_path("has_key");
             cartesian_args(args, input, scope, |a| {
                 let arg = &a[0];
-                quote!(#f(#input, &#arg)?)
+                quote!(#f(#input, &#arg))
             })
         }
         ("contains", 1) => {
             let f = core_path("contains_value");
             cartesian_args(args, input, scope, |a| {
                 let arg = &a[0];
-                quote!(#value_ty::Bool(#f(#input, &#arg)?))
+                quote!(#f(#input, &#arg).map(#value_ty::Bool))
             })
         }
         ("startswith", 1) => {
             let f = core_path("startswith");
             cartesian_args(args, input, scope, |a| {
                 let arg = &a[0];
-                quote!(#f(#input, &#arg)?)
+                quote!(#f(#input, &#arg))
             })
         }
         ("endswith", 1) => {
             let f = core_path("endswith");
             cartesian_args(args, input, scope, |a| {
                 let arg = &a[0];
-                quote!(#f(#input, &#arg)?)
+                quote!(#f(#input, &#arg))
             })
         }
         ("ltrimstr", 1) => {
             let f = core_path("ltrimstr");
             cartesian_args(args, input, scope, |a| {
                 let arg = &a[0];
-                quote!(#f(#input, &#arg))
+                quote!(Ok(#f(#input, &#arg)))
             })
         }
         ("rtrimstr", 1) => {
             let f = core_path("rtrimstr");
             cartesian_args(args, input, scope, |a| {
                 let arg = &a[0];
-                quote!(#f(#input, &#arg))
+                quote!(Ok(#f(#input, &#arg)))
             })
         }
         ("join", 1) => {
             let f = core_path("join_strings");
             cartesian_args(args, input, scope, |a| {
                 let arg = &a[0];
-                quote!(#f(#input, &#arg)?)
+                quote!(#f(#input, &#arg))
             })
         }
         ("split", 1) => {
             let f = core_path("split_string");
             cartesian_args(args, input, scope, |a| {
                 let arg = &a[0];
-                quote!(#f(#input, &#arg)?)
+                quote!(#f(#input, &#arg))
             })
         }
         ("range", 1) => {
             let range_values = core_path("range_values");
             let arg_c = compile(&args[0], input, scope)?;
             let to_f64 = core_path("value_to_f64");
-            Ok(quote! {
-                {
-                    let mut __out = ::std::vec::Vec::new();
-                    for __to in (#arg_c)? {
-                        __out.extend(#range_values(0.0, #to_f64(&__to)?, 1.0));
-                    }
-                    Ok(__out)
-                }
-            })
+            let bubble = core_path("bubble");
+            let jresult_ty = core_path("JResult");
+            let body = quote! {
+                __out = #bubble(__out, (|| -> #jresult_ty<::std::vec::Vec<#value_ty>> {
+                    Ok(#range_values(0.0, #to_f64(&__to)?, 1.0))
+                })())?;
+            };
+            Ok(partial_aware_for(&arg_c, &quote!(__to), body))
         }
         ("range", 2) => compile_range(&args[0], &args[1], None, input, scope),
         ("range", 3) => compile_range(&args[0], &args[1], Some(&args[2]), input, scope),
@@ -917,30 +986,31 @@ fn compile_range(
     let to_c = compile(to, input, scope)?;
     let to_f64 = core_path("value_to_f64");
     let range_values = core_path("range_values");
-    let step_part = match step {
+    let bubble = core_path("bubble");
+    let jresult_ty = core_path("JResult");
+    let value_ty = core_path("Value");
+    let to_body = match step {
         Some(s) => {
             let step_c = compile(s, input, scope)?;
-            quote! {
-                for __step in (#step_c)? {
-                    __out.extend(#range_values(#to_f64(&__from)?, #to_f64(&__to)?, #to_f64(&__step)?));
-                }
-            }
+            let step_body = quote! {
+                __out = #bubble(__out, (|| -> #jresult_ty<::std::vec::Vec<#value_ty>> {
+                    Ok(#range_values(#to_f64(&__from)?, #to_f64(&__to)?, #to_f64(&__step)?))
+                })())?;
+            };
+            let step_block = partial_aware_for(&step_c, &quote!(__step), step_body);
+            quote! { __out = #bubble(__out, (#step_block))?; }
         }
         None => quote! {
-            __out.extend(#range_values(#to_f64(&__from)?, #to_f64(&__to)?, 1.0));
+            __out = #bubble(__out, (|| -> #jresult_ty<::std::vec::Vec<#value_ty>> {
+                Ok(#range_values(#to_f64(&__from)?, #to_f64(&__to)?, 1.0))
+            })())?;
         },
     };
-    Ok(quote! {
-        {
-            let mut __out = ::std::vec::Vec::new();
-            for __from in (#from_c)? {
-                for __to in (#to_c)? {
-                    #step_part
-                }
-            }
-            Ok(__out)
-        }
-    })
+    let to_block = partial_aware_for(&to_c, &quote!(__to), to_body);
+    let from_body = quote! {
+        __out = #bubble(__out, (#to_block))?;
+    };
+    Ok(partial_aware_for(&from_c, &quote!(__from), from_body))
 }
 
 /// Shared shape for `sort_by`/`group_by`/`unique_by`/`min_by`/`max_by`:
