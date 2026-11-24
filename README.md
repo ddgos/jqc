@@ -102,8 +102,10 @@ preceding step only -- matches real jq), `|`, `,`, literals incl. string
 interpolation (`"\(expr)"`), array/object construction (incl. `{a}`/`{$a}`
 shorthand and computed `(expr): val` keys), arithmetic (`+ - * / %`,
 jq's type-aware semantics for each), comparisons, `and`/`or`, `//`
-(alternative operator), `if/elif/else/end`, `try/catch`, `as $x` bindings,
-`reduce`, `foreach`, recursive and non-recursive `def` (see limitation
+(alternative operator), `if/elif/else/end`, `try/catch`, `as` bindings
+(incl. destructuring patterns: `as [$a, $b]`, `as {a: $a, $b}`, computed
+and nested, but not `?//` alternative patterns), `reduce`, `foreach`,
+recursive and non-recursive `def` (see limitation
 below), and builtins: `map`, `select`, `values`, `recurse(;f)`, `in`,
 `any`/`all` (0/1/2-arg forms), `while`/`until`/`repeat`, `length`,
 `keys`/`keys_unsorted`, `has`, `type`, `not`, `empty`, `error`, `add`,
@@ -121,7 +123,10 @@ below), and builtins: `map`, `select`, `values`, `recurse(;f)`, `in`,
   explosion) but means **infinite generators never terminate** -- `repeat`
   and `while`/`until`/`recurse` without a condition that eventually goes
   false will hang. There's no `label`/`break`/`limit` to bound them yet.
-- **No destructuring patterns** in `as` bindings, only a single `$x`.
+- **No `?//` alternative destructuring patterns** (`as [$a] ?// {a: $a}`,
+  for matching one of several shapes depending on the input). Plain
+  destructuring (`as [$a, $b]`, `as {a: $a, $b}`, nested, computed keys)
+  is supported.
 - **`def` with parameters can't be recursive.** 0-arg recursive `def`s
   compile to a real recursive Rust `fn`; `def`s with parameters are inlined
   call-by-name at each call site (matching jq's own filter-argument

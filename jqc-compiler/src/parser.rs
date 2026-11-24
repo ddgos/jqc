@@ -1,7 +1,7 @@
 //! Recursive-descent parser producing [`Expr`] from the token stream
 //! produced by [`crate::lexer`].
 
-use crate::ast::{convert_str_parts, str_literal, BinOp, Expr, Param};
+use crate::ast::{convert_str_parts, str_literal, BinOp, Expr, Param, Pattern};
 use crate::diagnostics::{Diagnostic, Span};
 use crate::lexer::{Lexer, StrPart, Tok};
 use crate::version::JqVersion;
@@ -243,17 +243,100 @@ impl Parser {
         Ok(left)
     }
 
-    /// `EXPR as $x | BODY`, falling through to plain `//`-level expr.
+    /// `EXPR as PATTERN | BODY`, falling through to plain `//`-level expr.
     fn parse_as_binding(&mut self) -> PResult<Expr> {
         let expr = self.parse_alt()?;
         if self.is_ident("as") {
             self.bump();
-            let var = self.expect_var()?;
+            let pattern = self.parse_pattern()?;
             self.expect(Tok::Pipe)?;
             let body = self.parse_pipe()?;
-            return Ok(Expr::VarBind(Box::new(expr), var, Box::new(body)));
+            return Ok(Expr::VarBind(Box::new(expr), pattern, Box::new(body)));
         }
         Ok(expr)
+    }
+
+    /// An `as` binding's left-hand side: `$x`, or a destructuring
+    /// `[pat, ...]`/`{entry, ...}` shape that may itself nest patterns.
+    fn parse_pattern(&mut self) -> PResult<Pattern> {
+        match self.peek().clone() {
+            Tok::Var(name) => {
+                self.bump();
+                Ok(Pattern::Var(name))
+            }
+            Tok::LBracket => {
+                self.open_delim('[');
+                let mut elems = Vec::new();
+                if *self.peek() != Tok::RBracket {
+                    loop {
+                        elems.push(self.parse_pattern()?);
+                        if *self.peek() == Tok::Comma {
+                            self.bump();
+                            continue;
+                        }
+                        break;
+                    }
+                }
+                self.expect_close(Tok::RBracket)?;
+                Ok(Pattern::Array(elems))
+            }
+            Tok::LBrace => {
+                self.open_delim('{');
+                let mut entries = Vec::new();
+                if *self.peek() != Tok::RBrace {
+                    loop {
+                        entries.push(self.parse_pattern_entry()?);
+                        if *self.peek() == Tok::Comma {
+                            self.bump();
+                            continue;
+                        }
+                        break;
+                    }
+                }
+                self.expect_close(Tok::RBrace)?;
+                Ok(Pattern::Object(entries))
+            }
+            other => Err(self.err(format!(
+                "expected a pattern (e.g. `$x`, `[$a, $b]`, or `{{a: $a}}`), found {}",
+                describe(&other)
+            ))),
+        }
+    }
+
+    /// One `key: pattern` (or `$name` shorthand, meaning key `"name"` bound
+    /// via `Pattern::Var("name")`) inside a `{...}` destructuring pattern.
+    fn parse_pattern_entry(&mut self) -> PResult<(Expr, Pattern)> {
+        match self.peek().clone() {
+            Tok::Var(name) => {
+                self.bump();
+                Ok((str_literal(name.clone()), Pattern::Var(name)))
+            }
+            Tok::Ident(name) => {
+                self.bump();
+                self.expect(Tok::Colon)?;
+                let pat = self.parse_pattern()?;
+                Ok((str_literal(name), pat))
+            }
+            Tok::Str(parts) => {
+                self.bump();
+                let converted = convert_str_parts(parts, &mut |s| parse_sub_expr(s, self.version))?;
+                self.expect(Tok::Colon)?;
+                let pat = self.parse_pattern()?;
+                Ok((Expr::Str(converted), pat))
+            }
+            Tok::LParen => {
+                self.open_delim('(');
+                let key = self.parse_pipe()?;
+                self.expect_close(Tok::RParen)?;
+                self.expect(Tok::Colon)?;
+                let pat = self.parse_pattern()?;
+                Ok((key, pat))
+            }
+            other => Err(self.err(format!(
+                "expected a pattern entry (e.g. `$x`, `key: pattern`), found {}",
+                describe(&other)
+            ))),
+        }
     }
 
     /// `a // b`, the alternative operator -- looser than `or`/`and`/

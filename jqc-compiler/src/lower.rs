@@ -13,7 +13,7 @@
 
 use std::rc::Rc;
 
-use crate::ast::{Expr, ObjEntry, Param, StrPart};
+use crate::ast::{Expr, ObjEntry, Param, Pattern, StrPart};
 use crate::diagnostics::{Diagnostic, Span};
 use crate::parser::parse_program;
 use crate::version::JqVersion;
@@ -196,11 +196,11 @@ fn lower(expr: Expr, scope: &[DefEntry]) -> LResult<Expr> {
             catch.map(|e| lower(*e, scope)).transpose()?.map(Box::new),
         )),
         Expr::Optional(body) => Ok(Expr::Optional(Box::new(lower(*body, scope)?))),
-        Expr::VarBind(source, name, body) => Ok(Expr::VarBind(
-            Box::new(lower(*source, scope)?),
-            name,
-            Box::new(lower(*body, scope)?),
-        )),
+        Expr::VarBind(source, pattern, body) => {
+            let source = lower(*source, scope)?;
+            let body = lower(*body, scope)?;
+            bind_pattern(source, pattern, body, scope)
+        }
         Expr::Reduce {
             source,
             var,
@@ -238,6 +238,65 @@ fn lower(expr: Expr, scope: &[DefEntry]) -> LResult<Expr> {
             span,
         } => lower_funcdef(name, params, *body, *rest, span, scope),
         Expr::Call(name, args, span) => lower_call(name, args, span, scope),
+    }
+}
+
+/// Desugars `source as PATTERN | body` into nested plain-`$x` `VarBind`s
+/// over `Index` lookups -- e.g. `source as [$a, $b] | body` becomes
+/// (informally) `source as $__jqc_destr | $__jqc_destr[0] as $a |
+/// $__jqc_destr[1] as $b | body`. `source` and `body` must already be
+/// lowered (this only builds new `Index`/`VarRef` glue around them, which
+/// contains no calls needing resolution); a computed `(expr): pattern` key
+/// still needs lowering itself, since it comes straight from the parser.
+/// Reusing the fixed name `__jqc_destr` for every nesting level is safe --
+/// each is a `VarBind` lexically nested inside the last, so codegen's
+/// ordinary Rust block scoping shadows it the same way two sibling `let`s
+/// in nested blocks would, matching how the rest of codegen already
+/// avoids needing a fresh-name counter (see the module doc comment).
+fn bind_pattern(source: Expr, pattern: Pattern, body: Expr, scope: &[DefEntry]) -> LResult<Expr> {
+    match pattern {
+        Pattern::Var(name) => Ok(Expr::VarBind(
+            Box::new(source),
+            Pattern::Var(name),
+            Box::new(body),
+        )),
+        Pattern::Array(elems) => {
+            let tmp = "__jqc_destr".to_string();
+            let mut acc = body;
+            for (i, elem) in elems.into_iter().enumerate().rev() {
+                let value = Expr::Index {
+                    base: Box::new(Expr::VarRef(tmp.clone(), 0..0)),
+                    index: Box::new(Expr::Number(i as f64)),
+                    optional: false,
+                };
+                acc = bind_pattern(value, elem, acc, scope)?;
+            }
+            Ok(Expr::VarBind(Box::new(source), Pattern::Var(tmp), Box::new(acc)))
+        }
+        Pattern::Object(entries) => {
+            let tmp = "__jqc_destr".to_string();
+            let mut acc = body;
+            for (key, elem) in entries.into_iter().rev() {
+                let key = lower(key, scope)?;
+                // A computed `(expr): pattern` key evaluates with `.` set
+                // to the value being destructured (confirmed against real
+                // jq: `.foo as {(.k): $v} | $v` reads `.k` off `.foo`'s
+                // value, not the outer `.`) -- piping `tmp` through `key`
+                // gets that for free via Pipe's ordinary "rebind `.` to
+                // the left side's output" semantics; a no-op for the
+                // common case (a plain `Str` literal key, which ignores
+                // its input).
+                let key_against_value =
+                    Expr::Pipe(Box::new(Expr::VarRef(tmp.clone(), 0..0)), Box::new(key));
+                let value = Expr::Index {
+                    base: Box::new(Expr::VarRef(tmp.clone(), 0..0)),
+                    index: Box::new(key_against_value),
+                    optional: false,
+                };
+                acc = bind_pattern(value, elem, acc, scope)?;
+            }
+            Ok(Expr::VarBind(Box::new(source), Pattern::Var(tmp), Box::new(acc)))
+        }
     }
 }
 
@@ -307,8 +366,11 @@ fn lower_call(name: String, args: Vec<Expr>, span: Span, scope: &[DefEntry]) -> 
         }
         for (param, arg) in entry.params.iter().zip(args).rev() {
             if param.is_value {
-                specialized =
-                    Expr::VarBind(Box::new(arg), param.name.clone(), Box::new(specialized));
+                specialized = Expr::VarBind(
+                    Box::new(arg),
+                    Pattern::Var(param.name.clone()),
+                    Box::new(specialized),
+                );
             }
         }
         return lower(specialized, &entry.def_scope);
@@ -379,8 +441,10 @@ fn contains_call(expr: &Expr, name: &str, arity: usize) -> bool {
                     .as_deref()
                     .is_some_and(|e| contains_call(e, name, arity))
         }
-        Expr::VarBind(source, _, body) => {
-            contains_call(source, name, arity) || contains_call(body, name, arity)
+        Expr::VarBind(source, pattern, body) => {
+            contains_call(source, name, arity)
+                || pattern_contains_call(pattern, name, arity)
+                || contains_call(body, name, arity)
         }
         Expr::Reduce {
             source,
@@ -424,6 +488,19 @@ fn contains_call(expr: &Expr, name: &str, arity: usize) -> bool {
             let shadowed = inner_name == name && arity == 0;
             (!shadowed && contains_call(body, name, arity)) || contains_call(rest, name, arity)
         }
+    }
+}
+
+/// As [`contains_call`], but over a destructuring pattern's own computed
+/// `(expr): pattern` key expressions (`Pattern::Var` binds a name, not an
+/// expression, so it can never itself contain a call).
+fn pattern_contains_call(pattern: &Pattern, name: &str, arity: usize) -> bool {
+    match pattern {
+        Pattern::Var(_) => false,
+        Pattern::Array(elems) => elems.iter().any(|p| pattern_contains_call(p, name, arity)),
+        Pattern::Object(entries) => entries
+            .iter()
+            .any(|(k, p)| contains_call(k, name, arity) || pattern_contains_call(p, name, arity)),
     }
 }
 
@@ -556,9 +633,9 @@ fn rewrite_call0(expr: Expr, target: &str, build: &mut dyn FnMut() -> Expr) -> E
             catch.map(|e| Box::new(rewrite_call0(*e, target, build))),
         ),
         Expr::Optional(body) => Expr::Optional(Box::new(rewrite_call0(*body, target, build))),
-        Expr::VarBind(source, name, body) => Expr::VarBind(
+        Expr::VarBind(source, pattern, body) => Expr::VarBind(
             Box::new(rewrite_call0(*source, target, build)),
-            name,
+            rewrite_pattern(pattern, target, build),
             Box::new(rewrite_call0(*body, target, build)),
         ),
         Expr::Reduce {
@@ -626,6 +703,26 @@ fn rewrite_call0(expr: Expr, target: &str, build: &mut dyn FnMut() -> Expr) -> E
                 rest: Box::new(rewrite_call0(*rest, target, build)),
             }
         }
+    }
+}
+
+/// As [`rewrite_call0`], but over a destructuring pattern's own computed
+/// key expressions.
+fn rewrite_pattern(pattern: Pattern, target: &str, build: &mut dyn FnMut() -> Expr) -> Pattern {
+    match pattern {
+        Pattern::Var(name) => Pattern::Var(name),
+        Pattern::Array(elems) => Pattern::Array(
+            elems
+                .into_iter()
+                .map(|p| rewrite_pattern(p, target, build))
+                .collect(),
+        ),
+        Pattern::Object(entries) => Pattern::Object(
+            entries
+                .into_iter()
+                .map(|(k, p)| (rewrite_call0(k, target, build), rewrite_pattern(p, target, build)))
+                .collect(),
+        ),
     }
 }
 

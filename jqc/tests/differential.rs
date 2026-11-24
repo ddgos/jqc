@@ -281,6 +281,49 @@ difftest!(
     ".a as $x | .b | . + $x",
     r#"{"a":1,"b":2}"#
 );
+difftest!(
+    as_binding_array_destructure,
+    ". as [$a, $b] | {a: $a, b: $b}",
+    "[1,2,3]"
+);
+difftest!(
+    as_binding_array_destructure_short,
+    ". as [$a, $b] | {a: $a, b: $b}",
+    "[1]"
+);
+difftest!(
+    as_binding_object_destructure,
+    ". as {a: $a, b: $b} | $a + $b",
+    r#"{"a":1,"b":2,"c":3}"#
+);
+difftest!(
+    as_binding_object_shorthand,
+    ". as {$a, $b} | $a + $b",
+    r#"{"a":1,"b":2}"#
+);
+difftest!(
+    as_binding_object_missing_key,
+    ". as {a: $a} | $a",
+    r#"{"b":2}"#
+);
+difftest!(
+    as_binding_computed_key,
+    // The computed key `.k` evaluates against the value being
+    // destructured (`.foo`), not the outer `.` (whose own "k" field, if
+    // any, must be ignored) -- confirmed against real jq.
+    ".foo as {(.k): $v} | $v",
+    r#"{"foo":{"k":"x","x":99},"k":"wrong"}"#
+);
+difftest!(
+    as_binding_nested_destructure,
+    ". as [$a, {b: $b}] | $a + $b",
+    "[1,{\"b\":2}]"
+);
+difftest!(
+    as_binding_destructure_in_pipe,
+    ".a as [$x, $y] | .b | . + $x + $y",
+    r#"{"a":[1,2],"b":10}"#
+);
 
 #[test]
 fn optional_only_suppresses_its_own_step() {

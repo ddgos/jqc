@@ -13,7 +13,7 @@
 use proc_macro2::{Ident, TokenStream};
 use quote::{format_ident, quote};
 
-use crate::ast::{BinOp, Expr, ObjEntry, StrPart};
+use crate::ast::{BinOp, Expr, ObjEntry, Pattern, StrPart};
 use crate::diagnostics::{closest_match, Diagnostic, KNOWN_NAMES};
 
 pub type CResult<T> = Result<T, Diagnostic>;
@@ -346,7 +346,16 @@ fn compile_raw(expr: &Expr, input: &TokenStream, scope: &mut Vec<String>) -> CRe
                 }
             })
         }
-        Expr::VarBind(source, name, body) => {
+        Expr::VarBind(source, pattern, body) => {
+            let name = match pattern {
+                Pattern::Var(name) => name,
+                Pattern::Array(_) | Pattern::Object(_) => {
+                    return Err(Diagnostic::new(
+                        "internal error: destructuring pattern should have been desugared \
+                         by lowering",
+                    ))
+                }
+            };
             let jv = jv_ident(name);
             let source_c = compile(source, input, scope)?;
             scope.push(name.clone());

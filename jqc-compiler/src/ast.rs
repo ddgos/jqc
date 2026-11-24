@@ -41,6 +41,22 @@ pub struct Param {
     pub is_value: bool,
 }
 
+/// An `as` binding's left-hand pattern: a plain `$x`, or a destructuring
+/// shape over an array/object. `Index`/`Object` bind each element
+/// positionally/by key the same way plain `.[i]`/`.key` would (`null` for
+/// an out-of-range index or a missing key, not an error -- see
+/// `jqc_core::helpers::index_value`), and may nest arbitrarily (`[$a,
+/// {b: $b}]`, …).
+#[derive(Debug, Clone)]
+pub enum Pattern {
+    Var(String),
+    Array(Vec<Pattern>),
+    /// Each entry's key is an `Expr` the same way [`ObjEntry::key`] is --
+    /// a `Str` literal for a plain identifier/string/shorthand key, or an
+    /// arbitrary expression for a computed `(expr): pattern` key.
+    Object(Vec<(Expr, Pattern)>),
+}
+
 #[derive(Debug, Clone)]
 pub enum Expr {
     Identity,
@@ -87,7 +103,7 @@ pub enum Expr {
     /// `span` covers just the function name at the call site, for
     /// "unknown function"/"did you mean" diagnostics.
     Call(String, Vec<Expr>, Span),
-    VarBind(Box<Expr>, String, Box<Expr>),
+    VarBind(Box<Expr>, Pattern, Box<Expr>),
     /// `span` covers the `$name` reference itself, for "undefined
     /// variable" diagnostics.
     VarRef(String, Span),
