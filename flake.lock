@@ -18,7 +18,28 @@
     },
     "root": {
       "inputs": {
-        "nixpkgs": "nixpkgs"
+        "nixpkgs": "nixpkgs",
+        "typix": "typix"
+      }
+    },
+    "typix": {
+      "inputs": {
+        "nixpkgs": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1795365448,
+        "narHash": "sha256-9XfIygUYcOUoNeWiP0m94v757ox2JEAMsm8PRW71H6k=",
+        "owner": "loqusion",
+        "repo": "typix",
+        "rev": "95bc161c48e7ef5ac0745fffc457bf77747eaffb",
+        "type": "github"
+      },
+      "original": {
+        "owner": "loqusion",
+        "repo": "typix",
+        "type": "github"
       }
     }
   },

@@ -18,9 +18,12 @@ itself the first such report.
   used by every report so they stay visually consistent. It only uses
   Typst's built-in drawing primitives — no package-registry packages — so
   compilation never needs network access.
-- `flake.nix` gained `pkgs.typst` in the dev shell, and a `build-reports` app
-  (`nix run .#build-reports`) that finds every `todo-reports/**/report.typ`
-  and compiles it to a sibling `.pdf`.
+- `flake.nix` gained `pkgs.typst` in the dev shell, a `typix` input
+  (https://github.com/loqusion/typix) that builds each
+  `todo-reports/<name>/report.typ` as its own reproducible, hermetic
+  derivation (`packages.report-<name>`), and a `build-reports` app
+  (`nix run .#build-reports`) that builds every such report and copies the
+  resulting PDF back next to its source.
 
 = Pipeline
 

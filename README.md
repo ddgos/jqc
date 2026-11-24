@@ -106,7 +106,9 @@ gives you `cargo`, `rustc`, `rust-analyzer`, `rustfmt`, `clippy`, `jq`
 
 Completed items from `todos.md` get a short writeup under
 `todo-reports/<summary>/report.typ`, using the shared layout in
-`todo-reports/template.typ`. Compile every report to PDF with:
+`todo-reports/template.typ`. Each one is its own reproducible build via
+[typix](https://github.com/loqusion/typix) (`packages.report-<summary>`).
+Compile every report to PDF with:
 
 ```
 nix run .#build-reports

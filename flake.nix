@@ -3,12 +3,44 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    typix = {
+      url = "github:loqusion/typix";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
-  outputs = { self, nixpkgs }:
+  outputs = { self, nixpkgs, typix }:
     let
       systems = [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ];
       forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f system);
+
+      # Every `todo-reports/<name>/report.typ` becomes its own Typst project,
+      # built via typix (https://github.com/loqusion/typix) for reproducible,
+      # hermetic compilation.
+      reportNames =
+        let
+          lib = nixpkgs.lib;
+          entries = builtins.readDir ./todo-reports;
+        in
+        builtins.attrNames (lib.filterAttrs
+          (name: kind:
+            kind == "directory" && builtins.pathExists (./todo-reports + "/${name}/report.typ"))
+          entries);
+
+      reportPackages = system:
+        let
+          typixLib = typix.lib.${system};
+          src = typixLib.cleanTypstSource ./todo-reports;
+        in
+        nixpkgs.lib.genAttrs
+          (map (name: "report-${name}") reportNames)
+          (pkgAttr:
+            let name = nixpkgs.lib.removePrefix "report-" pkgAttr;
+            in typixLib.buildTypstProject {
+              inherit src;
+              typstSource = "${name}/report.typ";
+              typstOpts.root = ".";
+            });
     in
     {
       devShells = forAllSystems (system:
@@ -28,29 +60,29 @@
           };
         });
 
+      # `nix run .#build-reports` compiles every todo-reports/<name>/report.typ
+      # (each a typix-built derivation) and copies the PDF next to its source.
       apps = forAllSystems (system:
-        let pkgs = nixpkgs.legacyPackages.${system};
+        let
+          pkgs = nixpkgs.legacyPackages.${system};
+          reports = reportPackages system;
         in {
           build-reports = {
             type = "app";
             program = toString (pkgs.writeShellScript "build-reports" ''
               set -euo pipefail
               cd "$(git rev-parse --show-toplevel 2>/dev/null || echo .)"
-              shopt -s globstar nullglob
-              status=0
-              for src in todo-reports/**/report.typ; do
-                [ -e "$src" ] || continue
-                echo "compiling $src"
-                ${pkgs.typst}/bin/typst compile --root . "$src" "''${src%.typ}.pdf" || status=1
-              done
-              exit $status
+              ${nixpkgs.lib.concatStrings (map (name: ''
+                install -Dm644 "${reports."report-${name}"}" "todo-reports/${name}/report.pdf"
+                echo "built todo-reports/${name}/report.pdf"
+              '') reportNames)}
             '');
           };
         });
 
       packages = forAllSystems (system:
         let pkgs = nixpkgs.legacyPackages.${system};
-        in {
+        in (reportPackages system) // {
           default = pkgs.rustPlatform.buildRustPackage {
             pname = "jqc";
             version = "0.1.0";
