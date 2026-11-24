@@ -22,8 +22,29 @@
               pkgs.rustfmt
               pkgs.clippy
               pkgs.jq
+              pkgs.typst
             ];
             RUST_BACKTRACE = "1";
+          };
+        });
+
+      apps = forAllSystems (system:
+        let pkgs = nixpkgs.legacyPackages.${system};
+        in {
+          build-reports = {
+            type = "app";
+            program = toString (pkgs.writeShellScript "build-reports" ''
+              set -euo pipefail
+              cd "$(git rev-parse --show-toplevel 2>/dev/null || echo .)"
+              shopt -s globstar nullglob
+              status=0
+              for src in todo-reports/**/report.typ; do
+                [ -e "$src" ] || continue
+                echo "compiling $src"
+                ${pkgs.typst}/bin/typst compile --root . "$src" "''${src%.typ}.pdf" || status=1
+              done
+              exit $status
+            '');
           };
         });
 
@@ -34,7 +55,7 @@
             pname = "jqc";
             version = "0.1.0";
             src = self;
-            cargoLock = ./Cargo.lock;
+            cargoLock.lockFile = ./Cargo.lock;
             nativeBuildInputs = [ pkgs.pkg-config pkgs.makeWrapper ];
             # jqc-build shells out to `cargo` at runtime to compile generated
             # projects into standalone binaries, so cargo needs to be on PATH.

@@ -99,5 +99,15 @@ and non-recursive `def` (see limitation below), and builtins: `map`,
 ```
 nix develop
 ```
-gives you `cargo`, `rustc`, `rust-analyzer`, `rustfmt`, `clippy`, and `jq`
-(needed by the differential tests).
+gives you `cargo`, `rustc`, `rust-analyzer`, `rustfmt`, `clippy`, `jq`
+(needed by the differential tests), and `typst`.
+
+## Todo reports
+
+Completed items from `todos.md` get a short writeup under
+`todo-reports/<summary>/report.typ`, using the shared layout in
+`todo-reports/template.typ`. Compile every report to PDF with:
+
+```
+nix run .#build-reports
+```

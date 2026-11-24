@@ -9,13 +9,9 @@ git. Do these in whichever order makes the most sense.
 
 ## Tasks
 
-Do some preparatory work for the typst document production, involving the nix
-flake. Each report should be in a folder `todo-reports/<summary>/<files...>`.
-This should be the first task.
-
 Analyse the current state of the code, and finish up the refactor that is taking
-place. Commit to keep the working tree clean. This should be the first task once
-the typst document prep is done.
+place. Commit to keep the working tree clean. This should be the first task now
+that the typst document prep is done.
 
 Add safeguards around the more memory intensive tests to ensure that the test
 fails before the test uses a certain amount of memory on the machine it is
@@ -66,3 +62,12 @@ theory be tested. Do not stop until both of these are true.
 Make some feature of the flake be that it can generate derivations given a jq
 source file which is the compiled binary for that script. If this doesn't make
 sense then explain, since my nix knowledge is imperfect.
+
+Look for opportunities to use SIMD optimisation techniques. Implement as a
+new implementation of the codegen trait.
+
+Persue whatever optimisations possible. Always keep as separate implementations
+of the trait so that comparisons between implementations are easier to make.
+
+Identify some area of the code that could be tidied up, and refactor as desired.
+Do not remove this task until the code is as polished as possible.
