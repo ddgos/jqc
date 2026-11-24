@@ -8,3 +8,4 @@ description = "jq-compatible CLI argument parsing and colored/pretty output form
 [dependencies]
 jqc-core = { path = "../jqc-core", version = "0.1.0" }
 serde_json = "1"
+lexopt = "0.3"

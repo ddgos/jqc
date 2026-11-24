@@ -70,76 +70,64 @@ impl Args {
 
     /// Parses an argv-style argument list (not including argv[0]). Returns
     /// `Err(message)` for an unknown or unsupported flag.
+    ///
+    /// Argument-splitting itself (combined short flags like `-nc`,
+    /// `--long value`/`--long=value`, `--` ending flag parsing, `-` as a
+    /// plain positional rather than an empty flag cluster) is
+    /// `lexopt` -- a minimal, unopinionated argv tokenizer -- rather than
+    /// hand-rolled: that part has no jq-specific behavior to get right,
+    /// just the usual argv conventions every CLI parser needs, which is
+    /// exactly what makes it a reasonable thing to delegate instead of
+    /// reimplementing.
     pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Self, String> {
+        use lexopt::prelude::*;
+
         let mut a = Args::default();
-        let mut it = args.into_iter();
-        let mut no_more_flags = false;
-        while let Some(arg) = it.next() {
-            if no_more_flags || arg == "-" || !arg.starts_with('-') {
-                a.files.push(arg);
-                continue;
-            }
-            if arg == "--" {
-                no_more_flags = true;
-                continue;
-            }
-            if let Some(long) = arg.strip_prefix("--") {
-                match long {
-                    "slurp" => a.slurp = true,
-                    "raw-output" => a.raw_output = true,
-                    "raw-output0" => {
-                        a.raw_output = true;
-                        a.raw_output0 = true;
-                    }
-                    "join-output" => {
-                        a.raw_output = true;
-                        a.join_output = true;
-                    }
-                    "compact-output" => a.compact = true,
-                    "color-output" => a.color = Some(true),
-                    "monochrome-output" => a.color = Some(false),
-                    "ascii-output" => a.ascii = true,
-                    "sort-keys" => a.sort_keys = true,
-                    "raw-input" => a.raw_input = true,
-                    "null-input" => a.null_input = true,
-                    "exit-status" => a.exit_status = true,
-                    "unbuffered" => {}
-                    "tab" => a.indent = Indent::Tab,
-                    "indent" => {
-                        let n = it.next().ok_or("--indent requires an argument")?;
-                        let n: u32 = n
-                            .parse()
-                            .map_err(|_| format!("--indent: not a number: {n}"))?;
-                        a.indent = Indent::Spaces(n.min(7));
-                    }
-                    "arg" | "argjson" | "args" | "jsonargs" | "slurpfile" | "rawfile" => {
-                        return Err(format!(
-                            "--{long} is not supported by jqc-compiled binaries (no $ENV/\
-                             named-argument support -- see README.md's Known limitations)"
-                        ))
-                    }
-                    other => return Err(format!("unknown option: --{other}")),
+        let mut parser = lexopt::Parser::from_args(args);
+        while let Some(arg) = parser.next().map_err(|e| e.to_string())? {
+            match arg {
+                Short('s') | Long("slurp") => a.slurp = true,
+                Short('r') | Long("raw-output") => a.raw_output = true,
+                Long("raw-output0") => {
+                    a.raw_output = true;
+                    a.raw_output0 = true;
                 }
-                continue;
-            }
-            for ch in arg[1..].chars() {
-                match ch {
-                    's' => a.slurp = true,
-                    'r' => a.raw_output = true,
-                    'j' => {
-                        a.raw_output = true;
-                        a.join_output = true;
-                    }
-                    'c' => a.compact = true,
-                    'C' => a.color = Some(true),
-                    'M' => a.color = Some(false),
-                    'a' => a.ascii = true,
-                    'S' => a.sort_keys = true,
-                    'R' => a.raw_input = true,
-                    'n' => a.null_input = true,
-                    'e' => a.exit_status = true,
-                    other => return Err(format!("unknown option: -{other}")),
+                Short('j') | Long("join-output") => {
+                    a.raw_output = true;
+                    a.join_output = true;
                 }
+                Short('c') | Long("compact-output") => a.compact = true,
+                Short('C') | Long("color-output") => a.color = Some(true),
+                Short('M') | Long("monochrome-output") => a.color = Some(false),
+                Short('a') | Long("ascii-output") => a.ascii = true,
+                Short('S') | Long("sort-keys") => a.sort_keys = true,
+                Short('R') | Long("raw-input") => a.raw_input = true,
+                Short('n') | Long("null-input") => a.null_input = true,
+                Short('e') | Long("exit-status") => a.exit_status = true,
+                Long("unbuffered") => {}
+                Long("tab") => a.indent = Indent::Tab,
+                Long("indent") => {
+                    let v = parser.value().map_err(|e| e.to_string())?;
+                    let v = v.string().map_err(|_| "--indent: not valid UTF-8")?;
+                    let n: u32 = v
+                        .parse()
+                        .map_err(|_| format!("--indent: not a number: {v}"))?;
+                    a.indent = Indent::Spaces(n.min(7));
+                }
+                Long(
+                    long @ ("arg" | "argjson" | "args" | "jsonargs" | "slurpfile" | "rawfile"),
+                ) => {
+                    return Err(format!(
+                        "--{long} is not supported by jqc-compiled binaries (no $ENV/\
+                         named-argument support -- see README.md's Known limitations)"
+                    ))
+                }
+                Long(other) => return Err(format!("unknown option: --{other}")),
+                Short(other) => return Err(format!("unknown option: -{other}")),
+                Value(v) => a.files.push(
+                    v.into_string()
+                        .map_err(|_| "file argument: not valid UTF-8")?,
+                ),
             }
         }
         Ok(a)

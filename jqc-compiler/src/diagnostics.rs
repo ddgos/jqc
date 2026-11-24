@@ -211,7 +211,11 @@ pub const KNOWN_NAMES: &[&str] = &[
 
 /// Returns the entry in `candidates` closest to `target` by Levenshtein
 /// edit distance, for "did you mean ...?" help text -- `None` if nothing is
-/// close enough to be worth suggesting.
+/// close enough to be worth suggesting. The distance itself is
+/// `strsim::levenshtein` (an established crate implementing a handful of
+/// standard string-similarity metrics) rather than a hand-rolled DP table:
+/// textbook Levenshtein has no jq-specific behavior to customize, so
+/// there's nothing this project-specific about reimplementing it.
 pub fn closest_match<'a>(
     target: &str,
     candidates: impl IntoIterator<Item = &'a str>,
@@ -219,29 +223,10 @@ pub fn closest_match<'a>(
     let max_dist = (target.len() / 3).clamp(1, 4);
     candidates
         .into_iter()
-        .map(|c| (c, edit_distance(target, c)))
+        .map(|c| (c, strsim::levenshtein(target, c)))
         .filter(|(_, d)| *d <= max_dist)
         .min_by_key(|(_, d)| *d)
         .map(|(c, _)| c)
-}
-
-fn edit_distance(a: &str, b: &str) -> usize {
-    let a: Vec<char> = a.chars().collect();
-    let b: Vec<char> = b.chars().collect();
-    let mut prev: Vec<usize> = (0..=b.len()).collect();
-    let mut cur = vec![0usize; b.len() + 1];
-    for i in 1..=a.len() {
-        cur[0] = i;
-        for j in 1..=b.len() {
-            cur[j] = if a[i - 1] == b[j - 1] {
-                prev[j - 1]
-            } else {
-                1 + prev[j - 1].min(prev[j]).min(cur[j - 1])
-            };
-        }
-        std::mem::swap(&mut prev, &mut cur);
-    }
-    prev[b.len()]
 }
 
 impl std::fmt::Display for Diagnostic {

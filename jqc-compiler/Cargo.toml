@@ -8,6 +8,7 @@ description = "jq filter lex/parse/lower/codegen pipeline as a plain library (jq
 [dependencies]
 proc-macro2 = "1"
 quote = "1"
+strsim = "0.11"
 
 [dev-dependencies]
 criterion = "0.8"

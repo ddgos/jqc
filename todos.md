@@ -17,7 +17,10 @@ xfail tests, then fixed as part of this task, rather than fixed immediately.
 Improve upon the script and input fuzzing. Part of this should be using
 arbitrary utf-8 strings for the scripts and input. Part of this should be to
 work up the proptest generators until every valid script and input will in
-theory be tested. Do not stop until both of these are true.
+theory be tested. Do not stop until both of these are true. Also test
+arbitrary bytes (not just arbitrary valid utf-8) as input -- piped data isn't
+guaranteed to be valid utf-8, so differences from real `jq` on invalid-utf-8
+input could currently be going unnoticed.
 
 Identify some area of the code that could be tidied up, and refactor as desired.
 Do not remove this task until the code is as polished as possible.

@@ -145,13 +145,28 @@ fn parse_args() -> (PathBuf, Option<PathBuf>) {
     (script_path, output)
 }
 
-fn main() {
+/// Returns an `ExitCode` (rather than calling `std::process::exit`
+/// directly, the way every early-exit path here used to) specifically so
+/// the scratch `TempDir` created below actually gets cleaned up on every
+/// path, not just the success one: `std::process::exit` is documented to
+/// skip running `Drop` impls entirely, which silently leaked the whole
+/// scratch Cargo project (`target/` and all) on any failure -- a build
+/// failure in particular, the most likely failure of all, could leave
+/// behind a full dependency build's worth of disk space per failed run.
+/// Returning normally through `main` instead runs `scratch_dir`'s `Drop`
+/// like any other local.
+fn main() -> std::process::ExitCode {
+    use std::process::ExitCode;
+
     let (script_path, output) = parse_args();
 
-    let script = fs::read_to_string(&script_path).unwrap_or_else(|e| {
-        eprintln!("jqc-build: reading {}: {e}", script_path.display());
-        std::process::exit(1);
-    });
+    let script = match fs::read_to_string(&script_path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("jqc-build: reading {}: {e}", script_path.display());
+            return ExitCode::FAILURE;
+        }
+    };
 
     let name = sanitize_name(
         script_path
@@ -160,11 +175,27 @@ fn main() {
             .unwrap_or("jqc-script"),
     );
 
-    let scratch = env::temp_dir().join(format!("jqc-build-{name}-{}", std::process::id()));
-    fs::create_dir_all(scratch.join("src")).unwrap_or_else(|e| {
+    // An established crate (`tempfile`), not a hand-rolled PID-named
+    // `env::temp_dir().join(...)`, both for unique naming and so this
+    // cleans up after itself on `Drop` -- which, now that every path
+    // below returns out of `main` normally instead of calling
+    // `std::process::exit`, actually happens on every path, not just the
+    // successful one.
+    let scratch_dir = match tempfile::Builder::new()
+        .prefix(&format!("jqc-build-{name}-"))
+        .tempdir()
+    {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("jqc-build: creating scratch dir: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let scratch = scratch_dir.path();
+    if let Err(e) = fs::create_dir_all(scratch.join("src")) {
         eprintln!("jqc-build: creating scratch dir {}: {e}", scratch.display());
-        std::process::exit(1);
-    });
+        return ExitCode::FAILURE;
+    }
 
     let workspace = workspace_path();
     let jqc_path = workspace.join("jqc");
@@ -192,16 +223,19 @@ fn main() -> std::process::ExitCode {{
     cmd.args(["build", "--release", "--manifest-path"])
         .arg(scratch.join("Cargo.toml"));
     cap_child_memory(&mut cmd);
-    let status = cmd.status().unwrap_or_else(|e| {
-        eprintln!("jqc-build: spawning cargo (is it on PATH?): {e}");
-        std::process::exit(1);
-    });
+    let status = match cmd.status() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("jqc-build: spawning cargo (is it on PATH?): {e}");
+            return ExitCode::FAILURE;
+        }
+    };
     if !status.success() {
         eprintln!(
             "jqc-build: cargo build failed for {}",
             script_path.display()
         );
-        std::process::exit(status.code().unwrap_or(1));
+        return ExitCode::from(status.code().unwrap_or(1) as u8);
     }
 
     let built = scratch.join("target").join("release").join(&name);
@@ -209,14 +243,14 @@ fn main() -> std::process::ExitCode {{
     if let Some(parent) = dest.parent().filter(|p| !p.as_os_str().is_empty()) {
         fs::create_dir_all(parent).ok();
     }
-    fs::copy(&built, &dest).unwrap_or_else(|e| {
+    if let Err(e) = fs::copy(&built, &dest) {
         eprintln!(
             "jqc-build: copying {} to {}: {e}",
             built.display(),
             dest.display()
         );
-        std::process::exit(1);
-    });
-    fs::remove_dir_all(&scratch).ok();
+        return ExitCode::FAILURE;
+    }
     println!("{}", dest.display());
+    ExitCode::SUCCESS
 }

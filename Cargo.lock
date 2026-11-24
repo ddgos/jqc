@@ -411,6 +411,7 @@ name = "jqc-build"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "tempfile",
 ]
 
 [[package]]
@@ -418,6 +419,7 @@ name = "jqc-cli"
 version = "0.1.0"
 dependencies = [
  "jqc-core",
+ "lexopt",
  "serde_json",
 ]
 
@@ -429,6 +431,7 @@ dependencies = [
  "libc",
  "proc-macro2",
  "quote",
+ "strsim",
 ]
 
 [[package]]
@@ -467,6 +470,12 @@ dependencies = [
  "futures-util",
  "wasm-bindgen",
 ]
+
+[[package]]
+name = "lexopt"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "803ec87c9cfb29b9d2633f20cba1f488db3fd53f2158b1024cbefb47ba05d413"
 
 [[package]]
 name = "libc"
@@ -780,6 +789,12 @@ name = "slab"
 version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
+
+[[package]]
+name = "strsim"
+version = "0.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 
 [[package]]
 name = "syn"
