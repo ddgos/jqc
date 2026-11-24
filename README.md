@@ -118,6 +118,14 @@ and non-recursive `def` (see limitation below), and builtins: `map`,
   differential suite exercises it. Read that coverage from differential
   test results instead, not from tarpaulin's numbers for that crate.
 
+## Performance history
+
+`benchmarks/pareto-front.csv` is an append-only log of benchmark results
+tagged by commit and `Codegen` implementation (see `benchmarks/README.md`
+for the schema and when to add a row). It's what lets a future SIMD or
+multi-core backend be compared against the tree-walk one on equal
+footing instead of only against whatever ran last.
+
 ## Dev shell
 
 ```

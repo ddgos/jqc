@@ -9,8 +9,6 @@ git. Do these in whichever order makes the most sense.
 
 ## Tasks
 
-Keep a record of the pareto front to see how performance improves.
-
 Add functionality to specify which `jq` version should be used for the macro.
 This should default to the most recent `jq` version (whatever is supported by
 nixpkgs-unstable). Old versions of `jq` should be tested against by including
