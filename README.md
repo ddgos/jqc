@@ -91,8 +91,10 @@ and non-recursive `def` (see limitation below), and builtins: `map`,
   (~1s/case) and off by default.
 - `cargo bench -p jqc` -- criterion benchmarks of the generated code itself
   (not the macro-expansion step, which only runs once at compile time)
-  across input sizes, plus one illustrative subprocess-`jq` comparison
-  point showing the cost `jq!` avoids.
+  across input sizes, each with a real-`jq`-subprocess series alongside it
+  (at a couple of smaller sizes, to keep subprocess-spawn overhead from
+  dominating `cargo bench`'s own runtime) showing the per-call cost `jq!`
+  avoids by baking the filter in at compile time.
 - `cargo test -p jqc-macros --release -- --ignored <name> --nocapture` --
   `jqc-macros/src/bench.rs` benchmarks the macro-expansion step itself
   (wall time via `compile_time_benchmarks`, peak RSS via

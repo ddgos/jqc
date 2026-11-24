@@ -9,8 +9,6 @@ git. Do these in whichever order makes the most sense.
 
 ## Tasks
 
-Benchmark the actual `jq` binary to compare with.
-
 Generate a code coverage report from tests.
 
 Keep a record of the pareto front to see how performance improves.

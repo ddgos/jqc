@@ -33,15 +33,60 @@ fn make_nested(depth: usize) -> Value {
 
 const SIZES: &[usize] = &[10, 1_000, 100_000];
 
+/// Real `jq` is only benchmarked at these (smaller) sizes: each sample
+/// round-trips the input through a text pipe to a fresh subprocess, so
+/// sampling it at 100_000 elements the same number of times Criterion
+/// samples the in-process closure would make `cargo bench` take far longer
+/// for a comparison point whose conclusion (process-spawn overhead
+/// dominates) doesn't need the largest input to demonstrate.
+const JQ_COMPARISON_SIZES: &[usize] = &[10, 1_000];
+
+/// Runs `filter` against `input` via the real `jq` binary on `PATH` (the
+/// Nix dev shell provides it). This is deliberately *not* a fair "jq is
+/// slow" comparison: it's dominated by spawning a process and piping JSON
+/// through it as text, not by jq's own evaluation time -- which is the
+/// point. `jq!` bakes the filter into the binary at compile time, so a
+/// running program pays none of that per call the way shelling out to
+/// real `jq` would.
+fn run_jq(filter: &str, input: &Value) -> Vec<Value> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let mut child = Command::new("jq")
+        .arg("-c")
+        .arg(filter)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn jq (is it on PATH?)");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.to_string().as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().expect("jq exited");
+    serde_json::Deserializer::from_slice(&out.stdout)
+        .into_iter::<Value>()
+        .collect::<Result<_, _>>()
+        .expect("jq output should be valid JSON")
+}
+
 fn bench_identity(c: &mut Criterion) {
     let filter = jq!(".");
     let mut group = c.benchmark_group("identity");
     for &n in SIZES {
         let input = make_items(n);
         group.throughput(Throughput::Elements(n as u64));
-        group.bench_with_input(BenchmarkId::from_parameter(n), &input, |b, input| {
+        group.bench_with_input(BenchmarkId::new("jqc", n), &input, |b, input| {
             b.iter(|| filter(black_box(input)).unwrap());
         });
+        if JQ_COMPARISON_SIZES.contains(&n) {
+            group.bench_with_input(BenchmarkId::new("jq", n), &input, |b, input| {
+                b.iter(|| run_jq(".", black_box(input)));
+            });
+        }
     }
     group.finish();
 }
@@ -51,9 +96,14 @@ fn bench_field_access(c: &mut Criterion) {
     let mut group = c.benchmark_group("field_access");
     for &n in SIZES {
         let input = make_items(n);
-        group.bench_with_input(BenchmarkId::from_parameter(n), &input, |b, input| {
+        group.bench_with_input(BenchmarkId::new("jqc", n), &input, |b, input| {
             b.iter(|| filter(black_box(input)).unwrap());
         });
+        if JQ_COMPARISON_SIZES.contains(&n) {
+            group.bench_with_input(BenchmarkId::new("jq", n), &input, |b, input| {
+                b.iter(|| run_jq(".[0].name", black_box(input)));
+            });
+        }
     }
     group.finish();
 }
@@ -64,9 +114,14 @@ fn bench_map_select_pipeline(c: &mut Criterion) {
     for &n in SIZES {
         let input = make_items(n);
         group.throughput(Throughput::Elements(n as u64));
-        group.bench_with_input(BenchmarkId::from_parameter(n), &input, |b, input| {
+        group.bench_with_input(BenchmarkId::new("jqc", n), &input, |b, input| {
             b.iter(|| filter(black_box(input)).unwrap());
         });
+        if JQ_COMPARISON_SIZES.contains(&n) {
+            group.bench_with_input(BenchmarkId::new("jq", n), &input, |b, input| {
+                b.iter(|| run_jq("[.[] | select(.active) | .score]", black_box(input)));
+            });
+        }
     }
     group.finish();
 }
@@ -77,9 +132,14 @@ fn bench_sort_by(c: &mut Criterion) {
     for &n in SIZES {
         let input = make_items(n);
         group.throughput(Throughput::Elements(n as u64));
-        group.bench_with_input(BenchmarkId::from_parameter(n), &input, |b, input| {
+        group.bench_with_input(BenchmarkId::new("jqc", n), &input, |b, input| {
             b.iter(|| filter(black_box(input)).unwrap());
         });
+        if JQ_COMPARISON_SIZES.contains(&n) {
+            group.bench_with_input(BenchmarkId::new("jq", n), &input, |b, input| {
+                b.iter(|| run_jq("sort_by(.score)", black_box(input)));
+            });
+        }
     }
     group.finish();
 }
@@ -90,56 +150,41 @@ fn bench_reduce_sum(c: &mut Criterion) {
     for &n in SIZES {
         let input = make_items(n);
         group.throughput(Throughput::Elements(n as u64));
-        group.bench_with_input(BenchmarkId::from_parameter(n), &input, |b, input| {
+        group.bench_with_input(BenchmarkId::new("jqc", n), &input, |b, input| {
             b.iter(|| filter(black_box(input)).unwrap());
         });
+        if JQ_COMPARISON_SIZES.contains(&n) {
+            group.bench_with_input(BenchmarkId::new("jq", n), &input, |b, input| {
+                b.iter(|| run_jq("reduce .[] as $x (0; . + $x.score)", black_box(input)));
+            });
+        }
     }
     group.finish();
 }
+
+/// Depth 1_000 is excluded from the real-`jq` comparison below: `run_jq`
+/// parses jq's text output back into a `serde_json::Value` with the
+/// default (non-arbitrary-depth) deserializer, which has its own
+/// recursion limit (128) well short of 1_000 levels of nested objects.
+/// That's a limitation of benchmarking-via-text-roundtrip, not of either
+/// `jq` or `jqc`'s own 1_000-deep handling.
+const JQ_COMPARISON_DEPTHS: &[usize] = &[10, 100];
 
 fn bench_recurse(c: &mut Criterion) {
     let filter = jq!("[recurse]");
     let mut group = c.benchmark_group("recurse_nested");
     for &depth in &[10usize, 100, 1_000] {
         let input = make_nested(depth);
-        group.bench_with_input(BenchmarkId::from_parameter(depth), &input, |b, input| {
+        group.bench_with_input(BenchmarkId::new("jqc", depth), &input, |b, input| {
             b.iter(|| filter(black_box(input)).unwrap());
         });
+        if JQ_COMPARISON_DEPTHS.contains(&depth) {
+            group.bench_with_input(BenchmarkId::new("jq", depth), &input, |b, input| {
+                b.iter(|| run_jq("[recurse]", black_box(input)));
+            });
+        }
     }
     group.finish();
-}
-
-/// Illustrative only: cost of shelling out to the real `jq` binary per
-/// call, for contrast with the in-process compiled closure above. This is
-/// dominated by process-spawn overhead, not jq's own evaluation time, so
-/// it's not a fair "jq is slow" comparison -- it's the point: `jq!`
-/// eliminates the process-spawn-and-reparse step entirely by baking the
-/// filter into the binary at compile time.
-fn bench_subprocess_jq(c: &mut Criterion) {
-    use std::io::Write;
-    use std::process::{Command, Stdio};
-
-    let input = make_items(10);
-    let input_str = input.to_string();
-    c.bench_function("subprocess_jq_small_input", |b| {
-        b.iter(|| {
-            let mut child = Command::new("jq")
-                .arg("-c")
-                .arg("[.[] | select(.active) | .score]")
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::null())
-                .spawn()
-                .expect("spawn jq");
-            child
-                .stdin
-                .take()
-                .unwrap()
-                .write_all(input_str.as_bytes())
-                .unwrap();
-            black_box(child.wait_with_output().unwrap());
-        });
-    });
 }
 
 criterion_group!(
@@ -150,6 +195,5 @@ criterion_group!(
     bench_sort_by,
     bench_reduce_sum,
     bench_recurse,
-    bench_subprocess_jq,
 );
 criterion_main!(benches);
