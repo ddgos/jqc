@@ -105,9 +105,9 @@ jq's type-aware semantics for each), comparisons, `and`/`or`, `//`
 (alternative operator), `if/elif/else/end`, `try/catch`, `as` bindings
 (incl. destructuring patterns: `as [$a, $b]`, `as {a: $a, $b}`, computed
 and nested, but not `?//` alternative patterns), `reduce`, `foreach`,
-recursive and non-recursive `def` (see limitation
+`label`/`break`, recursive and non-recursive `def` (see limitation
 below), and builtins: `map`, `select`, `values`, `recurse(;f)`, `in`,
-`any`/`all` (0/1/2-arg forms), `while`/`until`/`repeat`, `length`,
+`any`/`all` (0/1/2-arg forms), `while`/`until`/`repeat`, `limit`, `length`,
 `keys`/`keys_unsorted`, `has`, `type`, `not`, `empty`, `error`, `add`,
 `to_entries`/`from_entries`/`with_entries`, `sort`/`sort_by`/`group_by`/
 `unique`/`unique_by`/`min`/`max`/`min_by`/`max_by`, `reverse`,
@@ -122,7 +122,8 @@ below), and builtins: `map`, `select`, `values`, `recurse(;f)`, `in`,
   `Vec<Value>`. This keeps codegen tractable (no generic-iterator-type
   explosion) but means **infinite generators never terminate** -- `repeat`
   and `while`/`until`/`recurse` without a condition that eventually goes
-  false will hang. There's no `label`/`break`/`limit` to bound them yet.
+  false will hang, unless wrapped in `label`/`break`/`limit` (supported) to
+  bound them explicitly.
 - **No `?//` alternative destructuring patterns** (`as [$a] ?// {a: $a}`,
   for matching one of several shapes depending on the input). Plain
   destructuring (`as [$a, $b]`, `as {a: $a, $b}`, nested, computed keys)
@@ -135,7 +136,7 @@ below), and builtins: `map`, `select`, `values`, `recurse(;f)`, `in`,
   or silently looping forever.
 - Not implemented: `path`/`paths`/`getpath`/`setpath`/`del`, update-
   assignment operators (`|=`, `+=`, …), `input`/`inputs`/`$ENV`,
-  `label`/`break`, SQL-style ops, module `import`/`include`.
+  SQL-style ops, module `import`/`include`.
 - Every clone is a real `Value::clone()` (deep for arrays/objects). Fine for
   typical filter sizes; a future version could switch to `Rc<Value>`
   internally for less copying on heavily-reused sub-results.

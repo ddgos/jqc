@@ -55,6 +55,16 @@ fn fn_ident(name: &str) -> Ident {
     format_ident!("__jqc_fn_{}", name)
 }
 
+/// Labels and variables are tracked in the same `scope: Vec<String>` (see
+/// [`compile_raw`]'s `VarRef`/`Label`/`Break` arms) -- this prefix can
+/// never collide with a real jq identifier (which the lexer never lets
+/// contain a NUL byte), so a plain string list serves as a scope stack
+/// for both without needing a second parameter threaded through every
+/// `compile`/`compile_raw` call site.
+fn label_key(name: &str) -> String {
+    format!("\0label\0{name}")
+}
+
 /// Builds a `JResult<Vec<Value>>`-typed expression that iterates `sub_c`'s
 /// output, binding each element to `item_ident` and running `body` once
 /// per element -- `body` extends/pushes onto its `__out: &mut Vec<Value>`
@@ -308,6 +318,16 @@ fn compile_raw(expr: &Expr, input: &TokenStream, scope: &mut Vec<String>) -> CRe
             // values `body` already produced before erroring were already
             // streamed out, so they stay in the result (`e.emitted`); a
             // `catch` handler's own outputs are appended after those.
+            // `break` is *not* specially exempted here -- confirmed
+            // against real jq (`label $out | try break $out catch "x"`
+            // produces `"x"`, not an uncaught break): only a `break`'s
+            // *own matching label* is guaranteed to see it, by virtue of
+            // being the nearest thing downstream that specifically checks
+            // for it (`Expr::Label` below); any `try`/`catch` in between
+            // catches it exactly like any other error, which is why
+            // `label`-using code (e.g. this crate's own `limit` prelude
+            // def) must avoid wrapping its own `break` in a `try`/`?` it
+            // doesn't want to swallow it.
             let handler = match catch {
                 Some(c) => {
                     let catch_c = compile(c, &quote!(&__caught), scope)?;
@@ -341,10 +361,55 @@ fn compile_raw(expr: &Expr, input: &TokenStream, scope: &mut Vec<String>) -> CRe
                     let __result: #jresult_ty<::std::vec::Vec<#value_ty>> = (|| #body_c)();
                     match __result {
                         Ok(v) => Ok(v),
+                        // `?` catches a `break` exactly like any other
+                        // error -- see the longer note on `Expr::TryCatch`.
                         Err(mut e) => Ok(::std::mem::take(&mut e.emitted)),
                     }
                 }
             })
+        }
+        Expr::Label(name, body) => {
+            let value_ty = core_path("Value");
+            let jresult_ty = core_path("JResult");
+            scope.push(label_key(name));
+            let body_c = compile(body, input, scope);
+            scope.pop();
+            let body_c = body_c?;
+            Ok(quote! {
+                {
+                    let __result: #jresult_ty<::std::vec::Vec<#value_ty>> = (|| #body_c)();
+                    match __result {
+                        // Only a `break` naming *this* label is ours to
+                        // catch -- anything else (a real error, or a
+                        // `break` for a differently-named, or outer,
+                        // label) propagates unchanged, so it keeps
+                        // unwinding to whichever `label`/`try` it
+                        // actually belongs to.
+                        Err(mut e) if e.break_label.as_deref() == Some(#name) => {
+                            Ok(::std::mem::take(&mut e.emitted))
+                        }
+                        other => other,
+                    }
+                }
+            })
+        }
+        Expr::Break(name, span) => {
+            let key = label_key(name);
+            if !scope.iter().any(|s| s == &key) {
+                let labels_in_scope = scope
+                    .iter()
+                    .filter_map(|s| s.strip_prefix("\0label\0"));
+                let err = Diagnostic::at(span.clone(), format!("undefined label ${name}"));
+                let err = match closest_match(name, labels_in_scope) {
+                    Some(sugg) => err.help(format!("did you mean break ${sugg}?")),
+                    None => err.help(format!(
+                        "break ${name} needs an enclosing `label ${name} | ...`"
+                    )),
+                };
+                return Err(err);
+            }
+            let jq_error = core_path("JqError");
+            Ok(quote!(Err(#jq_error::brk(#name))))
         }
         Expr::VarBind(source, pattern, body) => {
             let name = match pattern {
@@ -370,10 +435,14 @@ fn compile_raw(expr: &Expr, input: &TokenStream, scope: &mut Vec<String>) -> CRe
         }
         Expr::VarRef(name, span) => {
             if !scope.iter().any(|s| s == name) {
+                // Labels share `scope` with variables (see `label_key`)
+                // but live in a separate namespace -- exclude them here
+                // so a typo'd `$var` never gets suggested a label name.
+                let vars_in_scope = scope.iter().filter(|s| !s.starts_with('\0'));
                 let mut err = Diagnostic::at(span.clone(), format!("undefined variable ${name}"));
-                err = match closest_match(name, scope.iter().map(String::as_str)) {
+                err = match closest_match(name, vars_in_scope.map(String::as_str)) {
                     Some(sugg) => err.help(format!("did you mean ${sugg}?")),
-                    None if scope.is_empty() => {
+                    None if scope.iter().all(|s| s.starts_with('\0')) => {
                         err.help("no variables are in scope here")
                     }
                     None => err,

@@ -42,6 +42,13 @@ def to_entries: [keys_unsorted[] as $k | {key: $k, value: .[$k]}];
 def from_entries: map({ (.key // .Key // .name // .Name):
   if has("value") then .value else .Value end }) | add // {};
 def with_entries(f): to_entries | map(f) | from_entries;
+def limit(n; exp): if n > 0 then
+    label $__jqc_limit_out
+    | foreach exp as $__jqc_limit_item (0; . + 1;
+        $__jqc_limit_item,
+        if . >= n then break $__jqc_limit_out else empty end)
+  elif n == 0 then empty
+  else error("limit doesn't support negative count") end;
 "#;
 
 /// `user_src`'s char offset and length within the string `parse_and_lower`
@@ -196,6 +203,8 @@ fn lower(expr: Expr, scope: &[DefEntry]) -> LResult<Expr> {
             catch.map(|e| lower(*e, scope)).transpose()?.map(Box::new),
         )),
         Expr::Optional(body) => Ok(Expr::Optional(Box::new(lower(*body, scope)?))),
+        Expr::Label(name, body) => Ok(Expr::Label(name, Box::new(lower(*body, scope)?))),
+        Expr::Break(..) => Ok(expr),
         Expr::VarBind(source, pattern, body) => {
             let source = lower(*source, scope)?;
             let body = lower(*body, scope)?;
@@ -400,7 +409,8 @@ fn contains_call(expr: &Expr, name: &str, arity: usize) -> bool {
         Expr::Field { base, .. } | Expr::IterateAll { base, .. } => {
             contains_call(base, name, arity)
         }
-        Expr::Neg(x) | Expr::Optional(x) => contains_call(x, name, arity),
+        Expr::Neg(x) | Expr::Optional(x) | Expr::Label(_, x) => contains_call(x, name, arity),
+        Expr::Break(..) => false,
         Expr::Index { base, index, .. } => {
             contains_call(base, name, arity) || contains_call(index, name, arity)
         }
@@ -633,6 +643,8 @@ fn rewrite_call0(expr: Expr, target: &str, build: &mut dyn FnMut() -> Expr) -> E
             catch.map(|e| Box::new(rewrite_call0(*e, target, build))),
         ),
         Expr::Optional(body) => Expr::Optional(Box::new(rewrite_call0(*body, target, build))),
+        Expr::Label(name, body) => Expr::Label(name, Box::new(rewrite_call0(*body, target, build))),
+        e @ Expr::Break(..) => e,
         Expr::VarBind(source, pattern, body) => Expr::VarBind(
             Box::new(rewrite_call0(*source, target, build)),
             rewrite_pattern(pattern, target, build),
@@ -772,6 +784,7 @@ mod tests {
             "\"abc",
             "1 +",
             "if . then 1 end",
+            "label $out | break $oot",
         ] {
             let result = match parse_and_lower(src, version) {
                 Err(e) => Err(e),

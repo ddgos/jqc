@@ -261,6 +261,29 @@ difftest!(
     "5"
 );
 difftest!(while_builtin, "[while(. < 100; . * 2)]", "1");
+difftest!(
+    label_break_basic,
+    // `break` ends the whole enclosing `label` scope immediately -- 4
+    // and 5 are never reached once $x == 3 triggers it.
+    "[label $out | (1,2,3,4,5) as $x | if $x == 3 then break $out else $x end]",
+    "null"
+);
+difftest!(
+    label_break_caught_by_try,
+    // Confirmed against real jq: a `try`/`catch` in between a `break`
+    // and its matching `label` catches it exactly like any other
+    // error -- it's not specially exempted.
+    "label $out | [(1,2,3,4,5) as $x | try (if $x == 3 then break $out else $x end) catch \"caught-\\($x)\"]",
+    "null"
+);
+difftest!(
+    label_break_skips_non_matching_inner_label,
+    "[label $a | (label $b | (1,2,3) as $x | if $x == 2 then break $a else $x end), 99]",
+    "null"
+);
+difftest!(limit_basic, "[limit(2; range(0; 5))]", "null");
+difftest!(limit_zero, "[limit(0; range(0; 5))]", "null");
+difftest!(limit_more_than_available, "[limit(10; range(0; 3))]", "null");
 difftest!(until_builtin, "until(. >= 100; . * 2)", "1");
 difftest!(repeat_error_optional, "[repeat(.*2, error)?]", "1");
 difftest!(optional_chain, ".a.b?.c", r#"{"a":1}"#);

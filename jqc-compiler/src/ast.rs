@@ -123,6 +123,16 @@ pub enum Expr {
         update: Box<Expr>,
         extract: Option<Box<Expr>>,
     },
+    /// `label $name | body`: `body`'s nearest enclosing label named `name`
+    /// -- a `break $name` anywhere inside it (even through intervening
+    /// `try`/`catch`, which don't catch it) unwinds straight back here,
+    /// keeping whatever `body` had already produced, the same way an
+    /// error caught by `try`/`?` keeps its generator's prior output.
+    Label(String, Box<Expr>),
+    /// `break $name`: unwinds to the nearest enclosing `label $name`.
+    /// `span` covers the `$name` reference, for an "undefined label"
+    /// diagnostic if no enclosing label with that name exists.
+    Break(String, Span),
     FuncDef {
         name: String,
         params: Vec<Param>,

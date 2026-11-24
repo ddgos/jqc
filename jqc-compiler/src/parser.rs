@@ -608,6 +608,8 @@ impl Parser {
             "reduce" => self.parse_reduce(),
             "foreach" => self.parse_foreach(),
             "def" => self.parse_def(),
+            "label" => self.parse_label(),
+            "break" => self.parse_break(),
             "and" | "or" | "as" | "then" | "elif" | "else" | "end" | "catch" => {
                 Err(self.err(format!("unexpected keyword '{name}' here")))
             }
@@ -686,6 +688,25 @@ impl Parser {
             None
         };
         Ok(Expr::TryCatch(Box::new(body), catch))
+    }
+
+    /// `label $name | body` -- `body` is the *entire* rest of the
+    /// enclosing pipe (same trick as `def ... ; rest`: this call's own
+    /// `parse_pipe` greedily consumes any further `| ...` stages, so the
+    /// label's scope covers all of them, not just the first).
+    fn parse_label(&mut self) -> PResult<Expr> {
+        self.eat_ident("label")?;
+        let name = self.expect_var()?;
+        self.expect(Tok::Pipe)?;
+        let body = self.parse_pipe()?;
+        Ok(Expr::Label(name, Box::new(body)))
+    }
+
+    fn parse_break(&mut self) -> PResult<Expr> {
+        self.eat_ident("break")?;
+        let span = self.cur_span();
+        let name = self.expect_var()?;
+        Ok(Expr::Break(name, span))
     }
 
     fn parse_reduce(&mut self) -> PResult<Expr> {

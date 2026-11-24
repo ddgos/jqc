@@ -23,6 +23,13 @@ pub struct JqError {
     /// error, in order, before the error occurred. Empty for errors raised
     /// by atomic (non-generator) helpers.
     pub emitted: Vec<Value>,
+    /// `Some(name)` if this isn't really an error at all, but a `break
+    /// $name` unwinding to its matching `label $name` -- which must *not*
+    /// be caught by an intervening `try`/`catch`/`?` the way a real error
+    /// is (only the matching `label` may catch it), even though it's
+    /// threaded through exactly the same `Result`/`emitted` machinery so
+    /// everything already produced before the `break` is preserved.
+    pub break_label: Option<String>,
 }
 
 impl JqError {
@@ -30,6 +37,7 @@ impl JqError {
         JqError {
             value: Value::String(s.into()),
             emitted: Vec::new(),
+            break_label: None,
         }
     }
 
@@ -37,6 +45,15 @@ impl JqError {
         JqError {
             value: v,
             emitted: Vec::new(),
+            break_label: None,
+        }
+    }
+
+    pub fn brk(label: impl Into<String>) -> Self {
+        JqError {
+            value: Value::Null,
+            emitted: Vec::new(),
+            break_label: Some(label.into()),
         }
     }
 
