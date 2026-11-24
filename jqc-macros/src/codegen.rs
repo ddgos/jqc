@@ -14,7 +14,7 @@ use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 use syn::Ident;
 
-use crate::ast::{BinOp, Expr, StrPart};
+use crate::ast::{BinOp, Expr, ObjEntry, StrPart};
 
 pub type CResult<T> = Result<T, String>;
 
@@ -76,175 +76,165 @@ fn wrap_fallible(inner: TokenStream) -> TokenStream {
 fn compile_raw(expr: &Expr, input: &TokenStream, scope: &mut Vec<String>) -> CResult<TokenStream> {
     match expr {
         Expr::Identity => Ok(quote!(Ok(::std::vec![(#input).clone()]))),
-        Expr::RecurseDefault => Err("internal error: RecurseDefault should have been lowered".to_string()),
+        Expr::RecurseDefault => {
+            Err("internal error: RecurseDefault should have been lowered".to_string())
+        }
         Expr::Null => {
-            let v = core_path("Value");
-            Ok(quote!(Ok(::std::vec![#v::Null])))
+            let value_ty = core_path("Value");
+            Ok(quote!(Ok(::std::vec![#value_ty::Null])))
         }
         Expr::Bool(b) => {
-            let v = core_path("Value");
-            Ok(quote!(Ok(::std::vec![#v::Bool(#b)])))
+            let value_ty = core_path("Value");
+            Ok(quote!(Ok(::std::vec![#value_ty::Bool(#b)])))
         }
         Expr::Number(n) => {
-            let v = core_path("Value");
-            let num = core_path("number_from_f64");
-            Ok(quote!(Ok(::std::vec![#v::Number(#num(#n))])))
+            let value_ty = core_path("Value");
+            let number_from_f64 = core_path("number_from_f64");
+            Ok(quote!(Ok(
+                ::std::vec![#value_ty::Number(#number_from_f64(#n))]
+            )))
         }
         Expr::Str(parts) => compile_str(parts, input, scope),
-        Expr::Field(base, name, opt) => {
+        Expr::Field {
+            base,
+            name,
+            optional,
+        } => {
             let index_field = core_path("index_field");
             let base_c = compile(base, input, scope)?;
             Ok(quote! {
                 {
-                    let mut __o = ::std::vec::Vec::new();
-                    for __b in (#base_c)? {
-                        match #index_field(&__b, #name) {
-                            Ok(v) => __o.push(v),
-                            Err(e) => if !#opt { return Err(e); },
+                    let mut __out = ::std::vec::Vec::new();
+                    for __base in (#base_c)? {
+                        match #index_field(&__base, #name) {
+                            Ok(v) => __out.push(v),
+                            Err(e) => if !#optional { return Err(e); },
                         }
                     }
-                    Ok(__o)
+                    Ok(__out)
                 }
             })
         }
-        Expr::Index(base, idx, opt) => {
+        Expr::Index {
+            base,
+            index,
+            optional,
+        } => {
             let index_value = core_path("index_value");
             let base_c = compile(base, input, scope)?;
-            let idx_c = compile(idx, input, scope)?;
+            let index_c = compile(index, input, scope)?;
             Ok(quote! {
                 {
-                    let mut __o = ::std::vec::Vec::new();
-                    for __b in (#base_c)? {
-                        for __k in (#idx_c)? {
-                            match #index_value(&__b, &__k) {
-                                Ok(v) => __o.push(v),
-                                Err(e) => if !#opt { return Err(e); },
+                    let mut __out = ::std::vec::Vec::new();
+                    // As with binops, jq evaluates the bracket expression's
+                    // generator as the outer loop, the base as the inner one.
+                    for __key in (#index_c)? {
+                        for __base in (#base_c)? {
+                            match #index_value(&__base, &__key) {
+                                Ok(v) => __out.push(v),
+                                Err(e) => if !#optional { return Err(e); },
                             }
                         }
                     }
-                    Ok(__o)
+                    Ok(__out)
                 }
             })
         }
-        Expr::Slice(base, from, to, opt) => compile_slice(base, from.as_deref(), to.as_deref(), *opt, input, scope),
-        Expr::IterateAll(base, opt) => {
+        Expr::Slice {
+            base,
+            from,
+            to,
+            optional,
+        } => compile_slice(
+            base,
+            from.as_deref(),
+            to.as_deref(),
+            *optional,
+            input,
+            scope,
+        ),
+        Expr::IterateAll { base, optional } => {
             let iterate = core_path("iterate");
             let base_c = compile(base, input, scope)?;
             Ok(quote! {
                 {
-                    let mut __o = ::std::vec::Vec::new();
-                    for __b in (#base_c)? {
-                        match #iterate(&__b) {
-                            Ok(vs) => __o.extend(vs),
-                            Err(e) => if !#opt { return Err(e); },
+                    let mut __out = ::std::vec::Vec::new();
+                    for __base in (#base_c)? {
+                        match #iterate(&__base) {
+                            Ok(vs) => __out.extend(vs),
+                            Err(e) => if !#optional { return Err(e); },
                         }
                     }
-                    Ok(__o)
+                    Ok(__out)
                 }
             })
         }
-        Expr::Pipe(a, b) => {
-            let a_c = compile(a, input, scope)?;
-            let b_c = compile(b, &quote!(&__x), scope)?;
+        Expr::Pipe(lhs, rhs) => {
+            let lhs_c = compile(lhs, input, scope)?;
+            let rhs_c = compile(rhs, &quote!(&__piped), scope)?;
             Ok(quote! {
                 {
-                    let mut __o = ::std::vec::Vec::new();
-                    for __x in (#a_c)? {
-                        __o.extend((#b_c)?);
+                    let mut __out = ::std::vec::Vec::new();
+                    for __piped in (#lhs_c)? {
+                        __out.extend((#rhs_c)?);
                     }
-                    Ok(__o)
+                    Ok(__out)
                 }
             })
         }
-        Expr::Comma(a, b) => {
-            let a_c = compile(a, input, scope)?;
-            let b_c = compile(b, input, scope)?;
+        Expr::Comma(lhs, rhs) => {
+            let lhs_c = compile(lhs, input, scope)?;
+            let rhs_c = compile(rhs, input, scope)?;
             Ok(quote! {
                 {
-                    let mut __o = (#a_c)?;
-                    __o.extend((#b_c)?);
-                    Ok(__o)
+                    let mut __out = (#lhs_c)?;
+                    __out.extend((#rhs_c)?);
+                    Ok(__out)
                 }
             })
         }
         Expr::ArrayConstruct(inner) => {
-            let v = core_path("Value");
+            let value_ty = core_path("Value");
             match inner {
-                None => Ok(quote!(Ok(::std::vec![#v::Array(::std::vec::Vec::new())]))),
+                None => Ok(quote!(Ok(
+                    ::std::vec![#value_ty::Array(::std::vec::Vec::new())]
+                ))),
                 Some(e) => {
-                    let c = compile(e, input, scope)?;
-                    Ok(quote!(Ok(::std::vec![#v::Array((#c)?)])))
+                    let inner_c = compile(e, input, scope)?;
+                    Ok(quote!(Ok(::std::vec![#value_ty::Array((#inner_c)?)])))
                 }
             }
         }
         Expr::ObjectConstruct(entries) => compile_object(entries, input, scope),
         Expr::Neg(x) => {
-            let neg = core_path("neg_value");
-            let c = compile(x, input, scope)?;
+            let neg_value = core_path("neg_value");
+            let x_c = compile(x, input, scope)?;
             Ok(quote! {
                 {
-                    let mut __o = ::std::vec::Vec::new();
-                    for __v in (#c)? {
-                        __o.push(#neg(__v)?);
+                    let mut __out = ::std::vec::Vec::new();
+                    for __val in (#x_c)? {
+                        __out.push(#neg_value(__val)?);
                     }
-                    Ok(__o)
+                    Ok(__out)
                 }
             })
         }
-        Expr::BinOp(op, a, b) => compile_binop(*op, a, b, input, scope),
-        Expr::And(a, b) => {
-            let truthy = core_path("truthy");
-            let v = core_path("Value");
-            let a_c = compile(a, input, scope)?;
-            let b_c = compile(b, input, scope)?;
-            Ok(quote! {
-                {
-                    let mut __o = ::std::vec::Vec::new();
-                    for __l in (#a_c)? {
-                        if !#truthy(&__l) {
-                            __o.push(#v::Bool(false));
-                        } else {
-                            for __r in (#b_c)? {
-                                __o.push(#v::Bool(#truthy(&__r)));
-                            }
-                        }
-                    }
-                    Ok(__o)
-                }
-            })
+        Expr::BinOp(op, lhs, rhs) => compile_binop(*op, lhs, rhs, input, scope),
+        Expr::And(lhs, rhs) => compile_and_or(lhs, rhs, input, scope, true),
+        Expr::Or(lhs, rhs) => compile_and_or(lhs, rhs, input, scope, false),
+        Expr::If(branches, else_branch) => {
+            compile_if(branches, else_branch.as_deref(), input, scope)
         }
-        Expr::Or(a, b) => {
-            let truthy = core_path("truthy");
-            let v = core_path("Value");
-            let a_c = compile(a, input, scope)?;
-            let b_c = compile(b, input, scope)?;
-            Ok(quote! {
-                {
-                    let mut __o = ::std::vec::Vec::new();
-                    for __l in (#a_c)? {
-                        if #truthy(&__l) {
-                            __o.push(#v::Bool(true));
-                        } else {
-                            for __r in (#b_c)? {
-                                __o.push(#v::Bool(#truthy(&__r)));
-                            }
-                        }
-                    }
-                    Ok(__o)
-                }
-            })
-        }
-        Expr::If(branches, else_e) => compile_if(branches, else_e.as_deref(), input, scope),
         Expr::TryCatch(body, catch) => {
             let value_ty = core_path("Value");
             let jresult_ty = core_path("JResult");
             let body_c = compile(body, input, scope)?;
             let handler = match catch {
                 Some(c) => {
-                    let catch_c = compile(c, &quote!(&__ev), scope)?;
+                    let catch_c = compile(c, &quote!(&__caught), scope)?;
                     quote! {
                         Err(e) => {
-                            let __ev = e.into_value();
+                            let __caught = e.into_value();
                             (#catch_c)
                         }
                     }
@@ -253,8 +243,8 @@ fn compile_raw(expr: &Expr, input: &TokenStream, scope: &mut Vec<String>) -> CRe
             };
             Ok(quote! {
                 {
-                    let __r: #jresult_ty<::std::vec::Vec<#value_ty>> = (|| #body_c)();
-                    match __r {
+                    let __result: #jresult_ty<::std::vec::Vec<#value_ty>> = (|| #body_c)();
+                    match __result {
                         Ok(v) => Ok(v),
                         #handler
                     }
@@ -267,28 +257,28 @@ fn compile_raw(expr: &Expr, input: &TokenStream, scope: &mut Vec<String>) -> CRe
             let body_c = compile(body, input, scope)?;
             Ok(quote! {
                 {
-                    let __r: #jresult_ty<::std::vec::Vec<#value_ty>> = (|| #body_c)();
-                    match __r {
+                    let __result: #jresult_ty<::std::vec::Vec<#value_ty>> = (|| #body_c)();
+                    match __result {
                         Ok(v) => Ok(v),
                         Err(_) => Ok(::std::vec::Vec::new()),
                     }
                 }
             })
         }
-        Expr::VarBind(src, name, body) => {
+        Expr::VarBind(source, name, body) => {
             let jv = jv_ident(name);
-            let src_c = compile(src, input, scope)?;
+            let source_c = compile(source, input, scope)?;
             scope.push(name.clone());
             let body_c = compile(body, input, scope);
             scope.pop();
             let body_c = body_c?;
             Ok(quote! {
                 {
-                    let mut __o = ::std::vec::Vec::new();
-                    for #jv in (#src_c)? {
-                        __o.extend((#body_c)?);
+                    let mut __out = ::std::vec::Vec::new();
+                    for #jv in (#source_c)? {
+                        __out.extend((#body_c)?);
                     }
-                    Ok(__o)
+                    Ok(__out)
                 }
             })
         }
@@ -299,9 +289,14 @@ fn compile_raw(expr: &Expr, input: &TokenStream, scope: &mut Vec<String>) -> CRe
             let jv = jv_ident(name);
             Ok(quote!(Ok(::std::vec![#jv.clone()])))
         }
-        Expr::Reduce(src, var, init, update) => {
+        Expr::Reduce {
+            source,
+            var,
+            init,
+            update,
+        } => {
             let jv = jv_ident(var);
-            let src_c = compile(src, input, scope)?;
+            let source_c = compile(source, input, scope)?;
             let init_c = compile(init, input, scope)?;
             scope.push(var.clone());
             let update_c = compile(update, &quote!(&__state), scope);
@@ -310,22 +305,28 @@ fn compile_raw(expr: &Expr, input: &TokenStream, scope: &mut Vec<String>) -> CRe
             let value_ty = core_path("Value");
             Ok(quote! {
                 {
-                    let mut __o = ::std::vec::Vec::new();
+                    let mut __out = ::std::vec::Vec::new();
                     for __init in (#init_c)? {
                         let mut __state = __init;
-                        for #jv in (#src_c)? {
-                            let __upd = (#update_c)?;
-                            __state = __upd.into_iter().last().unwrap_or(#value_ty::Null);
+                        for #jv in (#source_c)? {
+                            let __updates = (#update_c)?;
+                            __state = __updates.into_iter().last().unwrap_or(#value_ty::Null);
                         }
-                        __o.push(__state);
+                        __out.push(__state);
                     }
-                    Ok(__o)
+                    Ok(__out)
                 }
             })
         }
-        Expr::Foreach(src, var, init, update, extract) => {
+        Expr::Foreach {
+            source,
+            var,
+            init,
+            update,
+            extract,
+        } => {
             let jv = jv_ident(var);
-            let src_c = compile(src, input, scope)?;
+            let source_c = compile(source, input, scope)?;
             let init_c = compile(init, input, scope)?;
             scope.push(var.clone());
             let update_c = compile(update, &quote!(&__state), scope);
@@ -336,23 +337,23 @@ fn compile_raw(expr: &Expr, input: &TokenStream, scope: &mut Vec<String>) -> CRe
             scope.pop();
             let update_c = update_c?;
             let extract_push = match extract_c? {
-                Some(ec) => quote!(__o.extend((#ec)?);),
-                None => quote!(__o.push(__state.clone());),
+                Some(ec) => quote!(__out.extend((#ec)?);),
+                None => quote!(__out.push(__state.clone());),
             };
             Ok(quote! {
                 {
-                    let mut __o = ::std::vec::Vec::new();
+                    let mut __out = ::std::vec::Vec::new();
                     for __init in (#init_c)? {
                         let mut __state = __init;
-                        for #jv in (#src_c)? {
-                            let __upd = (#update_c)?;
-                            for __u in __upd {
-                                __state = __u;
+                        for #jv in (#source_c)? {
+                            let __updates = (#update_c)?;
+                            for __next_state in __updates {
+                                __state = __next_state;
                                 #extract_push
                             }
                         }
                     }
-                    Ok(__o)
+                    Ok(__out)
                 }
             })
         }
@@ -375,28 +376,34 @@ fn compile_raw(expr: &Expr, input: &TokenStream, scope: &mut Vec<String>) -> CRe
                 }
             })
         }
-        Expr::FuncDef { .. } => Err("internal error: FuncDef should have been resolved by lowering".to_string()),
+        Expr::FuncDef { .. } => {
+            Err("internal error: FuncDef should have been resolved by lowering".to_string())
+        }
         Expr::Call(name, args) => compile_call(name, args, input, scope),
     }
 }
 
-fn compile_str(parts: &[StrPart], input: &TokenStream, scope: &mut Vec<String>) -> CResult<TokenStream> {
+fn compile_str(
+    parts: &[StrPart],
+    input: &TokenStream,
+    scope: &mut Vec<String>,
+) -> CResult<TokenStream> {
     let value_ty = core_path("Value");
     let display = core_path("value_to_display_string");
     let mut steps = Vec::new();
     for part in parts {
         match part {
             StrPart::Lit(s) => steps.push(quote! {
-                __o = __o.into_iter().map(|p: ::std::string::String| p + #s).collect();
+                __out = __out.into_iter().map(|prefix: ::std::string::String| prefix + #s).collect();
             }),
             StrPart::Interp(e) => {
-                let c = compile(e, input, scope)?;
+                let e_c = compile(e, input, scope)?;
                 steps.push(quote! {
-                    __o = {
+                    __out = {
                         let mut __next = ::std::vec::Vec::new();
-                        for __p in &__o {
-                            for __v in (#c)? {
-                                __next.push(__p.clone() + &#display(&__v));
+                        for __prefix in &__out {
+                            for __val in (#e_c)? {
+                                __next.push(__prefix.clone() + &#display(&__val));
                             }
                         }
                         __next
@@ -407,15 +414,15 @@ fn compile_str(parts: &[StrPart], input: &TokenStream, scope: &mut Vec<String>) 
     }
     Ok(quote! {
         {
-            let mut __o: ::std::vec::Vec<::std::string::String> = ::std::vec![::std::string::String::new()];
+            let mut __out: ::std::vec::Vec<::std::string::String> = ::std::vec![::std::string::String::new()];
             #(#steps)*
-            Ok(__o.into_iter().map(#value_ty::String).collect::<::std::vec::Vec<#value_ty>>())
+            Ok(__out.into_iter().map(#value_ty::String).collect::<::std::vec::Vec<#value_ty>>())
         }
     })
 }
 
 fn compile_object(
-    entries: &[crate::ast::ObjEntry],
+    entries: &[ObjEntry],
     input: &TokenStream,
     scope: &mut Vec<String>,
 ) -> CResult<TokenStream> {
@@ -427,12 +434,12 @@ fn compile_object(
         let key_c = compile(&entry.key, input, scope)?;
         let val_c = compile(&entry.val, input, scope)?;
         steps.push(quote! {
-            __maps = {
+            __partials = {
                 let mut __next: ::std::vec::Vec<#map_ty<::std::string::String, #value_ty>> = ::std::vec::Vec::new();
-                for __m in &__maps {
-                    for __k in (#key_c)? {
-                        for __v in (#val_c)? {
-                            __next.push(#object_insert(__m.clone(), __k.clone(), __v)?);
+                for __partial in &__partials {
+                    for __key in (#key_c)? {
+                        for __val in (#val_c)? {
+                            __next.push(#object_insert(__partial.clone(), __key.clone(), __val)?);
                         }
                     }
                 }
@@ -442,86 +449,128 @@ fn compile_object(
     }
     Ok(quote! {
         {
-            let mut __maps: ::std::vec::Vec<#map_ty<::std::string::String, #value_ty>> = ::std::vec![#map_ty::new()];
+            let mut __partials: ::std::vec::Vec<#map_ty<::std::string::String, #value_ty>> = ::std::vec![#map_ty::new()];
             #(#steps)*
-            Ok(__maps.into_iter().map(#value_ty::Object).collect::<::std::vec::Vec<#value_ty>>())
+            Ok(__partials.into_iter().map(#value_ty::Object).collect::<::std::vec::Vec<#value_ty>>())
         }
     })
 }
 
-fn compile_binop(op: BinOp, a: &Expr, b: &Expr, input: &TokenStream, scope: &mut Vec<String>) -> CResult<TokenStream> {
-    let a_c = compile(a, input, scope)?;
-    let b_c = compile(b, input, scope)?;
+fn compile_binop(
+    op: BinOp,
+    lhs: &Expr,
+    rhs: &Expr,
+    input: &TokenStream,
+    scope: &mut Vec<String>,
+) -> CResult<TokenStream> {
+    let lhs_c = compile(lhs, input, scope)?;
+    let rhs_c = compile(rhs, input, scope)?;
     let value_ty = core_path("Value");
     let op_call = match op {
         BinOp::Add => {
             let f = core_path("add_values");
-            quote!(#f(__a, __b.clone())?)
+            quote!(#f(__lhs, __rhs.clone())?)
         }
         BinOp::Sub => {
             let f = core_path("sub_values");
-            quote!(#f(__a, __b.clone())?)
+            quote!(#f(__lhs, __rhs.clone())?)
         }
         BinOp::Mul => {
             let f = core_path("mul_values");
-            quote!(#f(__a, __b.clone())?)
+            quote!(#f(__lhs, __rhs.clone())?)
         }
         BinOp::Div => {
             let f = core_path("div_values");
-            quote!(#f(__a, __b.clone())?)
+            quote!(#f(__lhs, __rhs.clone())?)
         }
         BinOp::Mod => {
             let f = core_path("mod_values");
-            quote!(#f(__a, __b.clone())?)
+            quote!(#f(__lhs, __rhs.clone())?)
         }
         BinOp::Eq => {
             let f = core_path("eq_values");
-            quote!(#value_ty::Bool(#f(&__a, &__b)))
+            quote!(#value_ty::Bool(#f(&__lhs, &__rhs)))
         }
         BinOp::Ne => {
             let f = core_path("eq_values");
-            quote!(#value_ty::Bool(!#f(&__a, &__b)))
+            quote!(#value_ty::Bool(!#f(&__lhs, &__rhs)))
         }
         BinOp::Lt => {
             let f = core_path("cmp_values");
-            quote!(#value_ty::Bool(#f(&__a, &__b) == ::std::cmp::Ordering::Less))
+            quote!(#value_ty::Bool(#f(&__lhs, &__rhs) == ::std::cmp::Ordering::Less))
         }
         BinOp::Le => {
             let f = core_path("cmp_values");
-            quote!(#value_ty::Bool(#f(&__a, &__b) != ::std::cmp::Ordering::Greater))
+            quote!(#value_ty::Bool(#f(&__lhs, &__rhs) != ::std::cmp::Ordering::Greater))
         }
         BinOp::Gt => {
             let f = core_path("cmp_values");
-            quote!(#value_ty::Bool(#f(&__a, &__b) == ::std::cmp::Ordering::Greater))
+            quote!(#value_ty::Bool(#f(&__lhs, &__rhs) == ::std::cmp::Ordering::Greater))
         }
         BinOp::Ge => {
             let f = core_path("cmp_values");
-            quote!(#value_ty::Bool(#f(&__a, &__b) != ::std::cmp::Ordering::Less))
+            quote!(#value_ty::Bool(#f(&__lhs, &__rhs) != ::std::cmp::Ordering::Less))
         }
     };
     Ok(quote! {
         {
-            let mut __o = ::std::vec::Vec::new();
+            let mut __out = ::std::vec::Vec::new();
             // jq evaluates the right operand's generator as the outer loop
             // (e.g. `(1,2) + (10,20)` yields `11,12,21,22`, not `11,21,12,22`).
-            for __b in (#b_c)? {
-                for __a in (#a_c)? {
-                    __o.push(#op_call);
+            for __rhs in (#rhs_c)? {
+                for __lhs in (#lhs_c)? {
+                    __out.push(#op_call);
                 }
             }
-            Ok(__o)
+            Ok(__out)
+        }
+    })
+}
+
+/// `and`/`or` short-circuit: the right operand is only evaluated (and only
+/// then cartesian-expanded) per left-hand value that didn't already decide
+/// the result on its own.
+fn compile_and_or(
+    lhs: &Expr,
+    rhs: &Expr,
+    input: &TokenStream,
+    scope: &mut Vec<String>,
+    is_and: bool,
+) -> CResult<TokenStream> {
+    let truthy = core_path("truthy");
+    let value_ty = core_path("Value");
+    let lhs_c = compile(lhs, input, scope)?;
+    let rhs_c = compile(rhs, input, scope)?;
+    let (short_circuit_on, short_circuit_value) = if is_and {
+        (quote!(!), false)
+    } else {
+        (quote!(), true)
+    };
+    Ok(quote! {
+        {
+            let mut __out = ::std::vec::Vec::new();
+            for __lhs in (#lhs_c)? {
+                if #short_circuit_on #truthy(&__lhs) {
+                    __out.push(#value_ty::Bool(#short_circuit_value));
+                } else {
+                    for __rhs in (#rhs_c)? {
+                        __out.push(#value_ty::Bool(#truthy(&__rhs)));
+                    }
+                }
+            }
+            Ok(__out)
         }
     })
 }
 
 fn compile_if(
     branches: &[(Expr, Expr)],
-    else_e: Option<&Expr>,
+    else_branch: Option<&Expr>,
     input: &TokenStream,
     scope: &mut Vec<String>,
 ) -> CResult<TokenStream> {
     if branches.is_empty() {
-        return match else_e {
+        return match else_branch {
             Some(e) => compile(e, input, scope),
             None => compile(&Expr::Identity, input, scope),
         };
@@ -529,19 +578,19 @@ fn compile_if(
     let (cond, then_e) = &branches[0];
     let cond_c = compile(cond, input, scope)?;
     let then_c = compile(then_e, input, scope)?;
-    let else_c = wrap_fallible(compile_if(&branches[1..], else_e, input, scope)?);
+    let else_c = wrap_fallible(compile_if(&branches[1..], else_branch, input, scope)?);
     let truthy = core_path("truthy");
     Ok(quote! {
         {
-            let mut __o = ::std::vec::Vec::new();
-            for __c in (#cond_c)? {
-                if #truthy(&__c) {
-                    __o.extend((#then_c)?);
+            let mut __out = ::std::vec::Vec::new();
+            for __cond in (#cond_c)? {
+                if #truthy(&__cond) {
+                    __out.extend((#then_c)?);
                 } else {
-                    __o.extend((#else_c)?);
+                    __out.extend((#else_c)?);
                 }
             }
-            Ok(__o)
+            Ok(__out)
         }
     })
 }
@@ -550,7 +599,7 @@ fn compile_slice(
     base: &Expr,
     from: Option<&Expr>,
     to: Option<&Expr>,
-    opt: bool,
+    optional: bool,
     input: &TokenStream,
     scope: &mut Vec<String>,
 ) -> CResult<TokenStream> {
@@ -561,28 +610,33 @@ fn compile_slice(
     let from_c = from.map(|e| compile(e, input, scope)).transpose()?;
     let to_c = to.map(|e| compile(e, input, scope)).transpose()?;
 
-    let core_match = quote! {
-        match #slice_value(&__b, __from, __to) {
-            Ok(v) => __o.push(v),
-            Err(e) => if !#opt { return Err(e); },
+    // jq nests these outer-to-inner as from, to, base (least significant),
+    // mirroring how it treats the bracket expression as outer and the
+    // receiver as inner for plain indexing.
+    let base_loop = quote! {
+        for __base in (#base_c)? {
+            match #slice_value(&__base, __from, __to) {
+                Ok(v) => __out.push(v),
+                Err(e) => if !#optional { return Err(e); },
+            }
         }
     };
     let with_to = match to_c {
         Some(c) => quote! {
-            for __tv in (#c)? {
-                let __to: ::std::option::Option<i64> = ::std::option::Option::Some(#to_i64(&__tv)?);
-                #core_match
+            for __to_src in (#c)? {
+                let __to: ::std::option::Option<i64> = ::std::option::Option::Some(#to_i64(&__to_src)?);
+                #base_loop
             }
         },
         None => quote! {
             let __to: ::std::option::Option<i64> = ::std::option::Option::None;
-            #core_match
+            #base_loop
         },
     };
     let with_from = match from_c {
         Some(c) => quote! {
-            for __fv in (#c)? {
-                let __from: ::std::option::Option<i64> = ::std::option::Option::Some(#to_i64(&__fv)?);
+            for __from_src in (#c)? {
+                let __from: ::std::option::Option<i64> = ::std::option::Option::Some(#to_i64(&__from_src)?);
                 #with_to
             }
         },
@@ -594,15 +648,17 @@ fn compile_slice(
 
     Ok(quote! {
         {
-            let mut __o = ::std::vec::Vec::new();
-            for __b in (#base_c)? {
-                #with_from
-            }
-            Ok(__o)
+            let mut __out = ::std::vec::Vec::new();
+            #with_from
+            Ok(__out)
         }
     })
 }
 
+/// Generic N-ary cartesian product over a builtin call's arguments: each
+/// arg's compiled output is bound to `__a0`, `__a1`, … (outermost to
+/// innermost, left to right), and `build` receives those idents to produce
+/// the single pushed expression.
 fn cartesian_args(
     args: &[Expr],
     input: &TokenStream,
@@ -615,8 +671,8 @@ fn cartesian_args(
         .collect::<CResult<Vec<_>>>()?;
     let names: Vec<Ident> = (0..args.len()).map(|i| format_ident!("__a{i}")).collect();
     let name_toks: Vec<TokenStream> = names.iter().map(|n| quote!(#n)).collect();
-    let inner = build(&name_toks);
-    let mut body = quote!(__o.push(#inner););
+    let pushed = build(&name_toks);
+    let mut body = quote!(__out.push(#pushed););
     for (name, c) in names.iter().zip(compiled.iter()).rev() {
         body = quote! {
             for #name in (#c)? {
@@ -626,14 +682,19 @@ fn cartesian_args(
     }
     Ok(quote! {
         {
-            let mut __o = ::std::vec::Vec::new();
+            let mut __out = ::std::vec::Vec::new();
             #body
-            Ok(__o)
+            Ok(__out)
         }
     })
 }
 
-fn compile_call(name: &str, args: &[Expr], input: &TokenStream, scope: &mut Vec<String>) -> CResult<TokenStream> {
+fn compile_call(
+    name: &str,
+    args: &[Expr],
+    input: &TokenStream,
+    scope: &mut Vec<String>,
+) -> CResult<TokenStream> {
     let value_ty = core_path("Value");
     match (name, args.len()) {
         ("empty", 0) => Ok(quote!(Ok(::std::vec::Vec::new()))),
@@ -647,7 +708,9 @@ fn compile_call(name: &str, args: &[Expr], input: &TokenStream, scope: &mut Vec<
         }
         ("type", 0) => {
             let f = core_path("type_name");
-            Ok(quote!(Ok(::std::vec![#value_ty::String(#f(#input).to_string())])))
+            Ok(quote!(Ok(
+                ::std::vec![#value_ty::String(#f(#input).to_string())]
+            )))
         }
         ("keys", 0) => {
             let f = core_path("keys_of");
@@ -658,37 +721,41 @@ fn compile_call(name: &str, args: &[Expr], input: &TokenStream, scope: &mut Vec<
             Ok(quote!(Ok(::std::vec![#f(#input, false)?])))
         }
         ("add", 0) => {
-            let arr = core_path("as_array");
+            let as_array = core_path("as_array");
             let f = core_path("add_all");
-            Ok(quote!(Ok(::std::vec![#f(#arr(#input)?)?])))
+            Ok(quote!(Ok(::std::vec![#f(#as_array(#input)?)?])))
         }
         ("reverse", 0) => {
             let f = core_path("reverse_value");
             Ok(quote!(Ok(::std::vec![#f(#input)?])))
         }
         ("sort", 0) => {
-            let arr = core_path("as_array");
+            let as_array = core_path("as_array");
             let f = core_path("sort_values");
-            Ok(quote!(Ok(::std::vec![#value_ty::Array(#f(#arr(#input)?.clone()))])))
+            Ok(quote!(Ok(
+                ::std::vec![#value_ty::Array(#f(#as_array(#input)?.clone()))]
+            )))
         }
         ("unique", 0) => {
-            let arr = core_path("as_array");
+            let as_array = core_path("as_array");
             let f = core_path("unique_values");
-            Ok(quote!(Ok(::std::vec![#value_ty::Array(#f(#arr(#input)?.clone()))])))
+            Ok(quote!(Ok(
+                ::std::vec![#value_ty::Array(#f(#as_array(#input)?.clone()))]
+            )))
         }
         ("min", 0) => {
-            let arr = core_path("as_array");
+            let as_array = core_path("as_array");
             let cmp = core_path("cmp_values");
-            Ok(quote! {
-                Ok(::std::vec![#arr(#input)?.iter().cloned().min_by(#cmp).unwrap_or(#value_ty::Null)])
-            })
+            Ok(quote!(Ok(
+                ::std::vec![#as_array(#input)?.iter().cloned().min_by(#cmp).unwrap_or(#value_ty::Null)]
+            )))
         }
         ("max", 0) => {
-            let arr = core_path("as_array");
+            let as_array = core_path("as_array");
             let cmp = core_path("cmp_values");
-            Ok(quote! {
-                Ok(::std::vec![#arr(#input)?.iter().cloned().max_by(#cmp).unwrap_or(#value_ty::Null)])
-            })
+            Ok(quote!(Ok(
+                ::std::vec![#as_array(#input)?.iter().cloned().max_by(#cmp).unwrap_or(#value_ty::Null)]
+            )))
         }
         ("floor", 0) => simple_unary("floor_value", input),
         ("ceil", 0) => simple_unary("ceil_value", input),
@@ -713,66 +780,90 @@ fn compile_call(name: &str, args: &[Expr], input: &TokenStream, scope: &mut Vec<
             Ok(quote!(Ok(::std::vec![#f(#input, &#value_ty::from(-1))?])))
         }
         ("first", 1) => {
-            let c = compile(&args[0], input, scope)?;
+            let arg_c = compile(&args[0], input, scope)?;
             Ok(quote! {
                 {
-                    let __all = (#c)?;
-                    Ok(__all.into_iter().next().into_iter().collect::<::std::vec::Vec<#value_ty>>())
+                    let __items = (#arg_c)?;
+                    Ok(__items.into_iter().next().into_iter().collect::<::std::vec::Vec<#value_ty>>())
                 }
             })
         }
         ("last", 1) => {
-            let c = compile(&args[0], input, scope)?;
+            let arg_c = compile(&args[0], input, scope)?;
             Ok(quote! {
                 {
-                    let __all = (#c)?;
-                    Ok(__all.into_iter().last().into_iter().collect::<::std::vec::Vec<#value_ty>>())
+                    let __items = (#arg_c)?;
+                    Ok(__items.into_iter().last().into_iter().collect::<::std::vec::Vec<#value_ty>>())
                 }
             })
         }
         ("has", 1) => {
             let f = core_path("has_key");
-            cartesian_args(args, input, scope, |a| { let a0 = &a[0]; quote!(#f(#input, &#a0)?) })
+            cartesian_args(args, input, scope, |a| {
+                let arg = &a[0];
+                quote!(#f(#input, &#arg)?)
+            })
         }
         ("contains", 1) => {
             let f = core_path("contains_value");
-            cartesian_args(args, input, scope, |a| { let a0 = &a[0]; quote!(#value_ty::Bool(#f(#input, &#a0)?)) })
+            cartesian_args(args, input, scope, |a| {
+                let arg = &a[0];
+                quote!(#value_ty::Bool(#f(#input, &#arg)?))
+            })
         }
         ("startswith", 1) => {
             let f = core_path("startswith");
-            cartesian_args(args, input, scope, |a| { let a0 = &a[0]; quote!(#f(#input, &#a0)?) })
+            cartesian_args(args, input, scope, |a| {
+                let arg = &a[0];
+                quote!(#f(#input, &#arg)?)
+            })
         }
         ("endswith", 1) => {
             let f = core_path("endswith");
-            cartesian_args(args, input, scope, |a| { let a0 = &a[0]; quote!(#f(#input, &#a0)?) })
+            cartesian_args(args, input, scope, |a| {
+                let arg = &a[0];
+                quote!(#f(#input, &#arg)?)
+            })
         }
         ("ltrimstr", 1) => {
             let f = core_path("ltrimstr");
-            cartesian_args(args, input, scope, |a| { let a0 = &a[0]; quote!(#f(#input, &#a0)) })
+            cartesian_args(args, input, scope, |a| {
+                let arg = &a[0];
+                quote!(#f(#input, &#arg))
+            })
         }
         ("rtrimstr", 1) => {
             let f = core_path("rtrimstr");
-            cartesian_args(args, input, scope, |a| { let a0 = &a[0]; quote!(#f(#input, &#a0)) })
+            cartesian_args(args, input, scope, |a| {
+                let arg = &a[0];
+                quote!(#f(#input, &#arg))
+            })
         }
         ("join", 1) => {
             let f = core_path("join_strings");
-            cartesian_args(args, input, scope, |a| { let a0 = &a[0]; quote!(#f(#input, &#a0)?) })
+            cartesian_args(args, input, scope, |a| {
+                let arg = &a[0];
+                quote!(#f(#input, &#arg)?)
+            })
         }
         ("split", 1) => {
             let f = core_path("split_string");
-            cartesian_args(args, input, scope, |a| { let a0 = &a[0]; quote!(#f(#input, &#a0)?) })
+            cartesian_args(args, input, scope, |a| {
+                let arg = &a[0];
+                quote!(#f(#input, &#arg)?)
+            })
         }
         ("range", 1) => {
-            let f = core_path("range_values");
-            let c = compile(&args[0], input, scope)?;
+            let range_values = core_path("range_values");
+            let arg_c = compile(&args[0], input, scope)?;
             let to_f64 = core_path("value_to_f64");
             Ok(quote! {
                 {
-                    let mut __o = ::std::vec::Vec::new();
-                    for __t in (#c)? {
-                        __o.extend(#f(0.0, #to_f64(&__t)?, 1.0));
+                    let mut __out = ::std::vec::Vec::new();
+                    for __to in (#arg_c)? {
+                        __out.extend(#range_values(0.0, #to_f64(&__to)?, 1.0));
                     }
-                    Ok(__o)
+                    Ok(__out)
                 }
             })
         }
@@ -810,24 +901,24 @@ fn compile_range(
         Some(s) => {
             let step_c = compile(s, input, scope)?;
             quote! {
-                for __s in (#step_c)? {
-                    __o.extend(#range_values(#to_f64(&__f)?, #to_f64(&__t)?, #to_f64(&__s)?));
+                for __step in (#step_c)? {
+                    __out.extend(#range_values(#to_f64(&__from)?, #to_f64(&__to)?, #to_f64(&__step)?));
                 }
             }
         }
         None => quote! {
-            __o.extend(#range_values(#to_f64(&__f)?, #to_f64(&__t)?, 1.0));
+            __out.extend(#range_values(#to_f64(&__from)?, #to_f64(&__to)?, 1.0));
         },
     };
     Ok(quote! {
         {
-            let mut __o = ::std::vec::Vec::new();
-            for __f in (#from_c)? {
-                for __t in (#to_c)? {
+            let mut __out = ::std::vec::Vec::new();
+            for __from in (#from_c)? {
+                for __to in (#to_c)? {
                     #step_part
                 }
             }
-            Ok(__o)
+            Ok(__out)
         }
     })
 }
@@ -847,17 +938,17 @@ fn compile_by(
     let value_ty = core_path("Value");
     let as_array = core_path("as_array");
     let helper = core_path(helper_name);
-    let key_c = compile(&args[0], &quote!(__el), scope)?;
+    let key_c = compile(&args[0], &quote!(__item), scope)?;
     let result = if wrap_array {
-        quote!(Ok(::std::vec![#value_ty::Array(#helper(__arr, __keys))]))
+        quote!(Ok(::std::vec![#value_ty::Array(#helper(__items, __keys))]))
     } else {
-        quote!(Ok(::std::vec![#helper(__arr, __keys)]))
+        quote!(Ok(::std::vec![#helper(__items, __keys)]))
     };
     Ok(quote! {
         {
-            let __arr = #as_array(#input)?.clone();
-            let mut __keys = ::std::vec::Vec::with_capacity(__arr.len());
-            for __el in &__arr {
+            let __items = #as_array(#input)?.clone();
+            let mut __keys = ::std::vec::Vec::with_capacity(__items.len());
+            for __item in &__items {
                 __keys.push(#value_ty::Array((#key_c)?));
             }
             #result

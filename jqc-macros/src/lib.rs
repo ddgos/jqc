@@ -7,6 +7,8 @@
 //! generated code references `::jqc::core::*`.
 
 mod ast;
+#[cfg(test)]
+mod bench;
 mod codegen;
 mod lexer;
 mod lower;
@@ -24,6 +26,8 @@ pub fn jq(input: TokenStream) -> TokenStream {
     let src = lit.value();
     match lower::parse_and_lower(&src).and_then(|ast| codegen::compile_top(&ast)) {
         Ok(ts) => ts.into(),
-        Err(msg) => syn::Error::new(lit.span(), format!("jq!: {msg}")).to_compile_error().into(),
+        Err(msg) => syn::Error::new(lit.span(), format!("jq!: {msg}"))
+            .to_compile_error()
+            .into(),
     }
 }

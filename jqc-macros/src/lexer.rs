@@ -40,18 +40,16 @@ pub enum Tok {
     Eof,
 }
 
-pub struct Lexer<'a> {
-    src: &'a str,
+pub struct Lexer {
     chars: Vec<char>,
     pos: usize,
 }
 
 pub type LexResult<T> = Result<T, String>;
 
-impl<'a> Lexer<'a> {
-    pub fn new(src: &'a str) -> Self {
+impl Lexer {
+    pub fn new(src: &str) -> Self {
         Lexer {
-            src,
             chars: src.chars().collect(),
             pos: 0,
         }
@@ -227,7 +225,7 @@ impl<'a> Lexer<'a> {
     }
 
     fn lex_string(&mut self) -> LexResult<Tok> {
-        self.bump(); // opening quote
+        self.bump();
         let mut parts = Vec::new();
         let mut cur = String::new();
         loop {
@@ -287,7 +285,11 @@ impl<'a> Lexer<'a> {
                     // skip over a nested string literal verbatim (including escapes)
                     loop {
                         match self.bump() {
-                            None => return Err("unterminated string literal in interpolation".to_string()),
+                            None => {
+                                return Err(
+                                    "unterminated string literal in interpolation".to_string()
+                                )
+                            }
                             Some('"') => break,
                             Some('\\') => {
                                 self.bump();
@@ -300,9 +302,4 @@ impl<'a> Lexer<'a> {
             }
         }
     }
-}
-
-#[allow(dead_code)]
-pub fn source_text<'a>(l: &Lexer<'a>) -> &'a str {
-    l.src
 }

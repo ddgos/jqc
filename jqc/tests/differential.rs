@@ -19,7 +19,12 @@ fn run_real_jq(filter: &str, input: &str) -> Vec<Value> {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn jq (is it on PATH?)");
-    child.stdin.take().unwrap().write_all(input.as_bytes()).unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.as_bytes())
+        .unwrap();
     let out = child.wait_with_output().unwrap();
     assert!(
         out.status.success(),
@@ -40,7 +45,8 @@ macro_rules! difftest {
         fn $name() {
             let compiled = jqc::jq!($src);
             let input: Value = serde_json::from_str($input).expect("test input must be valid JSON");
-            let got = compiled(&input).unwrap_or_else(|e| panic!("compiled filter {:?} errored: {e}", $src));
+            let got = compiled(&input)
+                .unwrap_or_else(|e| panic!("compiled filter {:?} errored: {e}", $src));
             let want = run_real_jq($src, $input);
             assert_eq!(got, want, "filter {:?} on input {}", $src, $input);
         }
@@ -57,14 +63,24 @@ difftest!(optional_field_err, ".a?", r#"[1,2,3]"#);
 difftest!(index_array, ".[1]", "[10,20,30]");
 difftest!(index_negative, ".[-1]", "[10,20,30]");
 difftest!(index_object_str, r#".["a"]"#, r#"{"a":5}"#);
+difftest!(index_multivalued, "[([10,20],[30,40])[0,1]]", "null");
 difftest!(slice_basic, ".[1:3]", "[0,1,2,3,4]");
 difftest!(slice_open_start, ".[:2]", "[0,1,2,3,4]");
 difftest!(slice_open_end, ".[2:]", "[0,1,2,3,4]");
 difftest!(slice_string, ".[1:3]", r#""abcdef""#);
+difftest!(
+    slice_multivalued,
+    "[([1,2,3,4],[10,20,30,40])[(0,1):(2,3)]]",
+    "null"
+);
 difftest!(iterate_array, ".[]", "[1,2,3]");
 difftest!(iterate_object, ".[]", r#"{"a":1,"b":2}"#);
 difftest!(pipe_basic, ".a | .b", r#"{"a":{"b":7}}"#);
-difftest!(pipe_iterate, ".items[] | .x", r#"{"items":[{"x":1},{"x":2}]}"#);
+difftest!(
+    pipe_iterate,
+    ".items[] | .x",
+    r#"{"items":[{"x":1},{"x":2}]}"#
+);
 difftest!(comma, ".a, .b", r#"{"a":1,"b":2}"#);
 difftest!(comma_cartesian, "(1,2) + (10,20)", "null");
 difftest!(array_construct, "[.a, .b]", r#"{"a":1,"b":2}"#);
@@ -89,12 +105,24 @@ difftest!(neg_number, "-.a", r#"{"a":5}"#);
 difftest!(eq, ".a == .b", r#"{"a":1,"b":1}"#);
 difftest!(ne, ".a != .b", r#"{"a":1,"b":2}"#);
 difftest!(lt, ".a < .b", r#"{"a":1,"b":2}"#);
-difftest!(cmp_mixed_types, "[1, \"a\", null, true, [1], {}] | sort", "null");
+difftest!(
+    cmp_mixed_types,
+    "[1, \"a\", null, true, [1], {}] | sort",
+    "null"
+);
 difftest!(and_short_circuit, ".a and .b", r#"{"a":false,"b":null}"#);
 difftest!(or_short_circuit, ".a or .b", r#"{"a":true,"b":null}"#);
 difftest!(not_builtin, ".a | not", r#"{"a":false}"#);
-difftest!(if_then_else, "if .a > 0 then \"pos\" else \"nonpos\" end", r#"{"a":5}"#);
-difftest!(if_elif, "if .a == 1 then \"one\" elif .a == 2 then \"two\" else \"other\" end", r#"{"a":2}"#);
+difftest!(
+    if_then_else,
+    "if .a > 0 then \"pos\" else \"nonpos\" end",
+    r#"{"a":5}"#
+);
+difftest!(
+    if_elif,
+    "if .a == 1 then \"one\" elif .a == 2 then \"two\" else \"other\" end",
+    r#"{"a":2}"#
+);
 difftest!(if_no_else, "if .a then 1 end", r#"{"a":false}"#);
 difftest!(try_catch, "try error(\"boom\") catch .", r#"null"#);
 difftest!(try_no_catch, "[try error, 1]", r#"null"#);
@@ -112,14 +140,34 @@ difftest!(all_cond, "all(. > 0)", "[1,2,-3]");
 difftest!(recurse_default, "[..]", r#"{"a":[1,2]}"#);
 difftest!(recurse_filter, "[recurse(.a?)]", r#"{"a":{"a":{"a":1}}}"#);
 difftest!(reduce_sum, "reduce .[] as $x (0; . + $x)", "[1,2,3,4]");
-difftest!(foreach_running_sum, "[foreach .[] as $x (0; . + $x)]", "[1,2,3,4]");
-difftest!(foreach_extract, "[foreach .[] as $x (0; . + $x; . * 10)]", "[1,2,3]");
+difftest!(
+    foreach_running_sum,
+    "[foreach .[] as $x (0; . + $x)]",
+    "[1,2,3,4]"
+);
+difftest!(
+    foreach_extract,
+    "[foreach .[] as $x (0; . + $x; . * 10)]",
+    "[1,2,3]"
+);
 difftest!(sort_basic, "sort", "[3,1,2]");
 difftest!(sort_by_field, "sort_by(.a)", r#"[{"a":3},{"a":1},{"a":2}]"#);
-difftest!(sort_by_multi, "sort_by(.a, .b)", r#"[{"a":1,"b":2},{"a":1,"b":1}]"#);
-difftest!(group_by_field, "group_by(.a)", r#"[{"a":1},{"a":2},{"a":1}]"#);
+difftest!(
+    sort_by_multi,
+    "sort_by(.a, .b)",
+    r#"[{"a":1,"b":2},{"a":1,"b":1}]"#
+);
+difftest!(
+    group_by_field,
+    "group_by(.a)",
+    r#"[{"a":1},{"a":2},{"a":1}]"#
+);
 difftest!(unique_basic, "unique", "[3,1,2,1,3]");
-difftest!(unique_by_field, "unique_by(.a)", r#"[{"a":1,"b":1},{"a":1,"b":2},{"a":2,"b":3}]"#);
+difftest!(
+    unique_by_field,
+    "unique_by(.a)",
+    r#"[{"a":1,"b":1},{"a":1,"b":2},{"a":2,"b":3}]"#
+);
 difftest!(min_basic, "min", "[3,1,2]");
 difftest!(max_basic, "max", "[3,1,2]");
 difftest!(min_by_field, "min_by(.a)", r#"[{"a":3},{"a":1},{"a":2}]"#);
@@ -158,16 +206,36 @@ difftest!(string_interp, r#""hello \(.name)!""#, r#"{"name":"world"}"#);
 difftest!(string_interp_multi, r#""\(.a)-\(.b)""#, r#"{"a":1,"b":2}"#);
 difftest!(user_def_simple, "def double: . * 2; double", "21");
 difftest!(user_def_with_param, "def addn(n): . + n; addn(5)", "10");
-difftest!(user_def_filter_param, "def sq(f): f * f; sq(.a)", r#"{"a":4}"#);
-difftest!(user_def_recursive, "def fact: if . <= 1 then 1 else (. - 1 | fact) * . end; fact", "5");
+difftest!(
+    user_def_filter_param,
+    "def sq(f): f * f; sq(.a)",
+    r#"{"a":4}"#
+);
+difftest!(
+    user_def_recursive,
+    "def fact: if . <= 1 then 1 else (. - 1 | fact) * . end; fact",
+    "5"
+);
 difftest!(while_builtin, "[while(. < 100; . * 2)]", "1");
 difftest!(until_builtin, "until(. >= 100; . * 2)", "1");
 difftest!(optional_chain, ".a.b?.c", r#"{"a":1}"#);
-difftest!(array_of_objects, "[.[] | {id: .id, doubled: (.val * 2)}]", r#"[{"id":1,"val":2},{"id":2,"val":3}]"#);
-difftest!(nested_reduce, "[.[] | reduce .[] as $x (0; . + $x)]", "[[1,2],[3,4,5]]");
+difftest!(
+    array_of_objects,
+    "[.[] | {id: .id, doubled: (.val * 2)}]",
+    r#"[{"id":1,"val":2},{"id":2,"val":3}]"#
+);
+difftest!(
+    nested_reduce,
+    "[.[] | reduce .[] as $x (0; . + $x)]",
+    "[[1,2],[3,4,5]]"
+);
 difftest!(empty_filter, "[1, empty, 2]", "null");
 difftest!(as_binding, ". as $x | $x + 1", "41");
-difftest!(as_binding_in_pipe, ".a as $x | .b | . + $x", r#"{"a":1,"b":2}"#);
+difftest!(
+    as_binding_in_pipe,
+    ".a as $x | .b | . + $x",
+    r#"{"a":1,"b":2}"#
+);
 
 #[test]
 fn optional_only_suppresses_its_own_step() {

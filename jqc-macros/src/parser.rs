@@ -1,8 +1,8 @@
 //! Recursive-descent parser producing [`Expr`] from the token stream
 //! produced by [`crate::lexer`].
 
-use crate::ast::{convert_str_parts, BinOp, Expr, ObjEntry};
-use crate::lexer::{Lexer, Tok};
+use crate::ast::{convert_str_parts, str_literal, BinOp, Expr, Param};
+use crate::lexer::{Lexer, StrPart, Tok};
 
 pub type PResult<T> = Result<T, String>;
 
@@ -28,11 +28,13 @@ fn is_keyword(s: &str) -> bool {
 }
 
 pub fn parse_program(src: &str) -> PResult<Expr> {
-    let toks = Lexer::new(src).tokenize().map_err(|e| format!("jq lex error: {e}"))?;
-    let mut p = Parser { toks, pos: 0 };
-    let e = p.parse_pipe()?;
-    p.expect_eof()?;
-    Ok(e)
+    let toks = Lexer::new(src)
+        .tokenize()
+        .map_err(|e| format!("jq lex error: {e}"))?;
+    let mut parser = Parser { toks, pos: 0 };
+    let expr = parser.parse_pipe()?;
+    parser.expect_eof()?;
+    Ok(expr)
 }
 
 /// Used for recursively parsing `\( ... )` string-interpolation bodies.
@@ -119,15 +121,15 @@ impl Parser {
 
     /// `EXPR as $x | BODY`, falling through to plain `or`-level expr.
     fn parse_as_binding(&mut self) -> PResult<Expr> {
-        let e = self.parse_or()?;
+        let expr = self.parse_or()?;
         if self.is_ident("as") {
             self.bump();
             let var = self.expect_var()?;
             self.expect(Tok::Pipe)?;
             let body = self.parse_pipe()?;
-            return Ok(Expr::VarBind(Box::new(e), var, Box::new(body)));
+            return Ok(Expr::VarBind(Box::new(expr), var, Box::new(body)));
         }
-        Ok(e)
+        Ok(expr)
     }
 
     /// Pipe-without-comma, used for object-construction values.
@@ -211,8 +213,8 @@ impl Parser {
     fn parse_unary(&mut self) -> PResult<Expr> {
         if *self.peek() == Tok::Minus {
             self.bump();
-            let e = self.parse_postfix()?;
-            return Ok(Expr::Neg(Box::new(e)));
+            let expr = self.parse_postfix()?;
+            return Ok(Expr::Neg(Box::new(expr)));
         }
         self.parse_postfix()
     }
@@ -230,12 +232,14 @@ impl Parser {
                     }
                     self.bump();
                     match self.bump() {
-                        Tok::Ident(name) => base = Expr::Field(Box::new(base), name, false),
+                        Tok::Ident(name) => base = field(base, name, false),
                         Tok::Str(parts) => {
                             let name = lit_str_only(&parts)?;
-                            base = Expr::Field(Box::new(base), name, false);
+                            base = field(base, name, false);
                         }
-                        other => return Err(format!("expected field name after '.', found {other:?}")),
+                        other => {
+                            return Err(format!("expected field name after '.', found {other:?}"))
+                        }
                     }
                 }
                 Tok::LBracket => {
@@ -252,35 +256,56 @@ impl Parser {
         Ok(base)
     }
 
+    /// Unlike object-construction values, a comma inside `[...]` isn't
+    /// ambiguous with anything -- `]`/`:` are the only terminators -- so
+    /// index/slice-bound expressions use the full `parse_pipe` and
+    /// `.[0,1]`-style comma-generator indices work.
     fn parse_bracket_suffix(&mut self, base: Expr) -> PResult<Expr> {
         if *self.peek() == Tok::RBracket {
             self.bump();
-            return Ok(Expr::IterateAll(Box::new(base), false));
+            return Ok(Expr::IterateAll {
+                base: Box::new(base),
+                optional: false,
+            });
         }
         if *self.peek() == Tok::Colon {
             self.bump();
-            let to = self.parse_pipe_no_comma()?;
+            let to = self.parse_pipe()?;
             self.expect(Tok::RBracket)?;
-            return Ok(Expr::Slice(Box::new(base), None, Some(Box::new(to)), false));
+            return Ok(Expr::Slice {
+                base: Box::new(base),
+                from: None,
+                to: Some(Box::new(to)),
+                optional: false,
+            });
         }
-        let first = self.parse_pipe_no_comma()?;
+        let first = self.parse_pipe()?;
         if *self.peek() == Tok::Colon {
             self.bump();
             if *self.peek() == Tok::RBracket {
                 self.bump();
-                return Ok(Expr::Slice(Box::new(base), Some(Box::new(first)), None, false));
+                return Ok(Expr::Slice {
+                    base: Box::new(base),
+                    from: Some(Box::new(first)),
+                    to: None,
+                    optional: false,
+                });
             }
-            let to = self.parse_pipe_no_comma()?;
+            let to = self.parse_pipe()?;
             self.expect(Tok::RBracket)?;
-            return Ok(Expr::Slice(
-                Box::new(base),
-                Some(Box::new(first)),
-                Some(Box::new(to)),
-                false,
-            ));
+            return Ok(Expr::Slice {
+                base: Box::new(base),
+                from: Some(Box::new(first)),
+                to: Some(Box::new(to)),
+                optional: false,
+            });
         }
         self.expect(Tok::RBracket)?;
-        Ok(Expr::Index(Box::new(base), Box::new(first), false))
+        Ok(Expr::Index {
+            base: Box::new(base),
+            index: Box::new(first),
+            optional: false,
+        })
     }
 
     fn parse_primary(&mut self) -> PResult<Expr> {
@@ -290,12 +315,12 @@ impl Parser {
                 match self.peek().clone() {
                     Tok::Ident(name) if !is_keyword(&name) => {
                         self.bump();
-                        Ok(Expr::Field(Box::new(Expr::Identity), name, false))
+                        Ok(field(Expr::Identity, name, false))
                     }
                     Tok::Str(parts) => {
                         self.bump();
                         let name = lit_str_only(&parts)?;
-                        Ok(Expr::Field(Box::new(Expr::Identity), name, false))
+                        Ok(field(Expr::Identity, name, false))
                     }
                     _ => Ok(Expr::Identity),
                 }
@@ -319,9 +344,9 @@ impl Parser {
             }
             Tok::LParen => {
                 self.bump();
-                let e = self.parse_pipe()?;
+                let expr = self.parse_pipe()?;
                 self.expect(Tok::RParen)?;
-                Ok(e)
+                Ok(expr)
             }
             Tok::LBracket => {
                 self.bump();
@@ -365,6 +390,9 @@ impl Parser {
         }
     }
 
+    /// Call arguments are full filters -- commas inside them are the
+    /// ordinary union/generator operator, not argument separators (`;` is
+    /// the separator) -- so each one is parsed with `parse_pipe`.
     fn parse_call(&mut self, name: String) -> PResult<Expr> {
         self.bump();
         if *self.peek() != Tok::LParen {
@@ -374,7 +402,7 @@ impl Parser {
         let mut args = Vec::new();
         if *self.peek() != Tok::RParen {
             loop {
-                args.push(self.parse_pipe_no_comma_allow_comma_as_union()?);
+                args.push(self.parse_pipe()?);
                 if *self.peek() == Tok::Semi {
                     self.bump();
                     continue;
@@ -386,13 +414,6 @@ impl Parser {
         Ok(Expr::Call(name, args))
     }
 
-    /// Function-call arguments are full filters (commas inside them are the
-    /// ordinary union/generator operator, not argument separators -- `;` is
-    /// the separator), so this is just `parse_pipe`.
-    fn parse_pipe_no_comma_allow_comma_as_union(&mut self) -> PResult<Expr> {
-        self.parse_pipe()
-    }
-
     fn parse_if(&mut self) -> PResult<Expr> {
         self.eat_ident("if")?;
         let mut branches = Vec::new();
@@ -400,16 +421,12 @@ impl Parser {
         self.eat_ident("then")?;
         let then_e = self.parse_pipe()?;
         branches.push((cond, then_e));
-        loop {
-            if self.is_ident("elif") {
-                self.bump();
-                let c = self.parse_pipe()?;
-                self.eat_ident("then")?;
-                let t = self.parse_pipe()?;
-                branches.push((c, t));
-                continue;
-            }
-            break;
+        while self.is_ident("elif") {
+            self.bump();
+            let cond = self.parse_pipe()?;
+            self.eat_ident("then")?;
+            let then_e = self.parse_pipe()?;
+            branches.push((cond, then_e));
         }
         let else_e = if self.is_ident("else") {
             self.bump();
@@ -435,7 +452,7 @@ impl Parser {
 
     fn parse_reduce(&mut self) -> PResult<Expr> {
         self.eat_ident("reduce")?;
-        let src = self.parse_postfix()?;
+        let source = self.parse_postfix()?;
         self.eat_ident("as")?;
         let var = self.expect_var()?;
         self.expect(Tok::LParen)?;
@@ -443,12 +460,17 @@ impl Parser {
         self.expect(Tok::Semi)?;
         let update = self.parse_pipe()?;
         self.expect(Tok::RParen)?;
-        Ok(Expr::Reduce(Box::new(src), var, Box::new(init), Box::new(update)))
+        Ok(Expr::Reduce {
+            source: Box::new(source),
+            var,
+            init: Box::new(init),
+            update: Box::new(update),
+        })
     }
 
     fn parse_foreach(&mut self) -> PResult<Expr> {
         self.eat_ident("foreach")?;
-        let src = self.parse_postfix()?;
+        let source = self.parse_postfix()?;
         self.eat_ident("as")?;
         let var = self.expect_var()?;
         self.expect(Tok::LParen)?;
@@ -462,22 +484,38 @@ impl Parser {
             None
         };
         self.expect(Tok::RParen)?;
-        Ok(Expr::Foreach(Box::new(src), var, Box::new(init), Box::new(update), extract))
+        Ok(Expr::Foreach {
+            source: Box::new(source),
+            var,
+            init: Box::new(init),
+            update: Box::new(update),
+            extract,
+        })
     }
 
     fn parse_def(&mut self) -> PResult<Expr> {
         self.eat_ident("def")?;
         let name = match self.bump() {
             Tok::Ident(n) => n,
-            other => return Err(format!("expected function name after 'def', found {other:?}")),
+            other => {
+                return Err(format!(
+                    "expected function name after 'def', found {other:?}"
+                ))
+            }
         };
         let mut params = Vec::new();
         if *self.peek() == Tok::LParen {
             self.bump();
             loop {
                 match self.bump() {
-                    Tok::Ident(p) => params.push((p, false)),
-                    Tok::Var(p) => params.push((p, true)),
+                    Tok::Ident(name) => params.push(Param {
+                        name,
+                        is_value: false,
+                    }),
+                    Tok::Var(name) => params.push(Param {
+                        name,
+                        is_value: true,
+                    }),
                     other => return Err(format!("expected parameter name, found {other:?}")),
                 }
                 if *self.peek() == Tok::Semi {
@@ -494,7 +532,7 @@ impl Parser {
         let rest = self.parse_pipe()?;
         Ok(Expr::FuncDef {
             name,
-            params: params.into_iter().map(ParamSpec::encode).collect(),
+            params,
             body: Box::new(body),
             rest: Box::new(rest),
         })
@@ -517,7 +555,8 @@ impl Parser {
         Ok(Expr::ObjectConstruct(entries))
     }
 
-    fn parse_obj_entry(&mut self) -> PResult<ObjEntry> {
+    fn parse_obj_entry(&mut self) -> PResult<crate::ast::ObjEntry> {
+        use crate::ast::ObjEntry;
         match self.peek().clone() {
             Tok::Var(name) => {
                 self.bump();
@@ -525,12 +564,12 @@ impl Parser {
                     self.bump();
                     let val = self.parse_pipe_no_comma()?;
                     Ok(ObjEntry {
-                        key: Expr::Str(vec![crate::ast::StrPart::Lit(name)]),
+                        key: str_literal(name),
                         val,
                     })
                 } else {
                     Ok(ObjEntry {
-                        key: Expr::Str(vec![crate::ast::StrPart::Lit(name.clone())]),
+                        key: str_literal(name.clone()),
                         val: Expr::VarRef(name),
                     })
                 }
@@ -541,13 +580,13 @@ impl Parser {
                     self.bump();
                     let val = self.parse_pipe_no_comma()?;
                     Ok(ObjEntry {
-                        key: Expr::Str(vec![crate::ast::StrPart::Lit(name)]),
+                        key: str_literal(name),
                         val,
                     })
                 } else {
                     Ok(ObjEntry {
-                        key: Expr::Str(vec![crate::ast::StrPart::Lit(name.clone())]),
-                        val: Expr::Field(Box::new(Expr::Identity), name, false),
+                        key: str_literal(name.clone()),
+                        val: field(Expr::Identity, name, false),
                     })
                 }
             }
@@ -569,38 +608,50 @@ impl Parser {
                 let val = self.parse_pipe_no_comma()?;
                 Ok(ObjEntry { key, val })
             }
-            other => Err(format!("unexpected token in object construction: {other:?}")),
+            other => Err(format!(
+                "unexpected token in object construction: {other:?}"
+            )),
         }
     }
 }
 
-/// Params are encoded as plain strings prefixed with `$` for value params
-/// so `ast::Expr::FuncDef.params: Vec<String>` doesn't need its own type;
-/// kept local so the AST module stays simple.
-struct ParamSpec;
-impl ParamSpec {
-    fn encode((name, is_val): (String, bool)) -> String {
-        if is_val {
-            format!("${name}")
-        } else {
-            name
-        }
+fn field(base: Expr, name: String, optional: bool) -> Expr {
+    Expr::Field {
+        base: Box::new(base),
+        name,
+        optional,
     }
 }
 
-fn mark_optional(e: Expr) -> Expr {
-    match e {
-        Expr::Field(b, n, _) => Expr::Field(b, n, true),
-        Expr::Index(b, i, _) => Expr::Index(b, i, true),
-        Expr::Slice(b, f, t, _) => Expr::Slice(b, f, t, true),
-        Expr::IterateAll(b, _) => Expr::IterateAll(b, true),
+fn mark_optional(expr: Expr) -> Expr {
+    match expr {
+        Expr::Field { base, name, .. } => Expr::Field {
+            base,
+            name,
+            optional: true,
+        },
+        Expr::Index { base, index, .. } => Expr::Index {
+            base,
+            index,
+            optional: true,
+        },
+        Expr::Slice { base, from, to, .. } => Expr::Slice {
+            base,
+            from,
+            to,
+            optional: true,
+        },
+        Expr::IterateAll { base, .. } => Expr::IterateAll {
+            base,
+            optional: true,
+        },
         other => Expr::Optional(Box::new(other)),
     }
 }
 
-fn lit_str_only(parts: &[crate::lexer::StrPart]) -> PResult<String> {
+fn lit_str_only(parts: &[StrPart]) -> PResult<String> {
     match parts {
-        [crate::lexer::StrPart::Lit(s)] => Ok(s.clone()),
+        [StrPart::Lit(s)] => Ok(s.clone()),
         [] => Ok(String::new()),
         _ => Err("interpolated strings are not allowed as field names".to_string()),
     }

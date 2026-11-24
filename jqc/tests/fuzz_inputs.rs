@@ -52,7 +52,12 @@ fn try_run_real_jq(filter: &str, input: &str) -> Result<Vec<Value>, ()> {
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn jq (is it on PATH?)");
-    child.stdin.take().unwrap().write_all(input.as_bytes()).unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.as_bytes())
+        .unwrap();
     let out = child.wait_with_output().unwrap();
     if !out.status.success() {
         return Err(());

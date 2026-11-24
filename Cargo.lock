@@ -425,6 +425,7 @@ dependencies = [
 name = "jqc-macros"
 version = "0.1.0"
 dependencies = [
+ "criterion",
  "proc-macro2",
  "quote",
  "syn 3.0.10",

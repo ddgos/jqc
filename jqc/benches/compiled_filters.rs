@@ -5,9 +5,9 @@
 //! Run with `cargo bench -p jqc`.
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use std::hint::black_box;
 use jqc::core::{json, Value};
 use jqc::jq;
+use std::hint::black_box;
 
 fn make_items(n: usize) -> Value {
     let items: Vec<Value> = (0..n)
@@ -131,7 +131,12 @@ fn bench_subprocess_jq(c: &mut Criterion) {
                 .stderr(Stdio::null())
                 .spawn()
                 .expect("spawn jq");
-            child.stdin.take().unwrap().write_all(input_str.as_bytes()).unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(input_str.as_bytes())
+                .unwrap();
             black_box(child.wait_with_output().unwrap());
         });
     });

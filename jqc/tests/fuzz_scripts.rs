@@ -65,7 +65,8 @@ struct Scratch {
 impl Scratch {
     fn new() -> Self {
         let dir = PathBuf::from(
-            std::env::var("CLAUDE_JOB_DIR").unwrap_or_else(|_| std::env::temp_dir().display().to_string()),
+            std::env::var("CLAUDE_JOB_DIR")
+                .unwrap_or_else(|_| std::env::temp_dir().display().to_string()),
         )
         .join("tmp/jqc-fuzz-scratch");
         std::fs::create_dir_all(dir.join("src")).unwrap();
@@ -129,7 +130,12 @@ fn run_compiled(bin: &Path, input: &str) -> Result<Vec<Value>, ()> {
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
-    child.stdin.take().unwrap().write_all(input.as_bytes()).unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.as_bytes())
+        .unwrap();
     let out = child.wait_with_output().unwrap();
     if !out.status.success() {
         return Err(());
@@ -151,7 +157,12 @@ fn run_real_jq(filter: &str, input: &str) -> Result<Vec<Value>, ()> {
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn jq");
-    child.stdin.take().unwrap().write_all(input.as_bytes()).unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.as_bytes())
+        .unwrap();
     let out = child.wait_with_output().unwrap();
     if !out.status.success() {
         return Err(());
@@ -198,5 +209,9 @@ fn fuzz_arbitrary_scripts() {
         }
     }
 
-    assert!(failures.is_empty(), "fuzz failures:\n{}", failures.join("\n"));
+    assert!(
+        failures.is_empty(),
+        "fuzz failures:\n{}",
+        failures.join("\n")
+    );
 }

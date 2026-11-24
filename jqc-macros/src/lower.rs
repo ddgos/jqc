@@ -11,7 +11,7 @@
 //! - Mutually-recursive and parameterized-recursive defs are out of scope
 //!   and rejected with a clear error rather than silently miscompiled.
 
-use crate::ast::{Expr, ObjEntry, StrPart};
+use crate::ast::{Expr, ObjEntry, Param, StrPart};
 use crate::parser::parse_program;
 
 pub type LResult<T> = Result<T, String>;
@@ -43,47 +43,60 @@ pub fn parse_and_lower(user_src: &str) -> LResult<Expr> {
 }
 
 #[derive(Clone)]
-enum ParamKind {
-    Filter(String),
-    Value(String),
-}
-
-fn decode_param(p: &str) -> ParamKind {
-    match p.strip_prefix('$') {
-        Some(rest) => ParamKind::Value(rest.to_string()),
-        None => ParamKind::Filter(p.to_string()),
-    }
-}
-
-#[derive(Clone)]
 struct DefEntry {
     name: String,
     arity: usize,
-    params: Vec<ParamKind>,
+    params: Vec<Param>,
     raw_body: Expr,
     def_scope: Vec<DefEntry>,
 }
 
-fn lower(e: Expr, scope: &[DefEntry]) -> LResult<Expr> {
-    match e {
-        Expr::Identity | Expr::Null | Expr::Bool(_) | Expr::Number(_) => Ok(e),
+fn lower(expr: Expr, scope: &[DefEntry]) -> LResult<Expr> {
+    match expr {
+        Expr::Identity | Expr::Null | Expr::Bool(_) | Expr::Number(_) => Ok(expr),
         Expr::RecurseDefault => lower_call("recurse".to_string(), vec![], scope),
-        Expr::VarRef(_) | Expr::RecCall(_) => Ok(e),
-        Expr::Field(b, n, opt) => Ok(Expr::Field(Box::new(lower(*b, scope)?), n, opt)),
-        Expr::Index(b, i, opt) => Ok(Expr::Index(
-            Box::new(lower(*b, scope)?),
-            Box::new(lower(*i, scope)?),
-            opt,
+        Expr::VarRef(_) | Expr::RecCall(_) => Ok(expr),
+        Expr::Field {
+            base,
+            name,
+            optional,
+        } => Ok(Expr::Field {
+            base: Box::new(lower(*base, scope)?),
+            name,
+            optional,
+        }),
+        Expr::Index {
+            base,
+            index,
+            optional,
+        } => Ok(Expr::Index {
+            base: Box::new(lower(*base, scope)?),
+            index: Box::new(lower(*index, scope)?),
+            optional,
+        }),
+        Expr::Slice {
+            base,
+            from,
+            to,
+            optional,
+        } => Ok(Expr::Slice {
+            base: Box::new(lower(*base, scope)?),
+            from: from.map(|e| lower(*e, scope)).transpose()?.map(Box::new),
+            to: to.map(|e| lower(*e, scope)).transpose()?.map(Box::new),
+            optional,
+        }),
+        Expr::IterateAll { base, optional } => Ok(Expr::IterateAll {
+            base: Box::new(lower(*base, scope)?),
+            optional,
+        }),
+        Expr::Pipe(lhs, rhs) => Ok(Expr::Pipe(
+            Box::new(lower(*lhs, scope)?),
+            Box::new(lower(*rhs, scope)?),
         )),
-        Expr::Slice(b, f, t, opt) => Ok(Expr::Slice(
-            Box::new(lower(*b, scope)?),
-            f.map(|x| lower(*x, scope)).transpose()?.map(Box::new),
-            t.map(|x| lower(*x, scope)).transpose()?.map(Box::new),
-            opt,
+        Expr::Comma(lhs, rhs) => Ok(Expr::Comma(
+            Box::new(lower(*lhs, scope)?),
+            Box::new(lower(*rhs, scope)?),
         )),
-        Expr::IterateAll(b, opt) => Ok(Expr::IterateAll(Box::new(lower(*b, scope)?), opt)),
-        Expr::Pipe(a, b) => Ok(Expr::Pipe(Box::new(lower(*a, scope)?), Box::new(lower(*b, scope)?))),
-        Expr::Comma(a, b) => Ok(Expr::Comma(Box::new(lower(*a, scope)?), Box::new(lower(*b, scope)?))),
         Expr::Str(parts) => Ok(Expr::Str(
             parts
                 .into_iter()
@@ -93,9 +106,9 @@ fn lower(e: Expr, scope: &[DefEntry]) -> LResult<Expr> {
                 })
                 .collect::<LResult<Vec<_>>>()?,
         )),
-        Expr::ArrayConstruct(inner) => {
-            Ok(Expr::ArrayConstruct(inner.map(|e| lower(*e, scope)).transpose()?.map(Box::new)))
-        }
+        Expr::ArrayConstruct(inner) => Ok(Expr::ArrayConstruct(
+            inner.map(|e| lower(*e, scope)).transpose()?.map(Box::new),
+        )),
         Expr::ObjectConstruct(entries) => Ok(Expr::ObjectConstruct(
             entries
                 .into_iter()
@@ -108,52 +121,81 @@ fn lower(e: Expr, scope: &[DefEntry]) -> LResult<Expr> {
                 .collect::<LResult<Vec<_>>>()?,
         )),
         Expr::Neg(x) => Ok(Expr::Neg(Box::new(lower(*x, scope)?))),
-        Expr::BinOp(op, a, b) => Ok(Expr::BinOp(op, Box::new(lower(*a, scope)?), Box::new(lower(*b, scope)?))),
-        Expr::And(a, b) => Ok(Expr::And(Box::new(lower(*a, scope)?), Box::new(lower(*b, scope)?))),
-        Expr::Or(a, b) => Ok(Expr::Or(Box::new(lower(*a, scope)?), Box::new(lower(*b, scope)?))),
-        Expr::If(branches, else_e) => Ok(Expr::If(
+        Expr::BinOp(op, lhs, rhs) => Ok(Expr::BinOp(
+            op,
+            Box::new(lower(*lhs, scope)?),
+            Box::new(lower(*rhs, scope)?),
+        )),
+        Expr::And(lhs, rhs) => Ok(Expr::And(
+            Box::new(lower(*lhs, scope)?),
+            Box::new(lower(*rhs, scope)?),
+        )),
+        Expr::Or(lhs, rhs) => Ok(Expr::Or(
+            Box::new(lower(*lhs, scope)?),
+            Box::new(lower(*rhs, scope)?),
+        )),
+        Expr::If(branches, else_branch) => Ok(Expr::If(
             branches
                 .into_iter()
-                .map(|(c, t)| Ok((lower(c, scope)?, lower(t, scope)?)))
+                .map(|(cond, then_e)| Ok((lower(cond, scope)?, lower(then_e, scope)?)))
                 .collect::<LResult<Vec<_>>>()?,
-            else_e.map(|e| lower(*e, scope)).transpose()?.map(Box::new),
+            else_branch
+                .map(|e| lower(*e, scope))
+                .transpose()?
+                .map(Box::new),
         )),
-        Expr::TryCatch(b, c) => Ok(Expr::TryCatch(
-            Box::new(lower(*b, scope)?),
-            c.map(|e| lower(*e, scope)).transpose()?.map(Box::new),
+        Expr::TryCatch(body, catch) => Ok(Expr::TryCatch(
+            Box::new(lower(*body, scope)?),
+            catch.map(|e| lower(*e, scope)).transpose()?.map(Box::new),
         )),
-        Expr::Optional(b) => Ok(Expr::Optional(Box::new(lower(*b, scope)?))),
-        Expr::VarBind(src, name, body) => Ok(Expr::VarBind(
-            Box::new(lower(*src, scope)?),
+        Expr::Optional(body) => Ok(Expr::Optional(Box::new(lower(*body, scope)?))),
+        Expr::VarBind(source, name, body) => Ok(Expr::VarBind(
+            Box::new(lower(*source, scope)?),
             name,
             Box::new(lower(*body, scope)?),
         )),
-        Expr::Reduce(src, var, init, update) => Ok(Expr::Reduce(
-            Box::new(lower(*src, scope)?),
+        Expr::Reduce {
+            source,
             var,
-            Box::new(lower(*init, scope)?),
-            Box::new(lower(*update, scope)?),
-        )),
-        Expr::Foreach(src, var, init, update, extract) => Ok(Expr::Foreach(
-            Box::new(lower(*src, scope)?),
+            init,
+            update,
+        } => Ok(Expr::Reduce {
+            source: Box::new(lower(*source, scope)?),
             var,
-            Box::new(lower(*init, scope)?),
-            Box::new(lower(*update, scope)?),
-            extract.map(|e| lower(*e, scope)).transpose()?.map(Box::new),
-        )),
+            init: Box::new(lower(*init, scope)?),
+            update: Box::new(lower(*update, scope)?),
+        }),
+        Expr::Foreach {
+            source,
+            var,
+            init,
+            update,
+            extract,
+        } => Ok(Expr::Foreach {
+            source: Box::new(lower(*source, scope)?),
+            var,
+            init: Box::new(lower(*init, scope)?),
+            update: Box::new(lower(*update, scope)?),
+            extract: extract.map(|e| lower(*e, scope)).transpose()?.map(Box::new),
+        }),
         Expr::RecFn0 { name, body, rest } => Ok(Expr::RecFn0 {
             name,
             body: Box::new(lower(*body, scope)?),
             rest: Box::new(lower(*rest, scope)?),
         }),
-        Expr::FuncDef { name, params, body, rest } => lower_funcdef(name, params, *body, *rest, scope),
+        Expr::FuncDef {
+            name,
+            params,
+            body,
+            rest,
+        } => lower_funcdef(name, params, *body, *rest, scope),
         Expr::Call(name, args) => lower_call(name, args, scope),
     }
 }
 
 fn lower_funcdef(
     name: String,
-    params: Vec<String>,
+    params: Vec<Param>,
     body: Expr,
     rest: Expr,
     scope: &[DefEntry],
@@ -167,21 +209,19 @@ fn lower_funcdef(
                  (only 0-argument recursive defs can be compiled; try a `reduce`/`foreach` loop instead)"
             ));
         }
-        let renamed_body = rewrite_self_calls(body, &name);
-        let renamed_rest = rewrite_self_calls(rest, &name);
-        let lowered_body = lower(renamed_body, scope)?;
-        let lowered_rest = lower(renamed_rest, scope)?;
+        let body = rewrite_self_calls(body, &name);
+        let rest = rewrite_self_calls(rest, &name);
         return Ok(Expr::RecFn0 {
             name,
-            body: Box::new(lowered_body),
-            rest: Box::new(lowered_rest),
+            body: Box::new(lower(body, scope)?),
+            rest: Box::new(lower(rest, scope)?),
         });
     }
     let mut def_scope = scope.to_vec();
     let entry = DefEntry {
         name,
         arity,
-        params: params.iter().map(|p| decode_param(p)).collect(),
+        params,
         raw_body: body,
         def_scope: def_scope.clone(),
     };
@@ -190,7 +230,11 @@ fn lower_funcdef(
 }
 
 fn lower_call(name: String, args: Vec<Expr>, scope: &[DefEntry]) -> LResult<Expr> {
-    if let Some(entry) = scope.iter().rev().find(|e| e.name == name && e.arity == args.len()) {
+    if let Some(entry) = scope
+        .iter()
+        .rev()
+        .find(|e| e.name == name && e.arity == args.len())
+    {
         // Arguments are filters written at the *call site*, so they must be
         // resolved against the caller's `scope` -- e.g. `map(select(f))`
         // needs `select` visible here, even though `map`'s own def_scope
@@ -199,24 +243,28 @@ fn lower_call(name: String, args: Vec<Expr>, scope: &[DefEntry]) -> LResult<Expr
         // splicing into the callee's body, also makes the substitution
         // idempotent: re-lowering an already-lowered subtree under the
         // callee's def_scope later is a no-op for it.
-        let args = args.into_iter().map(|a| lower(a, scope)).collect::<LResult<Vec<_>>>()?;
+        let args = args
+            .into_iter()
+            .map(|a| lower(a, scope))
+            .collect::<LResult<Vec<_>>>()?;
         let mut specialized = entry.raw_body.clone();
         for (param, arg) in entry.params.iter().zip(args.iter()) {
-            match param {
-                ParamKind::Filter(pname) => {
-                    specialized = subst_call0(specialized, pname, arg);
-                }
-                ParamKind::Value(_) => {}
+            if !param.is_value {
+                specialized = subst_call0(specialized, &param.name, arg);
             }
         }
-        for (param, arg) in entry.params.iter().zip(args.into_iter()).rev() {
-            if let ParamKind::Value(vname) = param {
-                specialized = Expr::VarBind(Box::new(arg), vname.clone(), Box::new(specialized));
+        for (param, arg) in entry.params.iter().zip(args).rev() {
+            if param.is_value {
+                specialized =
+                    Expr::VarBind(Box::new(arg), param.name.clone(), Box::new(specialized));
             }
         }
         return lower(specialized, &entry.def_scope);
     }
-    let lowered_args = args.into_iter().map(|a| lower(a, scope)).collect::<LResult<Vec<_>>>()?;
+    let lowered_args = args
+        .into_iter()
+        .map(|a| lower(a, scope))
+        .collect::<LResult<Vec<_>>>()?;
     Ok(Expr::Call(name, lowered_args))
 }
 
@@ -229,52 +277,97 @@ fn contains_call(expr: &Expr, name: &str, arity: usize) -> bool {
             (n == name && args.len() == arity) || args.iter().any(|a| contains_call(a, name, arity))
         }
         Expr::RecCall(n) => n == name && arity == 0,
-        Expr::Identity | Expr::RecurseDefault | Expr::Null | Expr::Bool(_) | Expr::Number(_) | Expr::VarRef(_) => {
-            false
+        Expr::Identity
+        | Expr::RecurseDefault
+        | Expr::Null
+        | Expr::Bool(_)
+        | Expr::Number(_)
+        | Expr::VarRef(_) => false,
+        Expr::Field { base, .. } | Expr::IterateAll { base, .. } => {
+            contains_call(base, name, arity)
         }
-        Expr::Field(b, _, _) | Expr::IterateAll(b, _) | Expr::Neg(b) | Expr::Optional(b) => {
-            contains_call(b, name, arity)
+        Expr::Neg(x) | Expr::Optional(x) => contains_call(x, name, arity),
+        Expr::Index { base, index, .. } => {
+            contains_call(base, name, arity) || contains_call(index, name, arity)
         }
-        Expr::Index(b, i, _) => contains_call(b, name, arity) || contains_call(i, name, arity),
-        Expr::Slice(b, f, t, _) => {
-            contains_call(b, name, arity)
-                || f.as_ref().map(|x| contains_call(x, name, arity)).unwrap_or(false)
-                || t.as_ref().map(|x| contains_call(x, name, arity)).unwrap_or(false)
+        Expr::Slice { base, from, to, .. } => {
+            contains_call(base, name, arity)
+                || from
+                    .as_deref()
+                    .is_some_and(|x| contains_call(x, name, arity))
+                || to.as_deref().is_some_and(|x| contains_call(x, name, arity))
         }
-        Expr::Pipe(a, b) | Expr::Comma(a, b) | Expr::And(a, b) | Expr::Or(a, b) | Expr::BinOp(_, a, b) => {
-            contains_call(a, name, arity) || contains_call(b, name, arity)
-        }
+        Expr::Pipe(a, b)
+        | Expr::Comma(a, b)
+        | Expr::And(a, b)
+        | Expr::Or(a, b)
+        | Expr::BinOp(_, a, b) => contains_call(a, name, arity) || contains_call(b, name, arity),
         Expr::Str(parts) => parts.iter().any(|p| match p {
             StrPart::Lit(_) => false,
             StrPart::Interp(e) => contains_call(e, name, arity),
         }),
-        Expr::ArrayConstruct(inner) => inner.as_ref().map(|e| contains_call(e, name, arity)).unwrap_or(false),
+        Expr::ArrayConstruct(inner) => inner
+            .as_deref()
+            .is_some_and(|e| contains_call(e, name, arity)),
         Expr::ObjectConstruct(entries) => entries
             .iter()
             .any(|e| contains_call(&e.key, name, arity) || contains_call(&e.val, name, arity)),
-        Expr::If(branches, else_e) => {
-            branches.iter().any(|(c, t)| contains_call(c, name, arity) || contains_call(t, name, arity))
-                || else_e.as_ref().map(|e| contains_call(e, name, arity)).unwrap_or(false)
+        Expr::If(branches, else_branch) => {
+            branches
+                .iter()
+                .any(|(c, t)| contains_call(c, name, arity) || contains_call(t, name, arity))
+                || else_branch
+                    .as_deref()
+                    .is_some_and(|e| contains_call(e, name, arity))
         }
-        Expr::TryCatch(b, c) => {
-            contains_call(b, name, arity) || c.as_ref().map(|e| contains_call(e, name, arity)).unwrap_or(false)
+        Expr::TryCatch(body, catch) => {
+            contains_call(body, name, arity)
+                || catch
+                    .as_deref()
+                    .is_some_and(|e| contains_call(e, name, arity))
         }
-        Expr::VarBind(src, _, body) => contains_call(src, name, arity) || contains_call(body, name, arity),
-        Expr::Reduce(src, _, init, update) => {
-            contains_call(src, name, arity) || contains_call(init, name, arity) || contains_call(update, name, arity)
+        Expr::VarBind(source, _, body) => {
+            contains_call(source, name, arity) || contains_call(body, name, arity)
         }
-        Expr::Foreach(src, _, init, update, extract) => {
-            contains_call(src, name, arity)
+        Expr::Reduce {
+            source,
+            init,
+            update,
+            ..
+        } => {
+            contains_call(source, name, arity)
                 || contains_call(init, name, arity)
                 || contains_call(update, name, arity)
-                || extract.as_ref().map(|e| contains_call(e, name, arity)).unwrap_or(false)
         }
-        Expr::FuncDef { name: n2, params, body, rest } => {
-            let shadowed = n2 == name && params.len() == arity;
+        Expr::Foreach {
+            source,
+            init,
+            update,
+            extract,
+            ..
+        } => {
+            contains_call(source, name, arity)
+                || contains_call(init, name, arity)
+                || contains_call(update, name, arity)
+                || extract
+                    .as_deref()
+                    .is_some_and(|e| contains_call(e, name, arity))
+        }
+        Expr::FuncDef {
+            name: inner_name,
+            params,
+            body,
+            rest,
+        } => {
+            let shadowed = inner_name == name && params.len() == arity;
             (!shadowed && contains_call(body, name, arity)) || contains_call(rest, name, arity)
         }
-        Expr::RecFn0 { name: n2, body, rest } => {
-            let shadowed = n2 == name && arity == 0;
+        Expr::RecFn0 {
+            name: inner_name,
+            body,
+            rest,
+        } => {
+            let shadowed = inner_name == name && arity == 0;
             (!shadowed && contains_call(body, name, arity)) || contains_call(rest, name, arity)
         }
     }
@@ -283,32 +376,24 @@ fn contains_call(expr: &Expr, name: &str, arity: usize) -> bool {
 /// Replace every 0-arg `Call(name, [])` in `expr` with `RecCall(name)`,
 /// marking it as a call to the recursive function currently being compiled.
 fn rewrite_self_calls(expr: Expr, name: &str) -> Expr {
-    map_expr(expr, &mut |e| match e {
-        Expr::Call(n, args) if n == name && args.is_empty() => Some(Expr::RecCall(n.clone())),
-        _ => None,
-    })
+    rewrite_call0(expr, name, &mut || Expr::RecCall(name.to_string()))
 }
 
 /// Replace every 0-arg `Call(pname, [])` in `expr` with a fresh clone of
 /// `replacement` (call-by-name filter-argument substitution).
 fn subst_call0(expr: Expr, pname: &str, replacement: &Expr) -> Expr {
-    map_expr(expr, &mut |e| match e {
-        Expr::Call(n, args) if n == pname && args.is_empty() => Some(replacement.clone()),
-        _ => None,
-    })
+    rewrite_call0(expr, pname, &mut || replacement.clone())
 }
 
-/// Generic structural rewrite: applies `f` at every node (pre-order); if `f`
-/// returns `Some`, that replaces the node and its children are NOT
-/// traversed further. Stops descending into nested `def`/recursive-fn
-/// bodies that redefine the name being targeted is the caller's
-/// responsibility via `f` returning `None` but leaving the subtree alone --
-/// callers here only ever target 0-arg plain identifiers, which can't be
-/// legally shadowed by anything except another `def` of the same name, so
-/// we special-case `FuncDef`/`RecFn0` to skip their `body` when shadowed.
-fn map_expr(expr: Expr, f: &mut dyn FnMut(&Expr) -> Option<Expr>) -> Expr {
-    if let Some(replacement) = f(&expr) {
-        return replacement;
+/// Shared walk for [`rewrite_self_calls`] and [`subst_call0`]: replaces
+/// every 0-arg `Call(target, [])` in `expr` with `build()`, without
+/// recursing into the replacement. Both callers only ever target a plain
+/// 0-arg identifier, so a nested `def`/recursive-fn that redefines `target`
+/// (necessarily also at arity 0) shadows it -- `target`'s body is left
+/// untouched in that case, since those calls refer to the inner def.
+fn rewrite_call0(expr: Expr, target: &str, build: &mut dyn FnMut() -> Expr) -> Expr {
+    if matches!(&expr, Expr::Call(n, args) if n == target && args.is_empty()) {
+        return build();
     }
     match expr {
         e @ (Expr::Identity
@@ -318,75 +403,167 @@ fn map_expr(expr: Expr, f: &mut dyn FnMut(&Expr) -> Option<Expr>) -> Expr {
         | Expr::Number(_)
         | Expr::VarRef(_)
         | Expr::RecCall(_)) => e,
-        Expr::Field(b, n, opt) => Expr::Field(Box::new(map_expr(*b, f)), n, opt),
-        Expr::Index(b, i, opt) => Expr::Index(Box::new(map_expr(*b, f)), Box::new(map_expr(*i, f)), opt),
-        Expr::Slice(b, lo, hi, opt) => Expr::Slice(
-            Box::new(map_expr(*b, f)),
-            lo.map(|x| Box::new(map_expr(*x, f))),
-            hi.map(|x| Box::new(map_expr(*x, f))),
-            opt,
+        Expr::Field {
+            base,
+            name,
+            optional,
+        } => Expr::Field {
+            base: Box::new(rewrite_call0(*base, target, build)),
+            name,
+            optional,
+        },
+        Expr::Index {
+            base,
+            index,
+            optional,
+        } => Expr::Index {
+            base: Box::new(rewrite_call0(*base, target, build)),
+            index: Box::new(rewrite_call0(*index, target, build)),
+            optional,
+        },
+        Expr::Slice {
+            base,
+            from,
+            to,
+            optional,
+        } => Expr::Slice {
+            base: Box::new(rewrite_call0(*base, target, build)),
+            from: from.map(|x| Box::new(rewrite_call0(*x, target, build))),
+            to: to.map(|x| Box::new(rewrite_call0(*x, target, build))),
+            optional,
+        },
+        Expr::IterateAll { base, optional } => Expr::IterateAll {
+            base: Box::new(rewrite_call0(*base, target, build)),
+            optional,
+        },
+        Expr::Pipe(a, b) => Expr::Pipe(
+            Box::new(rewrite_call0(*a, target, build)),
+            Box::new(rewrite_call0(*b, target, build)),
         ),
-        Expr::IterateAll(b, opt) => Expr::IterateAll(Box::new(map_expr(*b, f)), opt),
-        Expr::Pipe(a, b) => Expr::Pipe(Box::new(map_expr(*a, f)), Box::new(map_expr(*b, f))),
-        Expr::Comma(a, b) => Expr::Comma(Box::new(map_expr(*a, f)), Box::new(map_expr(*b, f))),
+        Expr::Comma(a, b) => Expr::Comma(
+            Box::new(rewrite_call0(*a, target, build)),
+            Box::new(rewrite_call0(*b, target, build)),
+        ),
         Expr::Str(parts) => Expr::Str(
             parts
                 .into_iter()
                 .map(|p| match p {
                     StrPart::Lit(s) => StrPart::Lit(s),
-                    StrPart::Interp(e) => StrPart::Interp(Box::new(map_expr(*e, f))),
+                    StrPart::Interp(e) => {
+                        StrPart::Interp(Box::new(rewrite_call0(*e, target, build)))
+                    }
                 })
                 .collect(),
         ),
-        Expr::ArrayConstruct(inner) => Expr::ArrayConstruct(inner.map(|e| Box::new(map_expr(*e, f)))),
+        Expr::ArrayConstruct(inner) => {
+            Expr::ArrayConstruct(inner.map(|e| Box::new(rewrite_call0(*e, target, build))))
+        }
         Expr::ObjectConstruct(entries) => Expr::ObjectConstruct(
             entries
                 .into_iter()
                 .map(|ObjEntry { key, val }| ObjEntry {
-                    key: map_expr(key, f),
-                    val: map_expr(val, f),
+                    key: rewrite_call0(key, target, build),
+                    val: rewrite_call0(val, target, build),
                 })
                 .collect(),
         ),
-        Expr::Neg(x) => Expr::Neg(Box::new(map_expr(*x, f))),
-        Expr::BinOp(op, a, b) => Expr::BinOp(op, Box::new(map_expr(*a, f)), Box::new(map_expr(*b, f))),
-        Expr::And(a, b) => Expr::And(Box::new(map_expr(*a, f)), Box::new(map_expr(*b, f))),
-        Expr::Or(a, b) => Expr::Or(Box::new(map_expr(*a, f)), Box::new(map_expr(*b, f))),
-        Expr::If(branches, else_e) => Expr::If(
-            branches.into_iter().map(|(c, t)| (map_expr(c, f), map_expr(t, f))).collect(),
-            else_e.map(|e| Box::new(map_expr(*e, f))),
+        Expr::Neg(x) => Expr::Neg(Box::new(rewrite_call0(*x, target, build))),
+        Expr::BinOp(op, a, b) => Expr::BinOp(
+            op,
+            Box::new(rewrite_call0(*a, target, build)),
+            Box::new(rewrite_call0(*b, target, build)),
         ),
-        Expr::TryCatch(b, c) => Expr::TryCatch(Box::new(map_expr(*b, f)), c.map(|e| Box::new(map_expr(*e, f)))),
-        Expr::Optional(b) => Expr::Optional(Box::new(map_expr(*b, f))),
-        Expr::VarBind(src, name, body) => {
-            Expr::VarBind(Box::new(map_expr(*src, f)), name, Box::new(map_expr(*body, f)))
-        }
-        Expr::Reduce(src, var, init, update) => Expr::Reduce(
-            Box::new(map_expr(*src, f)),
+        Expr::And(a, b) => Expr::And(
+            Box::new(rewrite_call0(*a, target, build)),
+            Box::new(rewrite_call0(*b, target, build)),
+        ),
+        Expr::Or(a, b) => Expr::Or(
+            Box::new(rewrite_call0(*a, target, build)),
+            Box::new(rewrite_call0(*b, target, build)),
+        ),
+        Expr::If(branches, else_branch) => Expr::If(
+            branches
+                .into_iter()
+                .map(|(c, t)| {
+                    (
+                        rewrite_call0(c, target, build),
+                        rewrite_call0(t, target, build),
+                    )
+                })
+                .collect(),
+            else_branch.map(|e| Box::new(rewrite_call0(*e, target, build))),
+        ),
+        Expr::TryCatch(body, catch) => Expr::TryCatch(
+            Box::new(rewrite_call0(*body, target, build)),
+            catch.map(|e| Box::new(rewrite_call0(*e, target, build))),
+        ),
+        Expr::Optional(body) => Expr::Optional(Box::new(rewrite_call0(*body, target, build))),
+        Expr::VarBind(source, name, body) => Expr::VarBind(
+            Box::new(rewrite_call0(*source, target, build)),
+            name,
+            Box::new(rewrite_call0(*body, target, build)),
+        ),
+        Expr::Reduce {
+            source,
             var,
-            Box::new(map_expr(*init, f)),
-            Box::new(map_expr(*update, f)),
-        ),
-        Expr::Foreach(src, var, init, update, extract) => Expr::Foreach(
-            Box::new(map_expr(*src, f)),
+            init,
+            update,
+        } => Expr::Reduce {
+            source: Box::new(rewrite_call0(*source, target, build)),
             var,
-            Box::new(map_expr(*init, f)),
-            Box::new(map_expr(*update, f)),
-            extract.map(|e| Box::new(map_expr(*e, f))),
+            init: Box::new(rewrite_call0(*init, target, build)),
+            update: Box::new(rewrite_call0(*update, target, build)),
+        },
+        Expr::Foreach {
+            source,
+            var,
+            init,
+            update,
+            extract,
+        } => Expr::Foreach {
+            source: Box::new(rewrite_call0(*source, target, build)),
+            var,
+            init: Box::new(rewrite_call0(*init, target, build)),
+            update: Box::new(rewrite_call0(*update, target, build)),
+            extract: extract.map(|e| Box::new(rewrite_call0(*e, target, build))),
+        },
+        Expr::Call(n, args) => Expr::Call(
+            n,
+            args.into_iter()
+                .map(|a| rewrite_call0(a, target, build))
+                .collect(),
         ),
-        Expr::Call(n, args) => Expr::Call(n, args.into_iter().map(|a| map_expr(a, f)).collect()),
-        Expr::FuncDef { name, params, body, rest } => {
-            let new_body = *body; // shadowing of the substitution target inside nested defs is a
-                                   // rare edge case we accept as a known limitation; always descend.
+        Expr::FuncDef {
+            name,
+            params,
+            body,
+            rest,
+        } => {
+            let shadowed = name == target && params.is_empty();
+            let body = if shadowed {
+                body
+            } else {
+                Box::new(rewrite_call0(*body, target, build))
+            };
             Expr::FuncDef {
                 name,
                 params,
-                body: Box::new(map_expr(new_body, f)),
-                rest: Box::new(map_expr(*rest, f)),
+                body,
+                rest: Box::new(rewrite_call0(*rest, target, build)),
             }
         }
         Expr::RecFn0 { name, body, rest } => {
-            Expr::RecFn0 { name, body: Box::new(map_expr(*body, f)), rest: Box::new(map_expr(*rest, f)) }
+            let shadowed = name == target;
+            let body = if shadowed {
+                body
+            } else {
+                Box::new(rewrite_call0(*body, target, build))
+            };
+            Expr::RecFn0 {
+                name,
+                body,
+                rest: Box::new(rewrite_call0(*rest, target, build)),
+            }
         }
     }
 }

@@ -42,7 +42,7 @@ pub fn number_from_f64(f: f64) -> Number {
 
 /// jq's total ordering over JSON values: null < false < true < numbers <
 /// strings < arrays < objects.
-pub fn cmp_values(a: &Value, b: &Value) -> Ordering {
+pub fn cmp_values(lhs: &Value, rhs: &Value) -> Ordering {
     fn rank(v: &Value) -> u8 {
         match v {
             Value::Null => 0,
@@ -54,7 +54,7 @@ pub fn cmp_values(a: &Value, b: &Value) -> Ordering {
             Value::Object(_) => 6,
         }
     }
-    match (a, b) {
+    match (lhs, rhs) {
         (Value::Null, Value::Null) => Ordering::Equal,
         (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
         (Value::Number(x), Value::Number(y)) => num_f64(x)
@@ -86,29 +86,29 @@ pub fn cmp_values(a: &Value, b: &Value) -> Ordering {
             }
             Ordering::Equal
         }
-        _ => rank(a).cmp(&rank(b)),
+        _ => rank(lhs).cmp(&rank(rhs)),
     }
 }
 
-pub fn eq_values(a: &Value, b: &Value) -> bool {
-    cmp_values(a, b) == Ordering::Equal
+pub fn eq_values(lhs: &Value, rhs: &Value) -> bool {
+    cmp_values(lhs, rhs) == Ordering::Equal
 }
 
-fn type_err(op: &str, a: &Value, b: &Value) -> JqError {
+fn type_err(op: &str, lhs: &Value, rhs: &Value) -> JqError {
     JqError::msg(format!(
         "{} ({}) and {} ({}) cannot be {}",
-        type_name(a),
-        a,
-        type_name(b),
-        b,
+        type_name(lhs),
+        lhs,
+        type_name(rhs),
+        rhs,
         op
     ))
 }
 
 /// jq's `+` operator: null-absorbing, numeric add, string/array
 /// concatenation, shallow object merge (right-biased).
-pub fn add_values(a: Value, b: Value) -> JResult<Value> {
-    Ok(match (a, b) {
+pub fn add_values(lhs: Value, rhs: Value) -> JResult<Value> {
+    Ok(match (lhs, rhs) {
         (Value::Null, x) | (x, Value::Null) => x,
         (Value::Number(x), Value::Number(y)) => {
             Value::Number(number_from_f64(num_f64(&x) + num_f64(&y)))
@@ -124,24 +124,24 @@ pub fn add_values(a: Value, b: Value) -> JResult<Value> {
             }
             Value::Object(x)
         }
-        (a, b) => return Err(type_err("added", &a, &b)),
+        (lhs, rhs) => return Err(type_err("added", &lhs, &rhs)),
     })
 }
 
-pub fn sub_values(a: Value, b: Value) -> JResult<Value> {
-    Ok(match (&a, &b) {
+pub fn sub_values(lhs: Value, rhs: Value) -> JResult<Value> {
+    Ok(match (&lhs, &rhs) {
         (Value::Number(x), Value::Number(y)) => {
             Value::Number(number_from_f64(num_f64(x) - num_f64(y)))
         }
         (Value::Array(x), Value::Array(y)) => {
             Value::Array(x.iter().filter(|e| !y.contains(e)).cloned().collect())
         }
-        _ => return Err(type_err("subtracted", &a, &b)),
+        _ => return Err(type_err("subtracted", &lhs, &rhs)),
     })
 }
 
-pub fn mul_values(a: Value, b: Value) -> JResult<Value> {
-    Ok(match (&a, &b) {
+pub fn mul_values(lhs: Value, rhs: Value) -> JResult<Value> {
+    Ok(match (&lhs, &rhs) {
         (Value::Number(x), Value::Number(y)) => {
             Value::Number(number_from_f64(num_f64(x) * num_f64(y)))
         }
@@ -153,13 +153,13 @@ pub fn mul_values(a: Value, b: Value) -> JResult<Value> {
                 Value::String(s.repeat(n as usize))
             }
         }
-        (Value::Object(_), Value::Object(_)) => deep_merge(a, b),
-        _ => return Err(type_err("multiplied", &a, &b)),
+        (Value::Object(_), Value::Object(_)) => deep_merge(lhs, rhs),
+        _ => return Err(type_err("multiplied", &lhs, &rhs)),
     })
 }
 
-fn deep_merge(a: Value, b: Value) -> Value {
-    match (a, b) {
+fn deep_merge(lhs: Value, rhs: Value) -> Value {
+    match (lhs, rhs) {
         (Value::Object(mut x), Value::Object(y)) => {
             for (k, v) in y {
                 let merged = match x.remove(&k) {
@@ -170,16 +170,18 @@ fn deep_merge(a: Value, b: Value) -> Value {
             }
             Value::Object(x)
         }
-        (_, b) => b,
+        (_, rhs) => rhs,
     }
 }
 
-pub fn div_values(a: Value, b: Value) -> JResult<Value> {
-    Ok(match (&a, &b) {
+pub fn div_values(lhs: Value, rhs: Value) -> JResult<Value> {
+    Ok(match (&lhs, &rhs) {
         (Value::Number(x), Value::Number(y)) => {
             let yv = num_f64(y);
             if yv == 0.0 {
-                return Err(JqError::msg(format!("{a} and {b} cannot be divided because the divisor is zero")));
+                return Err(JqError::msg(format!(
+                    "{lhs} and {rhs} cannot be divided because the divisor is zero"
+                )));
             }
             Value::Number(number_from_f64(num_f64(x) / yv))
         }
@@ -188,29 +190,29 @@ pub fn div_values(a: Value, b: Value) -> JResult<Value> {
                 .map(|s| Value::String(s.to_string()))
                 .collect(),
         ),
-        _ => return Err(type_err("divided", &a, &b)),
+        _ => return Err(type_err("divided", &lhs, &rhs)),
     })
 }
 
-pub fn mod_values(a: Value, b: Value) -> JResult<Value> {
-    Ok(match (&a, &b) {
+pub fn mod_values(lhs: Value, rhs: Value) -> JResult<Value> {
+    Ok(match (&lhs, &rhs) {
         (Value::Number(x), Value::Number(y)) => {
             let yi = num_f64(y).trunc() as i64;
             if yi == 0 {
-                return Err(JqError::msg(format!("{a} and {b} cannot be divided because the divisor is zero")));
+                return Err(JqError::msg(format!(
+                    "{lhs} and {rhs} cannot be divided because the divisor is zero"
+                )));
             }
             let xi = num_f64(x).trunc() as i64;
             Value::Number(Number::from(xi % yi))
         }
-        _ => return Err(type_err("divided", &a, &b)),
+        _ => return Err(type_err("divided", &lhs, &rhs)),
     })
 }
 
-pub fn neg_value(a: Value) -> JResult<Value> {
-    match a {
-        Value::Number(n) => Ok(Value::Number(
-            number_from_f64(-num_f64(&n)),
-        )),
+pub fn neg_value(v: Value) -> JResult<Value> {
+    match v {
+        Value::Number(n) => Ok(Value::Number(number_from_f64(-num_f64(&n)))),
         other => Err(JqError::msg(format!(
             "{} ({}) cannot be negated",
             type_name(&other),
@@ -313,7 +315,13 @@ pub fn iterate(v: &Value) -> JResult<Vec<Value>> {
 pub fn length_of(v: &Value) -> JResult<Value> {
     Ok(match v {
         Value::Null => Value::Number(Number::from(0)),
-        Value::Bool(_) => return Err(JqError::msg(format!("{} ({}) has no length", type_name(v), v))),
+        Value::Bool(_) => {
+            return Err(JqError::msg(format!(
+                "{} ({}) has no length",
+                type_name(v),
+                v
+            )))
+        }
         Value::Number(n) => Value::Number(number_from_f64(num_f64(n).abs())),
         Value::String(s) => Value::Number(Number::from(s.chars().count() as i64)),
         Value::Array(a) => Value::Number(Number::from(a.len() as i64)),
@@ -331,7 +339,9 @@ pub fn keys_of(v: &Value, sorted: bool) -> JResult<Value> {
             Ok(Value::Array(ks.into_iter().map(Value::String).collect()))
         }
         Value::Array(a) => Ok(Value::Array(
-            (0..a.len() as i64).map(|i| Value::Number(Number::from(i))).collect(),
+            (0..a.len() as i64)
+                .map(|i| Value::Number(Number::from(i)))
+                .collect(),
         )),
         other => Err(JqError::msg(format!(
             "{} ({}) has no keys",
@@ -473,7 +483,10 @@ pub fn range_values(from: f64, to: f64, step: f64) -> Vec<Value> {
 pub fn value_to_f64(v: &Value) -> JResult<f64> {
     match v {
         Value::Number(n) => Ok(num_f64(n)),
-        other => Err(JqError::msg(format!("{} is not a number", type_name(other)))),
+        other => Err(JqError::msg(format!(
+            "{} is not a number",
+            type_name(other)
+        ))),
     }
 }
 
@@ -484,22 +497,30 @@ pub fn value_to_i64(v: &Value) -> JResult<i64> {
 pub fn as_array(v: &Value) -> JResult<&Vec<Value>> {
     match v {
         Value::Array(a) => Ok(a),
-        other => Err(JqError::msg(format!("{} is not an array", type_name(other)))),
+        other => Err(JqError::msg(format!(
+            "{} is not an array",
+            type_name(other)
+        ))),
     }
 }
 
 pub fn as_str(v: &Value) -> JResult<&str> {
     match v {
         Value::String(s) => Ok(s),
-        other => Err(JqError::msg(format!("{} is not a string", type_name(other)))),
+        other => Err(JqError::msg(format!(
+            "{} is not a string",
+            type_name(other)
+        ))),
     }
 }
 
-pub fn contains_value(a: &Value, b: &Value) -> JResult<bool> {
-    Ok(match (a, b) {
-        (Value::Object(x), Value::Object(y)) => y
-            .iter()
-            .all(|(k, yv)| x.get(k).map(|xv| contains_value(xv, yv).unwrap_or(false)).unwrap_or(false)),
+pub fn contains_value(lhs: &Value, rhs: &Value) -> JResult<bool> {
+    Ok(match (lhs, rhs) {
+        (Value::Object(x), Value::Object(y)) => y.iter().all(|(k, yv)| {
+            x.get(k)
+                .map(|xv| contains_value(xv, yv).unwrap_or(false))
+                .unwrap_or(false)
+        }),
         (Value::Array(x), Value::Array(y)) => y
             .iter()
             .all(|yv| x.iter().any(|xv| contains_value(xv, yv).unwrap_or(false))),
@@ -565,7 +586,9 @@ pub fn split_string(v: &Value, sep: &Value) -> JResult<Value> {
 pub fn explode(v: &Value) -> JResult<Value> {
     let s = as_str(v)?;
     Ok(Value::Array(
-        s.chars().map(|c| Value::Number(Number::from(c as u32))).collect(),
+        s.chars()
+            .map(|c| Value::Number(Number::from(c as u32)))
+            .collect(),
     ))
 }
 
@@ -612,16 +635,20 @@ pub fn to_number_value(v: &Value) -> JResult<Value> {
             .ok()
             .map(|f| Value::Number(number_from_f64(f)))
             .ok_or_else(|| JqError::msg(format!("Cannot parse '{s}' as number"))),
-        other => Err(JqError::msg(format!("Cannot parse {} as number", type_name(other)))),
+        other => Err(JqError::msg(format!(
+            "Cannot parse {} as number",
+            type_name(other)
+        ))),
     }
 }
 
 fn num_unary(v: &Value, f: impl Fn(f64) -> f64) -> JResult<Value> {
     match v {
-        Value::Number(n) => Ok(Value::Number(
-            number_from_f64(f(num_f64(n))),
-        )),
-        other => Err(JqError::msg(format!("{} is not a number", type_name(other)))),
+        Value::Number(n) => Ok(Value::Number(number_from_f64(f(num_f64(n))))),
+        other => Err(JqError::msg(format!(
+            "{} is not a number",
+            type_name(other)
+        ))),
     }
 }
 
@@ -647,10 +674,19 @@ pub fn fabs_value(v: &Value) -> JResult<Value> {
 
 /// Builds a jq object-construction entry; used by generated code for both
 /// `{key: val}` and shorthand `{key}` / `{$var}` forms.
-pub fn object_insert(mut m: Map<String, Value>, key: Value, val: Value) -> JResult<Map<String, Value>> {
+pub fn object_insert(
+    mut m: Map<String, Value>,
+    key: Value,
+    val: Value,
+) -> JResult<Map<String, Value>> {
     let k = match key {
         Value::String(s) => s,
-        other => return Err(JqError::msg(format!("Object keys must be strings, got {}", type_name(&other)))),
+        other => {
+            return Err(JqError::msg(format!(
+                "Object keys must be strings, got {}",
+                type_name(&other)
+            )))
+        }
     };
     m.insert(k, val);
     Ok(m)

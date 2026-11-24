@@ -9,10 +9,6 @@ git. Do these in whichever order makes the most sense.
 
 ## Tasks
 
-Analyse the current state of the code, and finish up the refactor that is taking
-place. Commit to keep the working tree clean. This should be the first task now
-that the typst document prep is done.
-
 Add safeguards around the more memory intensive tests to ensure that the test
 fails before the test uses a certain amount of memory on the machine it is
 running on. Set this limit to 64GB by default on this machine. Complete this

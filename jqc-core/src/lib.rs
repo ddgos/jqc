@@ -12,7 +12,3 @@ mod helpers;
 pub use error::{JResult, JqError};
 pub use helpers::*;
 pub use serde_json::{json, Map, Number, Value};
-
-/// A compiled filter: given one input value, produces the (possibly empty,
-/// possibly multi-valued) stream of outputs, eagerly collected into a Vec.
-pub type Filter = dyn Fn(&Value) -> JResult<Vec<Value>>;
