@@ -1,0 +1,24 @@
+[package]
+name = "jqc-compiler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "jq filter lex/parse/lower/codegen pipeline as a plain library (jqc-macros wraps this in a proc macro; other crates, e.g. a test generator, can call it directly)"
+
+[dependencies]
+proc-macro2 = "1"
+quote = "1"
+
+[dev-dependencies]
+criterion = "0.8"
+libc = "0.2"
+
+[features]
+default = ["jq-1-8"]
+# Which jq language-version semantics are available for a `jq!(version =
+# "...", ...)` call to select (see src/version.rs). Not mutually
+# exclusive -- enable more than one to support multiple versions in the
+# same build.
+jq-1-6 = []
+jq-1-7 = []
+jq-1-8 = []

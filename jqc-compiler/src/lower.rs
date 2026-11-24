@@ -15,6 +15,7 @@ use std::rc::Rc;
 
 use crate::ast::{Expr, ObjEntry, Param, StrPart};
 use crate::parser::parse_program;
+use crate::version::JqVersion;
 
 pub type LResult<T> = Result<T, String>;
 
@@ -38,9 +39,9 @@ def not: if . then false else true end;
 def error(msg): msg | error;
 "#;
 
-pub fn parse_and_lower(user_src: &str) -> LResult<Expr> {
+pub fn parse_and_lower(user_src: &str, version: JqVersion) -> LResult<Expr> {
     let full = format!("{PRELUDE}\n({user_src}\n)");
-    let ast = parse_program(&full).map_err(|e| format!("jq parse error: {e}"))?;
+    let ast = parse_program(&full, version).map_err(|e| format!("jq parse error: {e}"))?;
     lower(ast, &[])
 }
 
@@ -581,8 +582,10 @@ mod tests {
 
     #[test]
     fn prelude_parses() {
-        if let Err(e) = parse_and_lower(".") {
-            panic!("{e}");
+        for version in JqVersion::ALL.into_iter().filter(|v| v.is_available()) {
+            if let Err(e) = parse_and_lower(".", version) {
+                panic!("prelude failed to parse under jq {}: {e}", version.as_str());
+            }
         }
     }
 }

@@ -407,6 +407,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "jqc-compiler"
+version = "0.1.0"
+dependencies = [
+ "criterion",
+ "libc",
+ "proc-macro2",
+ "quote",
+]
+
+[[package]]
 name = "jqc-core"
 version = "0.1.0"
 dependencies = [
@@ -425,10 +435,8 @@ dependencies = [
 name = "jqc-macros"
 version = "0.1.0"
 dependencies = [
- "criterion",
- "libc",
+ "jqc-compiler",
  "proc-macro2",
- "quote",
  "syn 3.0.10",
 ]
 

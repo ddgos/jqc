@@ -10,9 +10,8 @@
 //! safe across sibling/nested calls (ordinary Rust block scoping keeps them
 //! from colliding) and no fresh-name counter is needed.
 
-use proc_macro2::TokenStream;
+use proc_macro2::{Ident, TokenStream};
 use quote::{format_ident, quote};
-use syn::Ident;
 
 use crate::ast::{BinOp, Expr, ObjEntry, StrPart};
 

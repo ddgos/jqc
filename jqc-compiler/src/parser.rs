@@ -3,6 +3,7 @@
 
 use crate::ast::{convert_str_parts, str_literal, BinOp, Expr, Param};
 use crate::lexer::{Lexer, StrPart, Tok};
+use crate::version::JqVersion;
 
 pub type PResult<T> = Result<T, String>;
 
@@ -27,24 +28,30 @@ fn is_keyword(s: &str) -> bool {
     )
 }
 
-pub fn parse_program(src: &str) -> PResult<Expr> {
+pub fn parse_program(src: &str, version: JqVersion) -> PResult<Expr> {
     let toks = Lexer::new(src)
         .tokenize()
         .map_err(|e| format!("jq lex error: {e}"))?;
-    let mut parser = Parser { toks, pos: 0 };
+    let mut parser = Parser {
+        toks,
+        pos: 0,
+        version,
+    };
     let expr = parser.parse_pipe()?;
     parser.expect_eof()?;
     Ok(expr)
 }
 
-/// Used for recursively parsing `\( ... )` string-interpolation bodies.
-fn parse_sub_expr(src: &str) -> Result<Expr, String> {
-    parse_program(src)
+/// Used for recursively parsing `\( ... )` string-interpolation bodies,
+/// which must target the same version as the enclosing parse.
+fn parse_sub_expr(src: &str, version: JqVersion) -> Result<Expr, String> {
+    parse_program(src, version)
 }
 
 struct Parser {
     toks: Vec<Tok>,
     pos: usize,
+    version: JqVersion,
 }
 
 impl Parser {
@@ -335,7 +342,7 @@ impl Parser {
             }
             Tok::Str(parts) => {
                 self.bump();
-                let converted = convert_str_parts(parts, &mut |s| parse_sub_expr(s))?;
+                let converted = convert_str_parts(parts, &mut |s| parse_sub_expr(s, self.version))?;
                 Ok(Expr::Str(converted))
             }
             Tok::Var(name) => {
@@ -434,6 +441,14 @@ impl Parser {
         } else {
             None
         };
+        if else_e.is_none() && self.version.if_requires_else() {
+            return Err(
+                "jq 1.6 requires an explicit 'else' clause in 'if'/'then'/'end' \
+                 (support for omitting it was added in jq 1.7); add 'else .' \
+                 or select a newer jq-version feature"
+                    .to_string(),
+            );
+        }
         self.eat_ident("end")?;
         Ok(Expr::If(branches, else_e))
     }
@@ -592,7 +607,7 @@ impl Parser {
             }
             Tok::Str(parts) => {
                 self.bump();
-                let converted = convert_str_parts(parts, &mut |s| parse_sub_expr(s))?;
+                let converted = convert_str_parts(parts, &mut |s| parse_sub_expr(s, self.version))?;
                 self.expect(Tok::Colon)?;
                 let val = self.parse_pipe_no_comma()?;
                 Ok(ObjEntry {

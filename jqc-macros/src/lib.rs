@@ -3,32 +3,135 @@
 //! expansion is a closure `Fn(&jqc::core::Value) -> jqc::core::JResult<Vec<jqc::core::Value>>`;
 //! no jq parsing or AST walking happens at runtime.
 //!
+//! `jq!(version = "1.6", "<filter>")` targets a specific jq language
+//! version instead of the newest available one (the default when no
+//! `version` argument is given) -- see `jqc_compiler::version` for which
+//! versions are selectable and what differs between them. Which versions
+//! are *available* to select is controlled by Cargo features (`jq-1-6`,
+//! `jq-1-7`, `jq-1-8`, on `jqc`/`jqc-macros`/`jqc-compiler`); naming a
+//! version whose feature isn't enabled is a compile error.
+//!
 //! Requires the `jqc` crate (not just this one) as a dependency, since the
 //! generated code references `::jqc::core::*`.
-
-mod ast;
-#[cfg(test)]
-mod bench;
-mod codegen;
-mod lexer;
-mod lower;
-mod parser;
+//!
+//! This crate is a thin `#[proc_macro]` wrapper; the actual lex/parse/
+//! lower/codegen pipeline lives in `jqc-compiler`, a plain library crate --
+//! `proc-macro = true` crates can only export proc-macro items to other
+//! crates, so anything that needs to call the pipeline directly (e.g. a
+//! test generator trying many filters and catching failures as `Result`s)
+//! has to go through `jqc-compiler`, not this one.
 
 use proc_macro::TokenStream;
-use syn::LitStr;
+use proc_macro2::Span;
+use syn::parse::{Parse, ParseStream};
+use syn::{LitStr, Token};
 
-use codegen::{Codegen, TreeWalkCodegen};
+use jqc_compiler::codegen::{Codegen, TreeWalkCodegen};
+use jqc_compiler::lower;
+use jqc_compiler::version::JqVersion;
+
+/// `jq!("filter")` or `jq!(version = "X.Y", "filter")`.
+struct MacroInput {
+    version: Option<LitStr>,
+    filter: LitStr,
+}
+
+impl Parse for MacroInput {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        if input.peek(syn::Ident) && input.peek2(Token![=]) {
+            let ident: syn::Ident = input.parse()?;
+            if ident != "version" {
+                return Err(syn::Error::new(
+                    ident.span(),
+                    format!("jq!: unexpected argument '{ident}', expected 'version'"),
+                ));
+            }
+            input.parse::<Token![=]>()?;
+            let version: LitStr = input.parse()?;
+            input.parse::<Token![,]>()?;
+            let filter: LitStr = input.parse()?;
+            Ok(MacroInput {
+                version: Some(version),
+                filter,
+            })
+        } else {
+            let filter: LitStr = input.parse()?;
+            Ok(MacroInput {
+                version: None,
+                filter,
+            })
+        }
+    }
+}
+
+fn supported_versions_str() -> String {
+    JqVersion::ALL
+        .iter()
+        .map(|v| v.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
 
 #[proc_macro]
 pub fn jq(input: TokenStream) -> TokenStream {
-    let lit = match syn::parse::<LitStr>(input) {
-        Ok(l) => l,
+    let parsed = match syn::parse::<MacroInput>(input) {
+        Ok(p) => p,
         Err(e) => return e.to_compile_error().into(),
     };
-    let src = lit.value();
-    match lower::parse_and_lower(&src).and_then(|ast| TreeWalkCodegen.compile_top(&ast)) {
+
+    let version = match &parsed.version {
+        Some(lit) => match JqVersion::parse(&lit.value()) {
+            Some(v) => v,
+            None => {
+                return syn::Error::new(
+                    lit.span(),
+                    format!(
+                        "jq!: unknown jq version {:?} (supported: {})",
+                        lit.value(),
+                        supported_versions_str()
+                    ),
+                )
+                .to_compile_error()
+                .into();
+            }
+        },
+        None => match JqVersion::default_available() {
+            Some(v) => v,
+            None => {
+                return syn::Error::new(
+                    Span::call_site(),
+                    "jq!: no jq-version feature enabled -- enable jq-1-8, jq-1-7, or jq-1-6 \
+                     on your jqc dependency",
+                )
+                .to_compile_error()
+                .into();
+            }
+        },
+    };
+
+    if !version.is_available() {
+        let span = parsed
+            .version
+            .as_ref()
+            .map(|v| v.span())
+            .unwrap_or_else(Span::call_site);
+        return syn::Error::new(
+            span,
+            format!(
+                "jq!: jq version \"{}\" is valid but not enabled -- add feature \"jq-{}\" \
+                 to your jqc dependency",
+                version.as_str(),
+                version.as_str().replace('.', "-")
+            ),
+        )
+        .to_compile_error()
+        .into();
+    }
+
+    let src = parsed.filter.value();
+    match lower::parse_and_lower(&src, version).and_then(|ast| TreeWalkCodegen.compile_top(&ast)) {
         Ok(ts) => ts.into(),
-        Err(msg) => syn::Error::new(lit.span(), format!("jq!: {msg}"))
+        Err(msg) => syn::Error::new(parsed.filter.span(), format!("jq!: {msg}"))
             .to_compile_error()
             .into(),
     }

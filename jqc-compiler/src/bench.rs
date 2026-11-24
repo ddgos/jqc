@@ -3,17 +3,17 @@
 //! runtime cost of the code it generates (see `jqc`'s
 //! `benches/compiled_filters.rs` for that).
 //!
-//! This crate is a proc-macro crate, which may only export its
-//! `#[proc_macro]` items to other crates -- a normal external `benches/`
-//! target couldn't call `lower`/`codegen` at all. Driving Criterion from a
-//! `#[test]` instead keeps this a same-crate unit test, which has no such
-//! restriction.
+//! Lives in `jqc-compiler` (a plain lib) rather than `jqc-macros` (the
+//! `proc-macro = true` crate that wraps it) because a `#[test]` here
+//! needs to call `lower`/`codegen` as ordinary functions, which an
+//! external `benches/` target against a proc-macro crate cannot do.
 //!
 //! Run with:
-//! `cargo test -p jqc-macros --release -- --ignored compile_time_benchmarks --nocapture`
+//! `cargo test -p jqc-compiler --release -- --ignored compile_time_benchmarks --nocapture`
 
 use criterion::{BenchmarkId, Criterion};
 
+use crate::version::JqVersion;
 use crate::{codegen, lower};
 
 /// Physical RAM in bytes, via `sysconf`; `None` if the syscall fails.
@@ -59,7 +59,8 @@ fn cap_memory() {
 }
 
 fn compile(src: &str) {
-    let ast = lower::parse_and_lower(src).expect("fixture filter should compile");
+    let version = JqVersion::default_available().expect("at least one jq-version feature enabled");
+    let ast = lower::parse_and_lower(src, version).expect("fixture filter should compile");
     codegen::compile_top(&ast).expect("fixture filter should compile");
 }
 
@@ -87,7 +88,7 @@ const FIXTURES: &[(&str, &str)] = &[
 ];
 
 #[test]
-#[ignore = "run explicitly: cargo test -p jqc-macros --release -- --ignored compile_time_benchmarks --nocapture"]
+#[ignore = "run explicitly: cargo test -p jqc-compiler --release -- --ignored compile_time_benchmarks --nocapture"]
 fn compile_time_benchmarks() {
     cap_memory();
     let mut c = Criterion::default();
@@ -205,7 +206,7 @@ fn fmt_peak_rss() -> String {
 /// one's reading. Invoke with `--exact bench::peak_memory_benchmarks` (or
 /// any single matching name) to avoid that.
 #[test]
-#[ignore = "run explicitly: cargo test -p jqc-macros --release -- --ignored peak_memory_benchmarks --nocapture"]
+#[ignore = "run explicitly: cargo test -p jqc-compiler --release -- --ignored peak_memory_benchmarks --nocapture"]
 fn peak_memory_benchmarks() {
     cap_memory();
     for (name, src) in FIXTURES {

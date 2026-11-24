@@ -20,21 +20,46 @@ Build it normally (`cargo build --release`) and you get a standalone binary
 dedicated to running exactly that filter -- see `examples/src/main.rs` for a
 small NDJSON-filtering CLI built this way.
 
+### Targeting a specific jq version
+
+`jq!("...")` with no version argument targets the newest jq version this
+build has enabled. `jq!(version = "1.6", "...")` targets jq 1.6's semantics
+specifically (e.g. requiring an explicit `else` in `if`/`then`/`end`,
+which 1.7+ made optional) -- useful for compiling a script written
+against an older jq without rewriting it. Which versions are *available*
+to name is controlled by Cargo features on your `jqc` dependency:
+
+```toml
+jqc = { version = "0.1", features = ["jq-1-6"] }  # adds jq-1-6 alongside the default jq-1-8
+```
+
+Naming a version whose feature isn't enabled, anywhere in the same build,
+is a compile error pointing at that `jq!` call.
+
 ## Layout
 
 - `jqc-core` -- runtime support: the shared `Value`/`JqError` types and the
   value-level operations (`add_values`, `cmp_values`, `index_field`, sort/
   group/unique helpers, string builtins, …) that generated code calls into.
   No jq parsing happens here or anywhere at runtime.
-- `jqc-macros` -- the proc-macro itself: hand-rolled lexer/parser for the jq
-  subset below, a lowering pass that desugars builtins (`map`, `select`,
-  `recurse`, `any`/`all`, `while`/`until`/`repeat`, …) via a small jq-source
-  prelude and inlines/resolves user `def`s, and codegen that turns the
-  result into a `Fn(&Value) -> JResult<Vec<Value>>` closure.
+- `jqc-compiler` -- the jq lex/parse/lower/codegen pipeline, as a plain
+  library: hand-rolled lexer/parser for the jq subset below, a lowering
+  pass that desugars builtins (`map`, `select`, `recurse`, `any`/`all`,
+  `while`/`until`/`repeat`, …) via a small jq-source prelude and
+  inlines/resolves user `def`s, codegen that turns the result into a
+  `Fn(&Value) -> JResult<Vec<Value>>` closure, and `version` (which jq
+  language-version semantics a given parse targets). A plain lib, not a
+  proc macro, so anything that needs to call the pipeline directly and
+  catch failures as `Result`s -- not macro-expansion-time compile errors
+  -- can do so, which a `proc-macro = true` crate's callers cannot.
+- `jqc-macros` -- the thin `#[proc_macro]` wrapper around `jqc-compiler`:
+  parses `jq!`'s own argument syntax (the literal filter, optionally
+  preceded by `version = "X.Y",`) and converts the result to/from
+  `proc_macro`/`syn` types.
 - `jqc` -- the facade crate to actually depend on; re-exports `jqc-core` as
   `jqc::core` (generated code references `::jqc::core::...`, so this is
-  what you add to `Cargo.toml`, not `jqc-core`/`jqc-macros` directly) and
-  `jq!` from `jqc-macros`.
+  what you add to `Cargo.toml`, not `jqc-core`/`jqc-macros`/`jqc-compiler`
+  directly) and `jq!` from `jqc-macros`.
 - `examples` -- a tiny compiled-filter CLI demonstrating usage.
 
 ## Supported jq subset
@@ -79,19 +104,25 @@ and non-recursive `def` (see limitation below), and builtins: `map`,
 ## Testing
 
 - `cargo test -p jqc --test differential` -- the main correctness suite:
-  ~120 filters run through both the compiled closure and the real `jq`
-  binary (needs `jq` on `PATH`; the Nix dev shell provides it) and
-  compared. `jqc` itself doesn't call `jq` at any point (it's a
-  from-scratch implementation of a jq subset, not a wrapper around the
-  real interpreter) -- this suite is the only place a specific `jq`
-  *version* is operationally meaningful. The default dev shell's `jq`
-  tracks nixpkgs-unstable's current version (1.8.2 as of writing);
-  `nix develop .#jq-1_6` or `.#jq-1_7` run the identical suite against a
-  reproducibly pinned older jq instead, no test-code changes needed.
-  `jq-1_6` currently fails one case (`if_no_else`): `if cond then x end`
-  without an `else` is a syntax error in jq 1.6, support was added in
-  1.7 -- a real language-version difference, not a `jqc` bug, since
-  `jqc` targets the newest jq by design.
+  ~120 filters (all with no `version` argument, i.e. targeting this
+  build's newest enabled jq version) run through both the compiled
+  closure and the real `jq` binary (needs `jq` on `PATH`; the Nix dev
+  shell provides it) and compared.
+- `cargo test -p jqc --test version_selection` -- covers `jq!(version =
+  "...", ...)` itself: an explicit `version = "1.8"` behaving the same as
+  no `version` argument, and (with `--features jq-1-6`) jq 1.6 accepting
+  `if`/`then`/`else`/`end` with an explicit `else`. The *rejection* paths
+  (`version = "1.6"` without an `else`; naming a version whose feature
+  isn't enabled) are compile-time errors from the macro itself, verified
+  by hand rather than in this suite -- see the jq-version-selection
+  todo-report for the exact commands and output.
+- `nix develop .#jq-1_6` / `.#jq-1_7` provide a reproducibly pinned older
+  `jq` binary on `PATH` instead of the default shell's (nixpkgs-unstable's
+  current version, 1.8.2 as of writing) -- useful for checking a
+  version-gated behavior in `jqc-compiler/src/version.rs` against real
+  ground truth (as was done to confirm the `if`/`else` difference above),
+  or for running the differential suite against an intentionally older
+  `jq` to see what else has changed upstream since.
 - `cargo test -p jqc --test fuzz_inputs` -- proptest-generated arbitrary
   JSON inputs run through a curated filter set, differentially checked
   against real `jq`.
@@ -106,13 +137,14 @@ and non-recursive `def` (see limitation below), and builtins: `map`,
   (at a couple of smaller sizes, to keep subprocess-spawn overhead from
   dominating `cargo bench`'s own runtime) showing the per-call cost `jq!`
   avoids by baking the filter in at compile time.
-- `jqc-macros/src/bench.rs` benchmarks and guards the macro-expansion step
-  itself. `unused_defs_scaling_check` and `scaling_check` -- regression
-  checks for a `def_scope` cost cliff that once blew up to 38GB+ of RSS --
-  run as normal tests (part of `cargo test --workspace`, no flags needed).
-  `compile_time_benchmarks` (wall time) and `peak_memory_benchmarks` (peak
-  RSS) stay behind `cargo test -p jqc-macros --release -- --ignored <name>
-  --nocapture`, since they're diagnostics with no pass/fail assertions,
+- `jqc-compiler/src/bench.rs` benchmarks and guards the macro-expansion
+  step itself. `unused_defs_scaling_check` and `scaling_check` --
+  regression checks for a `def_scope` cost cliff that once blew up to
+  38GB+ of RSS -- run as normal tests (part of `cargo test --workspace`,
+  no flags needed). `compile_time_benchmarks` (wall time) and
+  `peak_memory_benchmarks` (peak RSS) stay behind `cargo test -p
+  jqc-compiler --release -- --ignored <name> --nocapture`, since they're
+  diagnostics with no pass/fail assertions,
   not correctness checks; run `peak_memory_benchmarks` alone (an exact
   `--ignored` name match), not alongside other `#[ignore]`d tests in the
   same invocation, since its RSS reading is a per-*process* high-water
@@ -122,9 +154,9 @@ and non-recursive `def` (see limitation below), and builtins: `map`,
   aborts fast instead of being left to the kernel's OOM reaper.
 - `cargo tarpaulin --workspace --out Html --output-dir target/tarpaulin` --
   line coverage from the test suite. Only meaningful for `jqc-core` (the
-  runtime support crate): `jqc-macros`' lex/parse/lower/codegen pipeline
-  runs during the *compilation* of the tests that exercise it (`jq!` is a
-  proc macro), not while the resulting test binary runs, so a runtime
+  runtime support crate): `jqc-compiler`'s lex/parse/lower/codegen
+  pipeline, reached through `jq!`, runs during the *compilation* of the
+  tests that call it, not while the resulting test binary runs, so a runtime
   coverage tool reports near-0% there regardless of how thoroughly the
   differential suite exercises it. Read that coverage from differential
   test results instead, not from tarpaulin's numbers for that crate.

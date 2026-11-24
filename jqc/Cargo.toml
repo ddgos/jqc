@@ -14,6 +14,14 @@ serde_json = "1"
 proptest = "1"
 criterion = "0.8"
 
+[features]
+default = ["jq-1-8"]
+# Which jq language-version(s) `jq!(version = "...", ...)` can select;
+# see jqc_compiler::version. Not mutually exclusive.
+jq-1-6 = ["jqc-macros/jq-1-6"]
+jq-1-7 = ["jqc-macros/jq-1-7"]
+jq-1-8 = ["jqc-macros/jq-1-8"]
+
 [[bench]]
 name = "compiled_filters"
 harness = false
