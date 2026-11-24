@@ -161,11 +161,8 @@ pub fn jq(input: TokenStream) -> TokenStream {
             }
             ts.into()
         }
-        Err(diag) => syn::Error::new(
-            parsed.filter.span(),
-            format!("jq!:\n{}", diag.render(&src)),
-        )
-        .to_compile_error()
-        .into(),
+        Err(diag) => syn::Error::new(parsed.filter.span(), format!("jq!:\n{}", diag.render(&src)))
+            .to_compile_error()
+            .into(),
     }
 }

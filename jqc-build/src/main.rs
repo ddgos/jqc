@@ -37,9 +37,12 @@ fn cap_child_memory(cmd: &mut Command) {
     let phys_gb = unsafe {
         let pages = libc::sysconf(libc::_SC_PHYS_PAGES);
         let page_size = libc::sysconf(libc::_SC_PAGE_SIZE);
-        (pages > 0 && page_size > 0).then(|| (pages as u64 * page_size as u64) / (1024 * 1024 * 1024))
+        (pages > 0 && page_size > 0)
+            .then(|| (pages as u64 * page_size as u64) / (1024 * 1024 * 1024))
     };
-    let default_gb = phys_gb.map(|gb| (gb / 4).clamp(1, NOMINAL_GB)).unwrap_or(NOMINAL_GB);
+    let default_gb = phys_gb
+        .map(|gb| (gb / 4).clamp(1, NOMINAL_GB))
+        .unwrap_or(NOMINAL_GB);
     let gb: u64 = env::var("JQC_BUILD_MEM_LIMIT_GB")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -101,7 +104,13 @@ fn escape_rust_str_literal(s: &str) -> String {
 fn sanitize_name(s: &str) -> String {
     let cleaned: String = s
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect();
     if cleaned.is_empty() || !cleaned.chars().next().unwrap().is_ascii_alphabetic() {
         format!("jqc-script-{cleaned}")
@@ -188,7 +197,10 @@ fn main() -> std::process::ExitCode {{
         std::process::exit(1);
     });
     if !status.success() {
-        eprintln!("jqc-build: cargo build failed for {}", script_path.display());
+        eprintln!(
+            "jqc-build: cargo build failed for {}",
+            script_path.display()
+        );
         std::process::exit(status.code().unwrap_or(1));
     }
 

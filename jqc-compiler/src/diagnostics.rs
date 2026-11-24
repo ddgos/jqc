@@ -154,18 +154,68 @@ fn render_span(out: &mut String, src: &str, span: &Span) {
 /// call -- not an authoritative list of what's actually supported (see the
 /// README's "Supported jq subset" for that).
 pub const KNOWN_NAMES: &[&str] = &[
-    "map", "select", "values", "recurse", "in", "any", "all", "while", "until", "repeat", "not",
-    "error", "empty", "length", "keys", "keys_unsorted", "has", "type", "add", "to_entries",
-    "from_entries", "with_entries", "sort", "sort_by", "group_by", "unique", "unique_by", "min",
-    "max", "min_by", "max_by", "reverse", "range", "first", "last", "floor", "ceil", "round",
-    "sqrt", "fabs", "tostring", "tonumber", "explode", "implode", "ascii_downcase",
-    "ascii_upcase", "startswith", "endswith", "contains", "ltrimstr", "rtrimstr", "join", "split",
+    "map",
+    "select",
+    "values",
+    "recurse",
+    "in",
+    "any",
+    "all",
+    "while",
+    "until",
+    "repeat",
+    "not",
+    "error",
+    "empty",
+    "length",
+    "keys",
+    "keys_unsorted",
+    "has",
+    "type",
+    "add",
+    "to_entries",
+    "from_entries",
+    "with_entries",
+    "sort",
+    "sort_by",
+    "group_by",
+    "unique",
+    "unique_by",
+    "min",
+    "max",
+    "min_by",
+    "max_by",
+    "reverse",
+    "range",
+    "first",
+    "last",
+    "floor",
+    "ceil",
+    "round",
+    "sqrt",
+    "fabs",
+    "tostring",
+    "tonumber",
+    "explode",
+    "implode",
+    "ascii_downcase",
+    "ascii_upcase",
+    "startswith",
+    "endswith",
+    "contains",
+    "ltrimstr",
+    "rtrimstr",
+    "join",
+    "split",
 ];
 
 /// Returns the entry in `candidates` closest to `target` by Levenshtein
 /// edit distance, for "did you mean ...?" help text -- `None` if nothing is
 /// close enough to be worth suggesting.
-pub fn closest_match<'a>(target: &str, candidates: impl IntoIterator<Item = &'a str>) -> Option<&'a str> {
+pub fn closest_match<'a>(
+    target: &str,
+    candidates: impl IntoIterator<Item = &'a str>,
+) -> Option<&'a str> {
     let max_dist = (target.len() / 3).clamp(1, 4);
     candidates
         .into_iter()
@@ -241,7 +291,10 @@ mod tests {
 
     #[test]
     fn closest_match_suggests_a_near_miss() {
-        assert_eq!(closest_match("selec", ["map", "select", "recurse"]), Some("select"));
+        assert_eq!(
+            closest_match("selec", ["map", "select", "recurse"]),
+            Some("select")
+        );
         assert_eq!(closest_match("zzzzzzzzzz", ["map", "select"]), None);
     }
 }

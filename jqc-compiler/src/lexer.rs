@@ -173,9 +173,14 @@ impl Lexer {
                     self.bump();
                     Ok(Tok::Eq)
                 } else {
-                    Err(Diagnostic::at(self.pos - 1..self.pos, "assignment operators are not supported")
-                        .help("update-assignment (`=`, `|=`, `+=`, ...) isn't implemented yet; \
-                               see the README's \"Known limitations\""))
+                    Err(Diagnostic::at(
+                        self.pos - 1..self.pos,
+                        "assignment operators are not supported",
+                    )
+                    .help(
+                        "update-assignment (`=`, `|=`, `+=`, ...) isn't implemented yet; \
+                               see the README's \"Known limitations\"",
+                    ))
                 }
             }
             '!' => {
@@ -257,8 +262,10 @@ impl Lexer {
         loop {
             match self.bump() {
                 None => {
-                    return Err(Diagnostic::at(open..open + 1, "unterminated string literal")
-                        .help("add a closing '\"' to match this one"))
+                    return Err(
+                        Diagnostic::at(open..open + 1, "unterminated string literal")
+                            .help("add a closing '\"' to match this one"),
+                    )
                 }
                 Some('"') => break,
                 Some('\\') => match self.bump() {
@@ -318,11 +325,10 @@ impl Lexer {
         loop {
             match self.bump() {
                 None => {
-                    return Err(Diagnostic::at(
-                        open..open + 2,
-                        "unterminated string interpolation",
+                    return Err(
+                        Diagnostic::at(open..open + 2, "unterminated string interpolation")
+                            .help("add a closing ')' to match this '\\('"),
                     )
-                    .help("add a closing ')' to match this '\\('"))
                 }
                 Some('(') => depth += 1,
                 Some(')') => {

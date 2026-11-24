@@ -59,7 +59,10 @@ def limit(n; exp): if n > 0 then
 /// a codegen-stage error back to `user_src`'s own coordinates the same way
 /// `parse_and_lower` relocates its own parse/lower-stage errors.
 pub fn user_src_window(user_src: &str) -> (usize, usize) {
-    (PRELUDE.chars().count() + 1 /* '\n' */, user_src.chars().count())
+    (
+        PRELUDE.chars().count() + 1, /* '\n' */
+        user_src.chars().count(),
+    )
 }
 
 pub fn parse_and_lower(user_src: &str, version: JqVersion) -> LResult<Expr> {
@@ -280,7 +283,11 @@ fn bind_pattern(source: Expr, pattern: Pattern, body: Expr, scope: &[DefEntry]) 
                 };
                 acc = bind_pattern(value, elem, acc, scope)?;
             }
-            Ok(Expr::VarBind(Box::new(source), Pattern::Var(tmp), Box::new(acc)))
+            Ok(Expr::VarBind(
+                Box::new(source),
+                Pattern::Var(tmp),
+                Box::new(acc),
+            ))
         }
         Pattern::Object(entries) => {
             let tmp = "__jqc_destr".to_string();
@@ -304,7 +311,11 @@ fn bind_pattern(source: Expr, pattern: Pattern, body: Expr, scope: &[DefEntry]) 
                 };
                 acc = bind_pattern(value, elem, acc, scope)?;
             }
-            Ok(Expr::VarBind(Box::new(source), Pattern::Var(tmp), Box::new(acc)))
+            Ok(Expr::VarBind(
+                Box::new(source),
+                Pattern::Var(tmp),
+                Box::new(acc),
+            ))
         }
     }
 }
@@ -325,9 +336,11 @@ fn lower_funcdef(
                 span,
                 format!("recursive function '{name}/{arity}' with parameters is not supported"),
             )
-            .help("only 0-argument recursive defs can be compiled (parameterized defs are \
+            .help(
+                "only 0-argument recursive defs can be compiled (parameterized defs are \
                    inlined call-by-name, which can't terminate if they recurse); \
-                   try a `reduce`/`foreach` loop instead"));
+                   try a `reduce`/`foreach` loop instead",
+            ));
         }
         let body = rewrite_self_calls(body, &name);
         let rest = rewrite_self_calls(rest, &name);
@@ -751,7 +764,12 @@ fn rewrite_pattern(pattern: Pattern, target: &str, build: &mut dyn FnMut() -> Ex
         Pattern::Object(entries) => Pattern::Object(
             entries
                 .into_iter()
-                .map(|(k, p)| (rewrite_call0(k, target, build), rewrite_pattern(p, target, build)))
+                .map(|(k, p)| {
+                    (
+                        rewrite_call0(k, target, build),
+                        rewrite_pattern(p, target, build),
+                    )
+                })
                 .collect(),
         ),
     }
@@ -809,7 +827,9 @@ mod tests {
                 Err(e) => Err(e),
                 Ok(ast) => {
                     let (offset, len) = user_src_window(src);
-                    TreeWalkCodegen.compile_top(&ast).map_err(|e| e.relocate(offset, len))
+                    TreeWalkCodegen
+                        .compile_top(&ast)
+                        .map_err(|e| e.relocate(offset, len))
                 }
             };
             println!("=== {src:?} ===");
@@ -824,15 +844,15 @@ mod tests {
     fn unclosed_paren_points_at_both_ends() {
         // The user source starts after PRELUDE + "(\n" -- relocation must
         // land the span back on `(1 + 2`, not somewhere in the prelude.
-        assert_error_contains(
-            "(1 + 2",
-            &["-->", "note:", "unclosed '(' opened here"],
-        );
+        assert_error_contains("(1 + 2", &["-->", "note:", "unclosed '(' opened here"]);
     }
 
     #[test]
     fn unknown_function_suggests_a_near_miss() {
-        assert_error_contains(".a | selct", &["unknown jq function", "did you mean `select`?"]);
+        assert_error_contains(
+            ".a | selct",
+            &["unknown jq function", "did you mean `select`?"],
+        );
     }
 
     #[test]

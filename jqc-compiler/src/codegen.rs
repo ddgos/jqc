@@ -118,7 +118,11 @@ fn fetch_or_bubble(binding: TokenStream, expr: TokenStream) -> TokenStream {
 /// each level re-inlining the loop/merge shape as more raw tokens (what
 /// this used to do -- see `partial_for`'s own doc comment for the real
 /// blowup that caused).
-fn partial_aware_for(sub_c: &TokenStream, item_ident: &TokenStream, body: TokenStream) -> TokenStream {
+fn partial_aware_for(
+    sub_c: &TokenStream,
+    item_ident: &TokenStream,
+    body: TokenStream,
+) -> TokenStream {
     let partial_for = core_path("partial_for");
     let value_ty = core_path("Value");
     let jresult_ty = core_path("JResult");
@@ -438,9 +442,7 @@ fn compile_raw(expr: &Expr, input: &TokenStream, scope: &mut Vec<String>) -> CRe
         Expr::Break(name, span) => {
             let key = label_key(name);
             if !scope.iter().any(|s| s == &key) {
-                let labels_in_scope = scope
-                    .iter()
-                    .filter_map(|s| s.strip_prefix("\0label\0"));
+                let labels_in_scope = scope.iter().filter_map(|s| s.strip_prefix("\0label\0"));
                 let err = Diagnostic::at(span.clone(), format!("undefined label ${name}"));
                 let err = match closest_match(name, labels_in_scope) {
                     Some(sugg) => err.help(format!("did you mean break ${sugg}?")),
@@ -917,6 +919,45 @@ fn cartesian_args(
     Ok(block)
 }
 
+/// `NAME(arg)` builtins that are directly jqc-core's own `fn(&Value,
+/// &Value) -> JResult<Value>`, called as `#fn_name(input, &arg)` -- the
+/// shape shared by `has`/`startswith`/`endswith`/`ltrimstr`/`rtrimstr`/
+/// `join`/`split`'s single-argument call sites below, so each of those is
+/// just this plus a name instead of its own copy of the boilerplate.
+fn compile_core_fn2(
+    fn_name: &str,
+    args: &[Expr],
+    input: &TokenStream,
+    scope: &mut Vec<String>,
+) -> CResult<TokenStream> {
+    let f = core_path(fn_name);
+    cartesian_args(args, input, scope, |a| {
+        let arg = &a[0];
+        quote!(#f(#input, &#arg))
+    })
+}
+
+/// `first(f)`/`last(f)`: take the `.next()`/`.last()` element of `f`'s own
+/// (fully materialized -- jqc being eager, not lazy) output, discarding
+/// the rest -- `method` is `next`/`last` verbatim, the only difference
+/// between the two builtins.
+fn compile_first_or_last_1(
+    method: &str,
+    arg: &Expr,
+    input: &TokenStream,
+    scope: &mut Vec<String>,
+) -> CResult<TokenStream> {
+    let arg_c = compile(arg, input, scope)?;
+    let method = format_ident!("{method}");
+    let value_ty = core_path("Value");
+    Ok(quote! {
+        {
+            let __items = (#arg_c)?;
+            Ok(__items.into_iter().#method().into_iter().collect::<::std::vec::Vec<#value_ty>>())
+        }
+    })
+}
+
 fn compile_call(
     name: &str,
     args: &[Expr],
@@ -1004,82 +1045,25 @@ fn compile_call(
             let f = core_path("index_value");
             Ok(quote!(Ok(::std::vec![#f(#input, &#value_ty::from(-1))?])))
         }
-        ("first", 1) => {
-            let arg_c = compile(&args[0], input, scope)?;
-            Ok(quote! {
-                {
-                    let __items = (#arg_c)?;
-                    Ok(__items.into_iter().next().into_iter().collect::<::std::vec::Vec<#value_ty>>())
-                }
-            })
-        }
-        ("last", 1) => {
-            let arg_c = compile(&args[0], input, scope)?;
-            Ok(quote! {
-                {
-                    let __items = (#arg_c)?;
-                    Ok(__items.into_iter().last().into_iter().collect::<::std::vec::Vec<#value_ty>>())
-                }
-            })
-        }
-        // `build` closures here all evaluate to a `JResult<Value>`-typed
-        // expression -- `cartesian_args` runs it as-is (no extra `Ok`/`?`
-        // wrapping) through `bubble1`, so a fallible helper is used
-        // directly and an infallible one is wrapped in `Ok` right here.
-        ("has", 1) => {
-            let f = core_path("has_key");
-            cartesian_args(args, input, scope, |a| {
-                let arg = &a[0];
-                quote!(#f(#input, &#arg))
-            })
-        }
+        ("first", 1) => compile_first_or_last_1("next", &args[0], input, scope),
+        ("last", 1) => compile_first_or_last_1("last", &args[0], input, scope),
+        // Every one of these is jqc-core's own `fn(&Value, &Value) ->
+        // JResult<Value>` called directly on `input` and the (cartesian-
+        // expanded) argument -- see `compile_core_fn2`.
+        ("has", 1) => compile_core_fn2("has_key", args, input, scope),
+        ("startswith", 1) => compile_core_fn2("startswith", args, input, scope),
+        ("endswith", 1) => compile_core_fn2("endswith", args, input, scope),
+        ("ltrimstr", 1) => compile_core_fn2("ltrimstr", args, input, scope),
+        ("rtrimstr", 1) => compile_core_fn2("rtrimstr", args, input, scope),
+        ("join", 1) => compile_core_fn2("join_strings", args, input, scope),
+        ("split", 1) => compile_core_fn2("split_string", args, input, scope),
+        // As above, but `contains_value` returns `JResult<bool>` rather
+        // than `JResult<Value>`, needing the extra `.map`.
         ("contains", 1) => {
             let f = core_path("contains_value");
             cartesian_args(args, input, scope, |a| {
                 let arg = &a[0];
                 quote!(#f(#input, &#arg).map(#value_ty::Bool))
-            })
-        }
-        ("startswith", 1) => {
-            let f = core_path("startswith");
-            cartesian_args(args, input, scope, |a| {
-                let arg = &a[0];
-                quote!(#f(#input, &#arg))
-            })
-        }
-        ("endswith", 1) => {
-            let f = core_path("endswith");
-            cartesian_args(args, input, scope, |a| {
-                let arg = &a[0];
-                quote!(#f(#input, &#arg))
-            })
-        }
-        ("ltrimstr", 1) => {
-            let f = core_path("ltrimstr");
-            cartesian_args(args, input, scope, |a| {
-                let arg = &a[0];
-                quote!(#f(#input, &#arg))
-            })
-        }
-        ("rtrimstr", 1) => {
-            let f = core_path("rtrimstr");
-            cartesian_args(args, input, scope, |a| {
-                let arg = &a[0];
-                quote!(#f(#input, &#arg))
-            })
-        }
-        ("join", 1) => {
-            let f = core_path("join_strings");
-            cartesian_args(args, input, scope, |a| {
-                let arg = &a[0];
-                quote!(#f(#input, &#arg))
-            })
-        }
-        ("split", 1) => {
-            let f = core_path("split_string");
-            cartesian_args(args, input, scope, |a| {
-                let arg = &a[0];
-                quote!(#f(#input, &#arg))
             })
         }
         ("range", 1) => {
@@ -1116,9 +1100,9 @@ fn compile_call(
             } else {
                 match closest_match(name, KNOWN_NAMES.iter().copied()) {
                     Some(sugg) => err.help(format!("did you mean `{sugg}`?")),
-                    None => err.help(
-                        "see the README's \"Supported jq subset\" for what's implemented",
-                    ),
+                    None => {
+                        err.help("see the README's \"Supported jq subset\" for what's implemented")
+                    }
                 }
             };
             Err(err)

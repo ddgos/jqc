@@ -45,7 +45,6 @@ fn describe(t: &Tok) -> String {
     }
 }
 
-
 /// Reserved words that must never be swallowed as a field name by `.name`
 /// (e.g. `if f then . else empty end` -- the `.` there must stay the bare
 /// identity filter, not become a field access `.else`).
@@ -158,7 +157,11 @@ impl Parser {
         } else {
             Err(Diagnostic::at(
                 self.cur_span(),
-                format!("expected {}, found {}", describe(&close), describe(self.peek())),
+                format!(
+                    "expected {}, found {}",
+                    describe(&close),
+                    describe(self.peek())
+                ),
             )
             .note(open_span, format!("unclosed '{open_ch}' opened here")))
         }
@@ -207,7 +210,10 @@ impl Parser {
             Tok::Var(name) => Ok(name),
             other => Err(Diagnostic::at(
                 span,
-                format!("expected a variable (e.g. `$x`), found {}", describe(&other)),
+                format!(
+                    "expected a variable (e.g. `$x`), found {}",
+                    describe(&other)
+                ),
             )),
         }
     }
@@ -461,7 +467,10 @@ impl Parser {
                         other => {
                             return Err(Diagnostic::at(
                                 self.spans[self.pos - 1].clone(),
-                                format!("expected field name after '.', found {}", describe(&other)),
+                                format!(
+                                    "expected field name after '.', found {}",
+                                    describe(&other)
+                                ),
                             ))
                         }
                     }
@@ -671,8 +680,10 @@ impl Parser {
                     self.version.as_str()
                 ),
             )
-            .help("add 'else .' before 'end', or select a jq-version feature from 1.7 onward \
-                   (support for omitting 'else' was added in jq 1.7)"));
+            .help(
+                "add 'else .' before 'end', or select a jq-version feature from 1.7 onward \
+                   (support for omitting 'else' was added in jq 1.7)",
+            ));
         }
         self.eat_ident("end")?;
         Ok(Expr::If(branches, else_e))
@@ -760,7 +771,10 @@ impl Parser {
             other => {
                 return Err(Diagnostic::at(
                     name_span,
-                    format!("expected function name after 'def', found {}", describe(&other)),
+                    format!(
+                        "expected function name after 'def', found {}",
+                        describe(&other)
+                    ),
                 ))
             }
         };
@@ -927,9 +941,10 @@ fn lit_str_only(parts: &[StrPart]) -> PResult<String> {
     match parts {
         [StrPart::Lit(s)] => Ok(s.clone()),
         [] => Ok(String::new()),
-        _ => Err(Diagnostic::new(
-            "interpolated strings are not allowed as field names",
-        )
-        .help("use a plain string, e.g. `.\"literal-name\"`, or `.[expr]` for a computed key")),
+        _ => Err(
+            Diagnostic::new("interpolated strings are not allowed as field names").help(
+                "use a plain string, e.g. `.\"literal-name\"`, or `.[expr]` for a computed key",
+            ),
+        ),
     }
 }
