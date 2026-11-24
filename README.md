@@ -140,6 +140,17 @@ below), and builtins: `map`, `select`, `values`, `recurse(;f)`, `in`,
 - Every clone is a real `Value::clone()` (deep for arrays/objects). Fine for
   typical filter sizes; a future version could switch to `Rc<Value>`
   internally for less copying on heavily-reused sub-results.
+- **Extremely deeply nested values (roughly 500+ levels) can still
+  overflow the stack**, independent of which operation touches them.
+  `contains`/`==`/`<`/`sort`/`unique`/object-merge (`*`) cap their own
+  recursion (`jqc-core`'s `MAX_STRUCTURAL_DEPTH`) well under real jq's own
+  10000-deep tolerance for the same CVE-2026-33947/-40612/-43896-class
+  bug, erroring cleanly rather than crashing -- but a value nested deeper
+  than that can overflow the stack merely by being *constructed and later
+  dropped*, before any such operation ever runs. `Value` is a plain
+  `serde_json::Value` (a foreign type), so jqc has no way to give it a
+  non-recursive `Drop`; fixing this for real would mean replacing the
+  runtime value representation entirely, not adding another depth check.
 
 ## Testing
 

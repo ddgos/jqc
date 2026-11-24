@@ -701,28 +701,28 @@ fn compile_binop(
             quote!(#f(__lhs, __rhs.clone()))
         }
         BinOp::Eq => {
-            let f = core_path("eq_values");
-            quote!(Ok(#value_ty::Bool(#f(&__lhs, &__rhs))))
+            let f = core_path("try_eq_values");
+            quote!(Ok(#value_ty::Bool(#f(&__lhs, &__rhs)?)))
         }
         BinOp::Ne => {
-            let f = core_path("eq_values");
-            quote!(Ok(#value_ty::Bool(!#f(&__lhs, &__rhs))))
+            let f = core_path("try_eq_values");
+            quote!(Ok(#value_ty::Bool(!#f(&__lhs, &__rhs)?)))
         }
         BinOp::Lt => {
-            let f = core_path("cmp_values");
-            quote!(Ok(#value_ty::Bool(#f(&__lhs, &__rhs) == ::std::cmp::Ordering::Less)))
+            let f = core_path("try_cmp_values");
+            quote!(Ok(#value_ty::Bool(#f(&__lhs, &__rhs)? == ::std::cmp::Ordering::Less)))
         }
         BinOp::Le => {
-            let f = core_path("cmp_values");
-            quote!(Ok(#value_ty::Bool(#f(&__lhs, &__rhs) != ::std::cmp::Ordering::Greater)))
+            let f = core_path("try_cmp_values");
+            quote!(Ok(#value_ty::Bool(#f(&__lhs, &__rhs)? != ::std::cmp::Ordering::Greater)))
         }
         BinOp::Gt => {
-            let f = core_path("cmp_values");
-            quote!(Ok(#value_ty::Bool(#f(&__lhs, &__rhs) == ::std::cmp::Ordering::Greater)))
+            let f = core_path("try_cmp_values");
+            quote!(Ok(#value_ty::Bool(#f(&__lhs, &__rhs)? == ::std::cmp::Ordering::Greater)))
         }
         BinOp::Ge => {
-            let f = core_path("cmp_values");
-            quote!(Ok(#value_ty::Bool(#f(&__lhs, &__rhs) != ::std::cmp::Ordering::Less)))
+            let f = core_path("try_cmp_values");
+            quote!(Ok(#value_ty::Bool(#f(&__lhs, &__rhs)? != ::std::cmp::Ordering::Less)))
         }
     };
     // jq evaluates the right operand's generator as the outer loop (e.g.
@@ -962,29 +962,25 @@ fn compile_call(
             let as_array = core_path("as_array");
             let f = core_path("sort_values");
             Ok(quote!(Ok(
-                ::std::vec![#value_ty::Array(#f(#as_array(#input)?.clone()))]
+                ::std::vec![#value_ty::Array(#f(#as_array(#input)?.clone())?)]
             )))
         }
         ("unique", 0) => {
             let as_array = core_path("as_array");
             let f = core_path("unique_values");
             Ok(quote!(Ok(
-                ::std::vec![#value_ty::Array(#f(#as_array(#input)?.clone()))]
+                ::std::vec![#value_ty::Array(#f(#as_array(#input)?.clone())?)]
             )))
         }
         ("min", 0) => {
             let as_array = core_path("as_array");
-            let cmp = core_path("cmp_values");
-            Ok(quote!(Ok(
-                ::std::vec![#as_array(#input)?.iter().cloned().min_by(#cmp).unwrap_or(#value_ty::Null)]
-            )))
+            let f = core_path("min_values");
+            Ok(quote!(Ok(::std::vec![#f(#as_array(#input)?)?])))
         }
         ("max", 0) => {
             let as_array = core_path("as_array");
-            let cmp = core_path("cmp_values");
-            Ok(quote!(Ok(
-                ::std::vec![#as_array(#input)?.iter().cloned().max_by(#cmp).unwrap_or(#value_ty::Null)]
-            )))
+            let f = core_path("max_values");
+            Ok(quote!(Ok(::std::vec![#f(#as_array(#input)?)?])))
         }
         ("floor", 0) => simple_unary("floor_value", input),
         ("ceil", 0) => simple_unary("ceil_value", input),
@@ -1190,9 +1186,9 @@ fn compile_by(
     let helper = core_path(helper_name);
     let key_c = compile(&args[0], &quote!(__item), scope)?;
     let result = if wrap_array {
-        quote!(Ok(::std::vec![#value_ty::Array(#helper(__items, __keys))]))
+        quote!(Ok(::std::vec![#value_ty::Array(#helper(__items, __keys)?)]))
     } else {
-        quote!(Ok(::std::vec![#helper(__items, __keys)]))
+        quote!(Ok(::std::vec![#helper(__items, __keys)?]))
     };
     Ok(quote! {
         {

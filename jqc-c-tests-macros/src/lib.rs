@@ -178,62 +178,74 @@ const KNOWN_RUNTIME_DISCREPANCIES: &[(&str, &str)] = &[
     //
     // The following cluster (jq.test lines ~2568-2633) are upstream jq's
     // own regression tests for CVE-2026-33947/-40612/-43896: real jq used
-    // to stack-overflow (an actual DoS vector, not just a wrong answer)
-    // on a deliberately 10001-deep nested array/object, and was fixed by
-    // adding an explicit depth limit to contains/equality/comparison/
-    // object-merge, returning a clean "... too deep" error instead of
-    // recursing unboundedly. jqc-core's equivalents (contains, PartialEq
-    // via serde_json::Value, cmp_values, add_values/object merge) have
-    // *no* such limit and really do stack-overflow -- this is the same
-    // class of bug real jq shipped a CVE fix for, not merely a test
-    // inconvenience; worth prioritizing a real depth-limit fix over
-    // other items in todos.md, not just leaving these #[ignore]d
-    // indefinitely. setpath/getpath/delpaths/tojson, the other builtins
-    // CVE-2026-33947's own test block exercises, aren't implemented by
-    // jqc at all yet (see README's "Not implemented"), so those cases
-    // are already ordinary xfail_unsupported and carry no crash risk.
+    // to stack-overflow on a deliberately 10001-deep nested array/object,
+    // fixed by adding an explicit depth limit to contains/equality/
+    // comparison/object-merge. jqc-core's equivalents (contains_value,
+    // cmp_values/eq_values, deep_merge) now carry the same kind of limit
+    // (`MAX_STRUCTURAL_DEPTH` in jqc-core/src/helpers.rs) -- but a much
+    // smaller one than jq's own 10000, chosen empirically because jqc's
+    // recursion (over a full `serde_json::Value`, not jq's refcounted
+    // `jv`) overflows a default thread stack well short of depth 10000
+    // regardless of which specific operation touches the value. Turns out
+    // that's not even the binding constraint for *these* cases: a
+    // `reduce`-built array/object nested to depth 10000+ overflows the
+    // stack from construction and eventual `Drop` alone (confirmed with a
+    // plain `| length` in place of contains/==/sort/unique/`*` below,
+    // still crashes) -- `Value` is a foreign type, so jqc can't give it a
+    // non-recursive `Drop` the way it could add a depth cap to its own
+    // helper functions. Each entry below is left `#[ignore]`d rather than
+    // fixed further: a *correct* depth cap no longer rescues them, since
+    // the value they build is already too deep for jqc to safely hold at
+    // all, not merely too deep for one specific comparison. This is a
+    // genuine, deeper limitation than originally diagnosed, not test
+    // debt -- see README's "Known limitations". setpath/getpath/
+    // delpaths/tojson, the other builtins CVE-2026-33947's own test block
+    // exercises, aren't implemented by jqc at all yet (see README's "Not
+    // implemented"), so those cases are already ordinary xfail_unsupported
+    // and carry no crash risk.
     (
         "reduce range(10000) as $_ ([]; [.]) | contains([[]])",
-        "CVE-2026-40612's own regression test, at the depth (10000) real jq's fix *keeps* \
-         working at (only *more* than that should error) -- jqc-core's contains stack-overflows \
-         here too, meaning its per-level stack usage is heavier than jq's C recursion, not just \
-         missing the same depth limit",
+        "stack overflow: a 10000-deep nested array built via `reduce` overflows the stack from \
+         construction and `Drop` alone (serde_json::Value has no non-recursive Drop), independent \
+         of contains_value's own (now depth-capped) recursion -- see the comment above this \
+         cluster",
     ),
     (
         "try (reduce range(10001) as $_ ([]; [.]) as $x | $x | contains($x)) catch .",
-        "CVE-2026-33947-class stack overflow: jqc-core's contains has no depth limit (real jq's \
-         own fix for this CVE added one, returning \"Containment check too deep\" instead)",
+        "same construction/Drop-depth stack overflow as the contains(10000) case above, one level \
+         deeper",
     ),
     (
         "reduce range(10000) as $_ ({}; {a: .}) as $x | $x * $x | length",
-        "CVE-2026-43896's own regression test, at the depth (10000) real jq's fix keeps working \
-         at -- jqc-core's object-merge (`*`) stack-overflows here too, so its per-level stack \
-         usage is heavier than jq's C recursion, not just missing the same depth limit",
+        "same construction/Drop-depth stack overflow as the contains(10000) case above, via nested \
+         objects instead of arrays",
     ),
     (
         "try (reduce range(10001) as $_ ({}; {a: .}) as $x | $x * $x) catch .",
-        "CVE-2026-43896-class stack overflow: jqc-core's object-merge (`*`) has no depth limit",
+        "same construction/Drop-depth stack overflow as the contains(10000) case above, via nested \
+         objects one level deeper",
     ),
     (
         "try ((reduce range(10001) as $_ ([]; [.])) as $x | (reduce range(10001) as $_ ([]; [.])) as $y | $x == $y) catch .",
-        "deep structural equality recursion, same CVE-class issue as contains() above (`==` uses \
-         serde_json::Value's derived PartialEq, which has no depth limit either)",
+        "same construction/Drop-depth stack overflow as the contains(10000) case above",
     ),
     (
         "try ((reduce range(10001) as $_ ([]; [.])) as $x | [$x, $x] | sort) catch .",
-        "CVE-class stack overflow in deep ordering comparison (jqc-core's cmp_values)",
+        "same construction/Drop-depth stack overflow as the contains(10000) case above",
     ),
     (
         "try ((reduce range(10001) as $_ ([]; [.])) as $x | [$x, $x] | unique) catch .",
-        "same deep-comparison stack overflow as the sort case above (unique also calls cmp_values)",
+        "same construction/Drop-depth stack overflow as the contains(10000) case above",
     ),
     (
         "try ((reduce range(10001) as $_ ({}; {a: .})) as $x | [$x, $x] | sort) catch .",
-        "same deep-comparison stack overflow, via a deeply-nested object instead of array",
+        "same construction/Drop-depth stack overflow as the contains(10000) case above, via nested \
+         objects instead of arrays",
     ),
     (
         "try ((reduce range(10001) as $_ ({}; {a: .})) as $x | [$x, $x] | unique) catch .",
-        "same deep-comparison stack overflow, via a deeply-nested object instead of array",
+        "same construction/Drop-depth stack overflow as the contains(10000) case above, via nested \
+         objects instead of arrays",
     ),
     //
     // The rest of this list is the first full pass of this generator
@@ -261,12 +273,6 @@ const KNOWN_RUNTIME_DISCREPANCIES: &[(&str, &str)] = &[
         "real jq's join errors on a non-scalar (array/object) element (delegates to `+`, which \
          itself errors mixing a string with an array/object); jqc's join silently stringifies \
          the nested value instead of validating its type first",
-    ),
-    (
-        "[.[] * \"abc\"]",
-        "off-by-one at the n=0.0 boundary for string-repeat: real jq gives \"\" for 0 <= n < 1, \
-         jqc gives null for n <= 0 (so n == 0.0 exactly comes out wrong; n < 0 and 0 < n < 1 \
-         both already agree with real jq)",
     ),
     (
         "def id(x):x; 2000 as $x | def f(x):1 as $x | id([$x, x, x]); def g(x): 100 as $x | f($x,$x+x); g($x)",
@@ -369,15 +375,6 @@ const KNOWN_RUNTIME_DISCREPANCIES: &[(&str, &str)] = &[
          (\"1e+17\"), jqc's number_from_f64 prefers a plain integer literal when one is exact, \
          and serde_json::Number's derived equality treats its float/int-parsed variants as \
          unequal even when the mathematical value is identical",
-    ),
-    (
-        "try (. * 1000000000) catch .",
-        "a memory-safety gap, not just a wrong answer: real jq caps string-repeat output size \
-         and errors (\"Repeat string result too long\"); jqc's string * number has no such \
-         limit and actually allocates the full ~3GB result for this input -- the same class of \
-         resource-exhaustion concern as the CVE-regression stack overflows above, just a \
-         memory bound instead of a stack one, worth prioritizing alongside those rather than \
-         leaving indefinitely",
     ),
     // (A cluster of extreme-exponent literals near this one in jq.test,
     // e.g. 9E999999999, needed no entry here at all: real jq's own
