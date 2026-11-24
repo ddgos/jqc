@@ -41,14 +41,13 @@ const SIZES: &[usize] = &[10, 1_000, 100_000];
 /// dominates) doesn't need the largest input to demonstrate.
 const JQ_COMPARISON_SIZES: &[usize] = &[10, 1_000];
 
-/// Runs `filter` against `input` via the real `jq` binary on `PATH` (the
-/// Nix dev shell provides it). This is deliberately *not* a fair "jq is
-/// slow" comparison: it's dominated by spawning a process and piping JSON
-/// through it as text, not by jq's own evaluation time -- which is the
-/// point. `jq!` bakes the filter into the binary at compile time, so a
-/// running program pays none of that per call the way shelling out to
-/// real `jq` would.
-fn run_jq(filter: &str, input: &Value) -> Vec<Value> {
+/// Spawns `jq -c <filter>`, writes `payload` to its stdin, and returns its
+/// stdout. Writes on a separate thread rather than blocking on
+/// `write_all` before reading any output: for a payload larger than the
+/// OS pipe buffer (64KB-ish on Linux), writing it all up front can
+/// deadlock once jq's own stdout pipe also fills up with unread output
+/// and both sides end up blocked waiting on each other.
+fn jq_pipe(filter: &str, payload: String) -> Vec<u8> {
     use std::io::Write;
     use std::process::{Command, Stdio};
 
@@ -60,17 +59,71 @@ fn run_jq(filter: &str, input: &Value) -> Vec<Value> {
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn jq (is it on PATH?)");
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(input.to_string().as_bytes())
-        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let writer = std::thread::spawn(move || {
+        stdin.write_all(payload.as_bytes()).unwrap();
+    });
     let out = child.wait_with_output().expect("jq exited");
-    serde_json::Deserializer::from_slice(&out.stdout)
+    writer.join().expect("stdin writer thread panicked");
+    out.stdout
+}
+
+/// Runs `filter` against `input` via the real `jq` binary on `PATH` (the
+/// Nix dev shell provides it). This is deliberately *not* a fair "jq is
+/// slow" comparison: it's dominated by spawning a process and piping JSON
+/// through it as text, not by jq's own evaluation time -- which is the
+/// point. `jq!` bakes the filter into the binary at compile time, so a
+/// running program pays none of that per call the way shelling out to
+/// real `jq` would.
+fn run_jq(filter: &str, input: &Value) -> Vec<Value> {
+    let stdout = jq_pipe(filter, input.to_string());
+    serde_json::Deserializer::from_slice(&stdout)
         .into_iter::<Value>()
         .collect::<Result<_, _>>()
         .expect("jq output should be valid JSON")
+}
+
+/// Each `jq_warm` benchmark point below batches this many evaluations
+/// into one `jq` process. Deliberately *not* driven by Criterion's own
+/// iteration count (via `iter_custom`): Criterion calibrates that count
+/// upward until a sample takes long enough to measure reliably, and for
+/// an operation this fast that meant trying to build and parse a
+/// multi-gigabyte stdin/stdout payload in one go before this was fixed to
+/// a constant.
+const WARM_REPS: u64 = 50;
+
+/// Complements `run_jq` above: spawns `jq` *once* and pipes `WARM_REPS`
+/// copies of `input` into it back to back (jq already treats a stream of
+/// concatenated top-level JSON values on stdin as that many separate
+/// inputs, emitting one output per input), instead of spawning a fresh
+/// process per evaluation. Process-spawn/startup cost is paid once and
+/// amortized over `WARM_REPS` evaluations rather than once per
+/// evaluation, isolating jq's own per-input evaluation cost from the
+/// cost of repeatedly invoking it -- real usage falls somewhere between
+/// this "warm" number and `run_jq`'s "cold" one, depending on whether a
+/// program shells out to `jq` once per request or once per batch. The
+/// per-evaluation time is this call's measured wall time divided by
+/// `WARM_REPS` (left to the caller/reader, the same way the `SIZES`
+/// benchmarks above report per-call time that Criterion already divides
+/// across elements via `Throughput`).
+fn run_jq_warm(filter: &str, input: &Value) -> Vec<Value> {
+    let mut payload = String::new();
+    for _ in 0..WARM_REPS {
+        payload.push_str(&input.to_string());
+        payload.push('\n');
+    }
+    let stdout = jq_pipe(filter, payload);
+    let outputs: Vec<Value> = serde_json::Deserializer::from_slice(&stdout)
+        .into_iter::<Value>()
+        .collect::<Result<_, _>>()
+        .expect("jq output should be valid JSON");
+    assert_eq!(
+        outputs.len() as u64,
+        WARM_REPS,
+        "expected {WARM_REPS} outputs from a warm jq batch, got {}",
+        outputs.len()
+    );
+    outputs
 }
 
 fn bench_identity(c: &mut Criterion) {
@@ -83,8 +136,11 @@ fn bench_identity(c: &mut Criterion) {
             b.iter(|| filter(black_box(input)).unwrap());
         });
         if JQ_COMPARISON_SIZES.contains(&n) {
-            group.bench_with_input(BenchmarkId::new("jq", n), &input, |b, input| {
+            group.bench_with_input(BenchmarkId::new("jq_cold", n), &input, |b, input| {
                 b.iter(|| run_jq(".", black_box(input)));
+            });
+            group.bench_with_input(BenchmarkId::new("jq_warm", n), &input, |b, input| {
+                b.iter(|| run_jq_warm(".", black_box(input)));
             });
         }
     }
@@ -100,8 +156,11 @@ fn bench_field_access(c: &mut Criterion) {
             b.iter(|| filter(black_box(input)).unwrap());
         });
         if JQ_COMPARISON_SIZES.contains(&n) {
-            group.bench_with_input(BenchmarkId::new("jq", n), &input, |b, input| {
+            group.bench_with_input(BenchmarkId::new("jq_cold", n), &input, |b, input| {
                 b.iter(|| run_jq(".[0].name", black_box(input)));
+            });
+            group.bench_with_input(BenchmarkId::new("jq_warm", n), &input, |b, input| {
+                b.iter(|| run_jq_warm(".[0].name", black_box(input)));
             });
         }
     }
@@ -118,8 +177,11 @@ fn bench_map_select_pipeline(c: &mut Criterion) {
             b.iter(|| filter(black_box(input)).unwrap());
         });
         if JQ_COMPARISON_SIZES.contains(&n) {
-            group.bench_with_input(BenchmarkId::new("jq", n), &input, |b, input| {
+            group.bench_with_input(BenchmarkId::new("jq_cold", n), &input, |b, input| {
                 b.iter(|| run_jq("[.[] | select(.active) | .score]", black_box(input)));
+            });
+            group.bench_with_input(BenchmarkId::new("jq_warm", n), &input, |b, input| {
+                b.iter(|| run_jq_warm("[.[] | select(.active) | .score]", black_box(input)));
             });
         }
     }
@@ -136,8 +198,11 @@ fn bench_sort_by(c: &mut Criterion) {
             b.iter(|| filter(black_box(input)).unwrap());
         });
         if JQ_COMPARISON_SIZES.contains(&n) {
-            group.bench_with_input(BenchmarkId::new("jq", n), &input, |b, input| {
+            group.bench_with_input(BenchmarkId::new("jq_cold", n), &input, |b, input| {
                 b.iter(|| run_jq("sort_by(.score)", black_box(input)));
+            });
+            group.bench_with_input(BenchmarkId::new("jq_warm", n), &input, |b, input| {
+                b.iter(|| run_jq_warm("sort_by(.score)", black_box(input)));
             });
         }
     }
@@ -154,8 +219,11 @@ fn bench_reduce_sum(c: &mut Criterion) {
             b.iter(|| filter(black_box(input)).unwrap());
         });
         if JQ_COMPARISON_SIZES.contains(&n) {
-            group.bench_with_input(BenchmarkId::new("jq", n), &input, |b, input| {
+            group.bench_with_input(BenchmarkId::new("jq_cold", n), &input, |b, input| {
                 b.iter(|| run_jq("reduce .[] as $x (0; . + $x.score)", black_box(input)));
+            });
+            group.bench_with_input(BenchmarkId::new("jq_warm", n), &input, |b, input| {
+                b.iter(|| run_jq_warm("reduce .[] as $x (0; . + $x.score)", black_box(input)));
             });
         }
     }
@@ -179,8 +247,11 @@ fn bench_recurse(c: &mut Criterion) {
             b.iter(|| filter(black_box(input)).unwrap());
         });
         if JQ_COMPARISON_DEPTHS.contains(&depth) {
-            group.bench_with_input(BenchmarkId::new("jq", depth), &input, |b, input| {
+            group.bench_with_input(BenchmarkId::new("jq_cold", depth), &input, |b, input| {
                 b.iter(|| run_jq("[recurse]", black_box(input)));
+            });
+            group.bench_with_input(BenchmarkId::new("jq_warm", depth), &input, |b, input| {
+                b.iter(|| run_jq_warm("[recurse]", black_box(input)));
             });
         }
     }

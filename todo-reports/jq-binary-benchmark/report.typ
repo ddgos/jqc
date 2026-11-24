@@ -14,9 +14,10 @@ proper series alongside every existing `jqc` benchmark group.
 
 Each of the five size-swept benchmark groups (`identity`, `field_access`,
 `map_select_pipeline`, `sort_by`, `reduce_sum`) and the depth-swept
-`recurse_nested` group now has a `jq` series next to its `jqc` series,
-via a shared `run_jq(filter, input)` helper that pipes JSON through a
-freshly spawned `jq -c <filter>` subprocess and parses its output back:
+`recurse_nested` group now has a `jq_cold` series next to its `jqc`
+series, via a shared `run_jq(filter, input)` helper that pipes JSON
+through a freshly spawned `jq -c <filter>` subprocess and parses its
+output back:
 
 #diagram(
   boxes: (("input: Value", 0, 0), ("jq -c <filter>\n(subprocess)", 1, 0), ("stdout: Value", 2, 0)),
@@ -51,7 +52,7 @@ depend on reaching that depth.
 #table(
   columns: 4,
   align: (left, right, right, right),
-  [*benchmark*], [*n*], [*jqc (in-process)*], [*jq (subprocess)*],
+  [*benchmark*], [*n*], [*jqc (in-process)*], [*jq\_cold (subprocess)*],
   [identity], [10], [867 ns], [1.84 ms],
   [identity], [1,000], [210 µs], [3.19 ms],
   [sort\_by(.score)], [10], [--], [1.82 ms],
@@ -66,8 +67,64 @@ scales with the work itself -- exactly the point the original illustrative
 benchmark was making, now with numbers across sizes and filters instead
 of one.
 
+= Addendum: an amortized ("warm") jq comparison, and a pipe deadlock
+
+The numbers above are dominated by process-spawn overhead, by design --
+`run_jq` spawns a fresh `jq` per evaluation, the same way a program that
+shells out to `jq` once per request would. A fairer question for a
+program that instead batches many inputs through one long-lived `jq`
+process: with spawn cost amortized away, how does jq's own per-input
+evaluation cost compare to `jqc`'s?
+
+Each group's `jq_cold` series (one spawn per evaluation) now has a
+`jq_warm` sibling: `run_jq_warm` spawns `jq` *once* and pipes
+`WARM_REPS` (50) copies of the input through it back to back -- jq's
+stdin reader already treats a stream of concatenated top-level JSON
+values as that many separate inputs -- so spawn cost is paid once and
+amortized over 50 evaluations instead of once per evaluation.
+
+== A real bug: pipe deadlock on large batched payloads
+
+The first version wrote the whole batched payload to `jq`'s stdin before
+reading any of its stdout (the same shape `run_jq` already used
+successfully for single inputs). For `WARM_REPS` copies of a 1,000-element
+array, that payload is large enough to fill the OS pipe buffer while
+`jq`'s own stdout pipe also fills with unread output -- both sides block
+waiting on the other, and the benchmark process hangs indefinitely.
+Fixed by writing stdin on a separate thread (`jq_pipe`, now shared by
+both `run_jq` and `run_jq_warm`) so writing and reading happen
+concurrently, the standard fix for this exact class of subprocess
+deadlock.
+
+An earlier attempt also tried driving the batch size from Criterion's own
+`iter_custom` iteration count instead of a fixed `WARM_REPS` -- Criterion
+calibrates that count upward until a sample takes long enough to measure
+reliably, which for an operation this fast meant trying to build and
+parse a multi-gigabyte payload in one shot. Fixed to a plain constant
+instead.
+
+== Results (identity and sort\_by, this run)
+
+#table(
+  columns: 4,
+  align: (left, right, right, right),
+  [*benchmark*], [*n*], [*jqc*], [*jq\_warm (per-eval, spawn excluded)*],
+  [identity], [10], [893 ns], [45.3 µs (2,265 µs / 50)],
+  [identity], [1,000], [216 µs], [1.95 ms (97.4 ms / 50)],
+  [sort\_by(.score)], [1,000], [374 µs], [2.69 ms (134.5 ms / 50)],
+)
+
+Even with process-spawn fully excluded, `jqc` still beats jq's own
+per-evaluation cost by roughly 50x at `n=10` and 7--9x at `n=1,000` --
+the remaining gap is jq's JSON text parsing and tree-walking interpreter
+overhead *per call*, which `jq!` has none of: the generated closure
+operates directly on already-parsed `Value`s, with the filter's control
+flow baked into native code at compile time rather than re-interpreted
+from source every evaluation.
+
 = Verification
 
 `cargo build/test/clippy/fmt --workspace` pass; `cargo bench -p jqc --
 --test` (Criterion's single-iteration dry run) exercises every
-`jqc`/`jq` point across all six groups without panicking.
+`jqc`/`jq_cold`/`jq_warm` point across all six groups without panicking
+or hanging.
