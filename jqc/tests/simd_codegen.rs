@@ -1,3 +1,4 @@
+#![cfg(feature = "codegen-simd")]
 //! Differential tests for `SimdCodegen` (`jq!(codegen = "simd", ...)`):
 //! same ground-truth approach as `tests/differential.rs` (run both the
 //! compiled closure and real `jq`, compare), specifically for

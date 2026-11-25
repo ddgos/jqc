@@ -20,8 +20,9 @@ pub type CResult<T> = Result<T, Diagnostic>;
 
 /// A backend that turns a lowered jq AST into the Rust `TokenStream` that
 /// `jq!` expands to. [`TreeWalkCodegen`] is the default; [`SimdCodegen`]
-/// (selected via `jq!(codegen = "simd", ...)`) produces identical output
-/// for every construct *except* `ascii_downcase`/`ascii_upcase`/
+/// (selected via `jq!(codegen = "simd", ...)`, gated behind the
+/// `codegen-simd` feature -- see [`CodegenBackend`]) produces identical
+/// output for every construct *except* `ascii_downcase`/`ascii_upcase`/
 /// `contains`, which it routes to explicit-SIMD/`memchr`-backed
 /// `jqc-core` implementations instead of the plain scalar ones -- see
 /// `jqc-core/src/simd.rs`'s module doc and the `simd-codegen` todo-report
@@ -30,6 +31,67 @@ pub type CResult<T> = Result<T, Diagnostic>;
 /// heterogeneously-typed) semantics.
 pub trait Codegen {
     fn compile_top(&self, expr: &Expr) -> CResult<TokenStream>;
+}
+
+/// Which [`Codegen`] backend a `jq!` call names. Mirrors
+/// `crate::version::JqVersion`'s split between "is this a real backend
+/// name" ([`parse`](Self::parse)) and "is it compiled into *this*
+/// build" ([`is_available`](Self::is_available)) -- [`TreeWalk`](Self::TreeWalk)
+/// is the pipeline [`Simd`](Self::Simd) itself is built on top of (see
+/// this module's doc comment), so it's unconditionally available;
+/// `Simd` only under the `codegen-simd` feature, which also controls
+/// whether `jqc-core`'s `simd` module (and its `memchr` dependency) gets
+/// compiled in at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodegenBackend {
+    TreeWalk,
+    Simd,
+}
+
+impl CodegenBackend {
+    pub const ALL: [CodegenBackend; 2] = [CodegenBackend::TreeWalk, CodegenBackend::Simd];
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "treewalk" => Some(Self::TreeWalk),
+            "simd" => Some(Self::Simd),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::TreeWalk => "treewalk",
+            Self::Simd => "simd",
+        }
+    }
+
+    pub fn is_available(self) -> bool {
+        match self {
+            Self::TreeWalk => true,
+            Self::Simd => cfg!(feature = "codegen-simd"),
+        }
+    }
+
+    /// Builds the actual backend. Panics if [`is_available`](Self::is_available)
+    /// is false -- callers (the `jq!` macro) are expected to check that
+    /// first and turn it into a compile error naming the missing
+    /// feature, the same way `JqVersion::is_available` callers do.
+    pub fn to_codegen(self) -> Box<dyn Codegen> {
+        match self {
+            Self::TreeWalk => Box::new(TreeWalkCodegen),
+            Self::Simd => {
+                #[cfg(feature = "codegen-simd")]
+                {
+                    Box::new(SimdCodegen)
+                }
+                #[cfg(not(feature = "codegen-simd"))]
+                {
+                    unreachable!("CodegenBackend::Simd::to_codegen without an is_available() check")
+                }
+            }
+        }
+    }
 }
 
 /// Which `jqc-core` function backs a handful of builtins whose
@@ -45,6 +107,7 @@ pub trait Codegen {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Backend {
     TreeWalk,
+    #[cfg(feature = "codegen-simd")]
     Simd,
 }
 
@@ -68,9 +131,13 @@ impl Codegen for TreeWalkCodegen {
 /// As [`TreeWalkCodegen`], except `ascii_downcase`/`ascii_upcase`/
 /// `contains` route to `jqc-core`'s SIMD/`memchr`-backed implementations
 /// instead of the plain scalar ones -- see this module's own doc
-/// comment.
+/// comment. Only exists under the `codegen-simd` feature; select it via
+/// [`CodegenBackend`] rather than naming the type directly if the
+/// backend might not be available.
+#[cfg(feature = "codegen-simd")]
 pub struct SimdCodegen;
 
+#[cfg(feature = "codegen-simd")]
 impl Codegen for SimdCodegen {
     fn compile_top(&self, expr: &Expr) -> CResult<TokenStream> {
         BACKEND.with(|b| b.set(Backend::Simd));
@@ -1161,8 +1228,11 @@ fn compile_call(
 /// [`BACKEND`], for the handful of builtins (`ascii_downcase`/
 /// `ascii_upcase`/`contains`) `SimdCodegen` implements differently.
 fn backend_fn_name(scalar_name: &'static str, simd_name: &'static str) -> &'static str {
+    #[cfg(not(feature = "codegen-simd"))]
+    let _ = simd_name;
     match BACKEND.with(|b| b.get()) {
         Backend::TreeWalk => scalar_name,
+        #[cfg(feature = "codegen-simd")]
         Backend::Simd => simd_name,
     }
 }

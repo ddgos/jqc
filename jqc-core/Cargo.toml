@@ -7,7 +7,17 @@ description = "Runtime support types and builtin semantics for jqc-compiled jq f
 
 [dependencies]
 serde_json = { version = "1", features = ["preserve_order"] }
-memchr = "2"
+memchr = { version = "2", optional = true }
 
 [dev-dependencies]
 proptest = "1"
+
+[features]
+default = ["codegen-simd"]
+# `SimdCodegen` (`jqc-compiler`/`jqc-macros`) calls into this crate's
+# `simd` module; this feature gates that module (and the `memchr`
+# dependency it needs) so a build that only ever selects the default
+# `TreeWalkCodegen` backend doesn't pay for either. See
+# `jqc-compiler/Cargo.toml`'s matching feature and the `codegen-feature-
+# flags` todo-report.
+codegen-simd = ["dep:memchr"]

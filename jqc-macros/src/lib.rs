@@ -13,9 +13,15 @@
 //!
 //! `jq!(codegen = "simd", "<filter>")` selects `jqc_compiler::codegen`'s
 //! `SimdCodegen` instead of the default `TreeWalkCodegen` -- identical
-//! output except for `ascii_downcase`/`ascii_upcase`, which it backs
-//! with an explicit-SIMD `jqc-core` implementation. `version` and
-//! `codegen` can both be given, in either order, before the filter.
+//! output except for `ascii_downcase`/`ascii_upcase`/`contains`, which it
+//! backs with explicit-SIMD/`memchr` `jqc-core` implementations. `version`
+//! and `codegen` can both be given, in either order, before the filter.
+//! Like `version`, which backends are *available* to select is Cargo-
+//! feature-gated -- `codegen-simd` (on `jqc`/`jqc-macros`/`jqc-compiler`/
+//! `jqc-core`), on by default; naming `"simd"` with that feature disabled
+//! is a compile error, the same as an unavailable `version`. `"treewalk"`
+//! has no feature of its own since it's the pipeline every backend
+//! (including `simd`) is built on, so it's always available.
 //!
 //! Requires the `jqc` crate (not just this one) as a dependency, since the
 //! generated code references `::jqc::core::*`.
@@ -32,7 +38,7 @@ use proc_macro2::Span;
 use syn::parse::{Parse, ParseStream};
 use syn::{LitStr, Token};
 
-use jqc_compiler::codegen::{Codegen, SimdCodegen, TreeWalkCodegen};
+use jqc_compiler::codegen::CodegenBackend;
 use jqc_compiler::lower;
 use jqc_compiler::version::JqVersion;
 
@@ -78,6 +84,14 @@ fn supported_versions_str() -> String {
     JqVersion::ALL
         .iter()
         .map(|v| v.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn supported_codegens_str() -> String {
+    CodegenBackend::ALL
+        .iter()
+        .map(|b| b.as_str())
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -138,21 +152,45 @@ pub fn jq(input: TokenStream) -> TokenStream {
         .into();
     }
 
-    let backend: Box<dyn Codegen> = match &parsed.codegen {
-        None => Box::new(TreeWalkCodegen),
-        Some(lit) => match lit.value().as_str() {
-            "treewalk" => Box::new(TreeWalkCodegen),
-            "simd" => Box::new(SimdCodegen),
-            other => {
+    let codegen_backend = match &parsed.codegen {
+        None => CodegenBackend::TreeWalk,
+        Some(lit) => match CodegenBackend::parse(&lit.value()) {
+            Some(b) => b,
+            None => {
                 return syn::Error::new(
                     lit.span(),
-                    format!("jq!: unknown codegen backend {other:?} (supported: \"treewalk\", \"simd\")"),
+                    format!(
+                        "jq!: unknown codegen backend {:?} (supported: {})",
+                        lit.value(),
+                        supported_codegens_str()
+                    ),
                 )
                 .to_compile_error()
                 .into();
             }
         },
     };
+
+    if !codegen_backend.is_available() {
+        let span = parsed
+            .codegen
+            .as_ref()
+            .map(|c| c.span())
+            .unwrap_or_else(Span::call_site);
+        return syn::Error::new(
+            span,
+            format!(
+                "jq!: codegen backend \"{}\" is valid but not enabled -- add feature \
+                 \"codegen-{}\" to your jqc dependency",
+                codegen_backend.as_str(),
+                codegen_backend.as_str()
+            ),
+        )
+        .to_compile_error()
+        .into();
+    }
+
+    let backend = codegen_backend.to_codegen();
 
     let src = parsed.filter.value();
     // parse_and_lower's own errors come back already relocated to `src`'s

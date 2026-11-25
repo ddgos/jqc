@@ -6,8 +6,8 @@ license.workspace = true
 description = "Compile jq filters to native Rust code at build time via the jq! macro"
 
 [dependencies]
-jqc-core = { path = "../jqc-core", version = "0.1.0" }
-jqc-macros = { path = "../jqc-macros", version = "0.1.0" }
+jqc-core = { path = "../jqc-core", version = "0.1.0", default-features = false }
+jqc-macros = { path = "../jqc-macros", version = "0.1.0", default-features = false }
 
 [dev-dependencies]
 serde_json = "1"
@@ -15,12 +15,16 @@ proptest = "1"
 criterion = "0.8"
 
 [features]
-default = ["jq-1-8"]
+default = ["jq-1-8", "codegen-simd"]
 # Which jq language-version(s) `jq!(version = "...", ...)` can select;
 # see jqc_compiler::version. Not mutually exclusive.
 jq-1-6 = ["jqc-macros/jq-1-6"]
 jq-1-7 = ["jqc-macros/jq-1-7"]
 jq-1-8 = ["jqc-macros/jq-1-8"]
+# Whether `jq!(codegen = "simd", ...)` can select `SimdCodegen`; see
+# jqc_compiler::codegen::CodegenBackend. Also controls jqc-core's
+# `simd` module/`memchr` dependency.
+codegen-simd = ["jqc-macros/codegen-simd", "jqc-core/codegen-simd"]
 
 [[bench]]
 name = "compiled_filters"

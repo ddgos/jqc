@@ -11,10 +11,11 @@ proc-macro = true
 [dependencies]
 proc-macro2 = "1"
 syn = { version = "3", features = ["full"] }
-jqc-compiler = { path = "../jqc-compiler", version = "0.1.0" }
+jqc-compiler = { path = "../jqc-compiler", version = "0.1.0", default-features = false }
 
 [features]
-default = ["jq-1-8"]
+default = ["jq-1-8", "codegen-simd"]
 jq-1-6 = ["jqc-compiler/jq-1-6"]
 jq-1-7 = ["jqc-compiler/jq-1-7"]
 jq-1-8 = ["jqc-compiler/jq-1-8"]
+codegen-simd = ["jqc-compiler/codegen-simd"]

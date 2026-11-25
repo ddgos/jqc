@@ -8,9 +8,11 @@
 
 mod error;
 mod helpers;
+#[cfg(feature = "codegen-simd")]
 mod simd;
 
 pub use error::{bubble, bubble1, partial_for, JResult, JqError};
 pub use helpers::*;
 pub use serde_json::{json, Map, Number, Value};
+#[cfg(feature = "codegen-simd")]
 pub use simd::{simd_ascii_downcase, simd_ascii_upcase, simd_contains_value};

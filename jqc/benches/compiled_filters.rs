@@ -405,6 +405,7 @@ fn bench_recurse(c: &mut Criterion) {
 /// `jqc-core/src/simd.rs`'s doc comment) -- over ASCII strings of
 /// increasing length, the regime SIMD's fixed per-element setup cost
 /// should pay off in most clearly.
+#[cfg(feature = "codegen-simd")]
 fn bench_ascii_downcase_simd(c: &mut Criterion) {
     let treewalk = jq!("ascii_downcase");
     let simd = jq!(codegen = "simd", "ascii_downcase");
@@ -429,6 +430,7 @@ fn bench_ascii_downcase_simd(c: &mut Criterion) {
 /// comment). The needle is never present, forcing a full scan of the
 /// haystack -- the regime a tuned substring search should separate
 /// itself from a naive one most clearly.
+#[cfg(feature = "codegen-simd")]
 fn bench_contains_simd(c: &mut Criterion) {
     let treewalk = jq!(r#"contains("needle-not-present")"#);
     let simd = jq!(codegen = "simd", r#"contains("needle-not-present")"#);
@@ -447,6 +449,7 @@ fn bench_contains_simd(c: &mut Criterion) {
     group.finish();
 }
 
+#[cfg(feature = "codegen-simd")]
 criterion_group!(
     benches,
     bench_identity,
@@ -457,5 +460,15 @@ criterion_group!(
     bench_recurse,
     bench_ascii_downcase_simd,
     bench_contains_simd,
+);
+#[cfg(not(feature = "codegen-simd"))]
+criterion_group!(
+    benches,
+    bench_identity,
+    bench_field_access,
+    bench_map_select_pipeline,
+    bench_sort_by,
+    bench_reduce_sum,
+    bench_recurse,
 );
 criterion_main!(benches);

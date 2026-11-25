@@ -15,7 +15,7 @@ criterion = "0.8"
 libc = "0.2"
 
 [features]
-default = ["jq-1-8"]
+default = ["jq-1-8", "codegen-simd"]
 # Which jq language-version semantics are available for a `jq!(version =
 # "...", ...)` call to select (see src/version.rs). Not mutually
 # exclusive -- enable more than one to support multiple versions in the
@@ -23,3 +23,10 @@ default = ["jq-1-8"]
 jq-1-6 = []
 jq-1-7 = []
 jq-1-8 = []
+# Whether `jq!(codegen = "simd", ...)` can select `SimdCodegen` (see
+# src/codegen.rs's `CodegenBackend`). The default `TreeWalkCodegen` is
+# the pipeline `SimdCodegen` itself is built on, so it has no feature of
+# its own -- it's unconditionally available. Off, a build doesn't emit
+# references to `jqc-core`'s `simd` module, so `jqc-core` itself can drop
+# its `codegen-simd` feature (and the `memchr` dependency it brings in).
+codegen-simd = []
