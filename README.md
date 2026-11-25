@@ -168,6 +168,32 @@ below), and builtins: `map`, `select`, `values`, `recurse(;f)`, `in`,
   inside any `foreach`/`reduce`/`as`/`label` as long as their own
   `cond`/`update`/`f` argument doesn't reach outside itself either -- the
   overwhelmingly common case.
+- **A NaN or infinite intermediate result (`sqrt` of a negative number,
+  arithmetic overflow, …) can't stay "a number" the way it does in real
+  jq.** Real jq's own number type can hold a NaN/infinite value and keeps
+  reporting it as a number (`type`, `has`, further arithmetic, …) all the
+  way through the pipeline, *only* converting it at the final JSON-output
+  step (NaN becomes the JSON literal `null`; +-infinity clamps to
+  +-`f64::MAX` -- confirmed directly, not just assumed: `jq -n '1e308 *
+  10'` prints `1.7976931348623157e+308`). `jqc`'s `Value` is a plain
+  `serde_json::Value`, whose `Number` type has no way to represent NaN or
+  infinity at all (`serde_json::Number::from_f64` rejects both outright)
+  -- so `number_from_f64` converts NaN straight to `Value::Null` and
+  clamps infinity to a finite `Number`, matching real jq exactly *when
+  that's the filter's final, directly-printed output* (confirmed:
+  `sqrt(-1)`, `"nan" | tonumber`, arithmetic overflow all now match), but
+  diverging the moment anything downstream inspects the value *as a
+  number* before it's printed -- confirmed directly: `((-2)|sqrt) | type`
+  gives `"null"` here vs real jq's `"number"`; `((-2)|sqrt) | has("a")`
+  succeeds with `false` here vs real jq *erroring* ("Cannot check whether
+  number has a string key"); `((-2)|sqrt) + 1` gives `1` here vs real
+  jq's `null` (NaN propagates through `+`, landing back on the same
+  can't-print-NaN case). Fixing this for real would mean a `Value::Number`
+  that can hold an actual `f64` (including non-finite ones) instead of
+  `serde_json::Number` -- a materially different value representation,
+  not a local fix (see the `serde-audit` todo-report for why `serde_json`
+  is otherwise a good fit, not worth replacing wholesale for this one
+  edge case).
 - Not implemented: `path`/`paths`/`getpath`/`setpath`/`del`, update-
   assignment operators (`|=`, `+=`, …), `input`/`inputs`/`$ENV`,
   SQL-style ops, module `import`/`include`.

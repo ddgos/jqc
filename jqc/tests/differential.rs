@@ -232,6 +232,44 @@ difftest!(
     r#"[("nan" | tonumber), ("infinity" | tonumber)]"#,
     "null"
 );
+#[test]
+fn nan_consumed_before_print_diverges_from_real_jq() {
+    // A genuine, documented (README's "Known limitations") gap, not an
+    // oversight: real jq's own number type can hold NaN and keeps
+    // reporting it as a number all the way through the pipeline, only
+    // converting to the JSON literal `null` at the final output step.
+    // `jqc`'s `Value` is a plain `serde_json::Value`, whose `Number` has
+    // no way to represent NaN at all -- `number_from_f64` converts it to
+    // `Value::Null` immediately, matching real jq exactly when that's the
+    // filter's own final output (see `sqrt_negative_is_null` above), but
+    // diverging the moment something downstream inspects it *as a
+    // number* first. Confirmed directly against real jq for all three:
+    // `((-2)|sqrt) | type` is `"number"`; `((-2)|sqrt) | has("a")` is a
+    // runtime error ("Cannot check whether number has a string key");
+    // `((-2)|sqrt) + 1` is `null` (NaN propagates through `+`).
+    let input: Value = serde_json::from_str("null").unwrap();
+
+    let type_of_nan = jqc::jq!("((-2)|sqrt) | type");
+    assert_eq!(
+        type_of_nan(&input).unwrap(),
+        vec![Value::String("null".to_string())],
+        "jqc reports a consumed-NaN's type as \"null\"; real jq reports \"number\""
+    );
+
+    let has_on_nan = jqc::jq!("((-2)|sqrt) | has(\"a\")");
+    assert_eq!(
+        has_on_nan(&input).unwrap(),
+        vec![Value::Bool(false)],
+        "jqc's has() succeeds on a consumed NaN; real jq errors"
+    );
+
+    let plus_on_nan = jqc::jq!("((-2)|sqrt) + 1");
+    assert_eq!(
+        plus_on_nan(&input).unwrap(),
+        vec![serde_json::json!(1)],
+        "jqc's + absorbs a consumed NaN as null-plus-1; real jq propagates NaN, printing null"
+    );
+}
 difftest!(reverse_array, "reverse", "[1,2,3]");
 difftest!(range_1, "[range(5)]", "null");
 difftest!(range_2, "[range(2;5)]", "null");
