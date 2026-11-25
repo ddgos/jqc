@@ -87,6 +87,18 @@ flake-check:
 reports:
     nix run .#build-reports
 
+# Build a standalone binary for an arbitrary jq script file straight into the nix store.
+# Flake outputs can't take positional runtime args, so this wraps the one incantation
+# that can (lib.mkJqScript via --impure --expr) and prints just the binary's own path --
+# e.g. `echo '{}' | "$(just build-script myscript.jq)"` builds then runs it.
+build-script script:
+    @set -euo pipefail; \
+    script="$(realpath "{{script}}")"; \
+    name="$(basename "$script" .jq)"; \
+    out="$(nix build --impure --no-link --print-out-paths --expr \
+        "(builtins.getFlake (toString {{justfile_directory()}})).lib.mkJqScript builtins.currentSystem $script")"; \
+    echo "$out/bin/$name"
+
 # --- bundles -----------------------------------------------------------
 
 # Formatting, lints, the fast suite, both $JQ_SRC suites, a flake check. Excludes fuzz_scripts/benchmarks.

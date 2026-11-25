@@ -38,6 +38,17 @@ builds `jqc-build/examples/select-active.jq` this way as a Nix derivation
 (reproducibly, offline -- see `mkJqScript` in `flake.nix`, exposed as
 `lib.mkJqScript` for other flakes to build their own scripts this way).
 
+Flake outputs are static attribute paths, so there's no literal `nix build
+<flake> <script.jq>` for an *arbitrary* script file picked at the command
+line -- but `lib.mkJqScript` being exposed means `--impure --expr` can still
+reach it for one picked at runtime: `just build-script <script.jq>` wraps
+exactly that (`nix build --impure --expr
+'(builtins.getFlake ...).lib.mkJqScript builtins.currentSystem <script>'`)
+and prints just the resulting binary's path, so
+`echo '{}' | "$(just build-script myscript.jq)"` builds then runs it in one
+line, same reproducible/offline nix-store build as `example-script` above,
+for any script instead of one hardcoded one.
+
 It caps the `cargo build` it shells out to at a fraction of physical RAM
 (`JQC_BUILD_MEM_LIMIT_GB` to override) as defense-in-depth against a
 pathological script's compile blowing up the host rather than just that one
