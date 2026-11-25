@@ -125,18 +125,6 @@ fn parse_c_tests(src: &str) -> Vec<CTestCase> {
 /// is fixed and its case goes green on its own.
 const KNOWN_RUNTIME_DISCREPANCIES: &[(&str, &str)] = &[
     (
-        "[limit(1; 1, error)]",
-        "jqc is eager: limit(n; exp)'s `exp` is fully evaluated (hitting `error`) before \
-         foreach/break ever gets a chance to short-circuit away from it, unlike real jq's lazy \
-         generators -- the same root cause as the next entry, and ultimately the README's \
-         documented \"eager, not lazy\" limitation, not a bug specific to limit/break",
-    ),
-    (
-        "first(1,error(\"foo\"))",
-        "same eager-evaluation root cause as limit(1; 1, error) above: first(f)'s `f` is fully \
-         evaluated (hitting `error`) before first's own label/break short-circuit ever runs",
-    ),
-    (
         "[limit(5,7; range(9))]",
         "limit's `n` parameter is a filter (call-by-name) argument referenced three times in its \
          body (the `if`/`elif` conditions and foreach's extract clause); real jq's closure \
@@ -256,16 +244,6 @@ const KNOWN_RUNTIME_DISCREPANCIES: &[(&str, &str)] = &[
     // against jq.test, past the CVE-regression cluster above -- found,
     // documented, deliberately left unfixed per instruction rather than
     // chased down further in the same sitting as building this generator.
-    (
-        "any(true, error; .)",
-        "same eager-evaluation root cause as limit(1; 1, error) above (see that entry): \
-         any(g; cond)'s `g` is fully evaluated (hitting `error`) before any's own \
-         short-circuit-on-first-true ever gets a chance to run",
-    ),
-    (
-        "all(false, error; .)",
-        "same eager-evaluation root cause as any(true, error; .) above, via all/false instead",
-    ),
     (
         "split(\"\")",
         "real jq's split(\"\") splits into individual characters; jqc's split errors instead \

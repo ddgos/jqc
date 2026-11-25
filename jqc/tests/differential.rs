@@ -381,6 +381,70 @@ difftest!(
     r#"{"a":[1,2],"b":10}"#
 );
 
+difftest!(
+    lazy_limit_over_infinite_while,
+    // The headline bug the eager->lazy codegen rewrite fixed: `while(true;.)`
+    // never terminates, so any eager evaluation of it (materializing a
+    // `Vec<Value>` before `limit` gets to see any of it) stack-overflows.
+    // Only works if `while`'s generator is genuinely pulled lazily.
+    "[limit(3; while(true;.))]",
+    "null"
+);
+difftest!(lazy_limit_over_repeat, "[limit(3; repeat(true))]", "null");
+difftest!(
+    lazy_first_over_repeat,
+    // Same shape as `lazy_limit_over_repeat` but via `first`, which
+    // internally uses its own `limit(1; ...)` -- regression guard for that
+    // specific builtin's laziness, not just `limit` itself.
+    "first(repeat(1))",
+    "null"
+);
+difftest!(
+    lazy_user_foreach_piped_into_limit,
+    // Unlike the two cases above, this `foreach` is user-written (not a
+    // builtin's internal use of `foreach`) and is piped into `limit` from
+    // the *outside* -- proving `ForeachGen` is a real external lazy
+    // generator that `limit` can pull from incrementally, not merely
+    // internally lazy but collected into a `Vec` before `limit` ever sees
+    // it.
+    "[limit(3; foreach repeat(1) as $x (0; .+1; $x))]",
+    "null"
+);
+difftest!(
+    lazy_any_short_circuits_past_error,
+    // `any`/`all` used to be implemented via `reduce`, which (unlike
+    // `first`/`limit`) can't short-circuit at all -- it must drain its
+    // whole source before returning, so this would hit `error` instead of
+    // stopping at the first `true`. Rewritten (matching real jq's own
+    // `isempty`/`first`-based definition) to actually short-circuit now
+    // that `first` is genuinely lazy.
+    "any(true, error; .)",
+    "null"
+);
+difftest!(
+    lazy_all_short_circuits_past_error,
+    "all(false, error; .)",
+    "null"
+);
+difftest!(
+    sort_by_key_referencing_outer_foreach_var,
+    // Regression test for a real compile-time bug found by fuzzing this
+    // rewrite: `compile_by` (the shared codegen for `sort_by`/`group_by`/
+    // `unique_by`/`min_by`/`max_by`) spliced its key filter's compiled
+    // code into a runtime `for` loop (once per array element) without
+    // isolating it -- fine as long as the key filter was self-contained,
+    // but if it referenced an in-scope `$var` from an enclosing
+    // `foreach`/`reduce`/`as` (here, `$x`, unused by the key itself but
+    // still in scope), the *first* loop iteration's compiled closure
+    // captured that outer variable *by move*, leaving nothing for the
+    // second iteration to clone from -- a real `E0382` ("use of moved
+    // value ... in previous iteration of loop"), not a runtime
+    // discrepancy. Fixed by isolating `compile_by`'s key filter the same
+    // way `Reduce`'s own per-item loop already isolates its `update`.
+    "[foreach (1,2,3) as $x (0; sort_by((2.4|fabs))?)]",
+    "null"
+);
+
 #[test]
 fn optional_only_suppresses_its_own_step() {
     // `.a.b.c?` -- the `?` binds to `.c` only; the error from `.a.b`

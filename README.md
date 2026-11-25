@@ -134,19 +134,6 @@ below), and builtins: `map`, `select`, `values`, `recurse(;f)`, `in`,
 
 ## Known limitations
 
-- **Eager, not lazy.** Every sub-expression evaluates to a fully-materialized
-  `Vec<Value>`. This keeps codegen tractable (no generic-iterator-type
-  explosion) but means **a genuinely infinite generator crashes (stack
-  overflow via its recursive desugaring), it doesn't just run forever**:
-  `repeat`, or `while`/`until`/`recurse` with a condition that never goes
-  false, has to finish producing its *entire* output before anything
-  downstream -- including `limit`/`label`/`break`, whose own desugaring is
-  just as eager -- ever gets a chance to run and cut it short; confirmed
-  directly (`[limit(3; while(true; .))]` stack-overflows, it does not stay
-  bounded at 3). `limit`/`label`/`break` *do* still work for cutting an
-  early exit out of a generator that's merely large, not infinite (e.g.
-  stopping partway through a big but finite `range`), since there the
-  underlying generator actually terminates on its own, eventually.
 - **No `?//` alternative destructuring patterns** (`as [$a] ?// {a: $a}`,
   for matching one of several shapes depending on the input). Plain
   destructuring (`as [$a, $b]`, `as {a: $a, $b}`, nested, computed keys)
@@ -157,6 +144,19 @@ below), and builtins: `map`, `select`, `values`, `recurse(;f)`, `in`,
   semantics) but that approach can't terminate for a recursive, parameterized
   def, so it's rejected at compile time with a clear error instead of hanging
   or silently looping forever.
+- **A recursive 0-arg `def`'s body can't reference a variable or label
+  from an *enclosing* scope.** Real jq's `def`s are proper closures over
+  their lexical environment even when recursive; jqc's "compile to a real
+  Rust `fn`" strategy for the recursive case can't support that (a plain
+  `fn` item has no closure environment at all), so a genuine free
+  reference is rejected at compile time with a clear "undefined
+  variable"/"undefined label" error instead of failing to compile the
+  generated Rust. This only bites a recursive def whose body actually
+  references something from outside itself; `while`/`until`/`repeat`/
+  `recurse(f)` (all recursive 0-arg defs under the hood) work fine nested
+  inside any `foreach`/`reduce`/`as`/`label` as long as their own
+  `cond`/`update`/`f` argument doesn't reach outside itself either -- the
+  overwhelmingly common case.
 - Not implemented: `path`/`paths`/`getpath`/`setpath`/`del`, update-
   assignment operators (`|=`, `+=`, …), `input`/`inputs`/`$ENV`,
   SQL-style ops, module `import`/`include`.

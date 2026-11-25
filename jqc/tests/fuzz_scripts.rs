@@ -204,20 +204,38 @@ fn arb_filter() -> impl Strategy<Value = String> {
             (inner.clone(), inner.clone()).prop_map(|(e, f)| format!("({e} | with_entries({f})?)")),
             (inner.clone(), inner.clone()).prop_map(|(e, f)| format!("({e} | first({f}))")),
             (inner.clone(), inner.clone()).prop_map(|(e, f)| format!("({e} | last({f}))")),
-            // `repeat(f)`/`while(c;u)`/`until(c;u)`/`recurse(f)` are
-            // deliberately never generated, bounded or not: all four
-            // desugar (jqc-compiler/src/lower.rs's prelude) to a 0-arg
-            // *recursive* `def`, and `limit(n; exp)` desugars to a
-            // `foreach exp as $x (...)` whose `exp` -- jqc being eager,
-            // not lazy -- must fully materialize as a `Vec<Value>`
-            // *before* `foreach`'s own loop (and so `limit`'s own
-            // `break`) ever runs at all. `limit(3; while(true; .))`
-            // doesn't bound anything: the `while` has to finish first,
-            // and for an arbitrary generated condition that may never
-            // itself go false, it simply never does. Bare 0-arg
-            // `recurse` is fine (bounded by the actual JSON value's own,
-            // always-finite, structure -- no user-suppliable condition
-            // involved), and is already generated above.
+            // `while(c;u)`, wrapped in an explicit `limit`, never bare: it
+            // desugars (jqc-compiler/src/lower.rs's prelude) to a 0-arg
+            // *recursive* `def` (`if cond then ., (update | r) else empty
+            // end`) that, for an arbitrary generated condition that never
+            // itself goes false, is unbounded -- bare, that's a real,
+            // unbounded hang, not a `limit`-evaluation-order bug: now that
+            // codegen is genuinely lazy (`jqc-core/src/gen.rs`'s `JGen`/
+            // `lazy_chain`), `limit(n; ...)`'s own `foreach`+`break` pulls
+            // at most `n` items from it and stops for real, so a
+            // `limit`-wrapped use is safe to generate and exercises
+            // exactly that laziness.
+            //
+            // `until(c;u)`/`repeat(f)` are deliberately *not* generated,
+            // `limit`-wrapped or not, unlike `while`: both can produce
+            // *zero* items forever rather than merely "more items than
+            // `limit` wants" -- `until`'s desugaring only ever yields on
+            // the branch where `cond` finally holds (`if cond then . else
+            // (next|_until) end`), so `until(false; .)` (cond constantly
+            // false, state never changing) recurses endlessly without
+            // producing anything for `limit` to count against; `repeat(f)`
+            // is `f, _repeat_r`, so `repeat(empty)` (`f` resolving to the
+            // `empty` leaf this grammar already generates) has the same
+            // silent-zero-production hang. Neither is a laziness gap --
+            // `limit` can only bound a generator by the items it actually
+            // observes, and these can run forever while observing none,
+            // in real `jq` too (confirmed directly: `jq`'s own CLI hangs
+            // on `[limit(3; until(null; null))]` the same way) -- found by
+            // fuzzing this exact shape before a per-case timeout existed
+            // here, which is why `run_real_jq`/`run_compiled` below now
+            // have one.
+            (inner.clone(), inner.clone())
+                .prop_map(|(c, u)| format!("[limit(3; while({c}; {u}))]")),
             // String builtins taking a string-literal argument.
             arb_string_literal().prop_map(|s| format!("(. | startswith({s})?)")),
             arb_string_literal().prop_map(|s| format!("(. | endswith({s})?)")),
@@ -369,8 +387,21 @@ fn main() {{
     }
 }
 
+/// Both callers below run a filter that's valid jq syntax but of otherwise
+/// arbitrary, fuzzer-generated semantics -- including (found directly: see
+/// the `while`/`until`/`repeat` comment in `arb_filter`) ones that loop
+/// forever producing no output at all, which no amount of codegen
+/// laziness can rescue (`limit` only bounds a generator by the items it
+/// actually observes). `timeout` turns that into an ordinary non-zero
+/// exit -- already tolerated as symmetric with any other failure -- for
+/// *both* sides, rather than hanging this whole test indefinitely on one
+/// bad case.
+const PER_CASE_TIMEOUT_SECS: &str = "5";
+
 fn run_compiled(bin: &Path, input: &str) -> Result<Vec<Value>, ()> {
-    let mut child = Command::new(bin)
+    let mut child = Command::new("timeout")
+        .arg(PER_CASE_TIMEOUT_SECS)
+        .arg(bin)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -395,7 +426,9 @@ fn run_compiled(bin: &Path, input: &str) -> Result<Vec<Value>, ()> {
 }
 
 fn run_real_jq(filter: &str, input: &str) -> Result<Vec<Value>, ()> {
-    let mut child = Command::new("jq")
+    let mut child = Command::new("timeout")
+        .arg(PER_CASE_TIMEOUT_SECS)
+        .arg("jq")
         .arg("-c")
         .arg(filter)
         .stdin(Stdio::piped())

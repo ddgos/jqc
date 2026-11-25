@@ -760,9 +760,34 @@ fn compile_raw(expr: &Expr, input: &TokenStream, scope: &mut Vec<String>) -> CRe
             let update_c = update_c?;
             let extract_c = extract_c?;
             let foreach_gen = core_path("ForeachGen");
+            // `update_closure`/`extract_closure` below are two *sibling*
+            // `move` closures, both passed to `ForeachGen::new` -- unlike
+            // `update_c`/`extract_c`'s own internal `compile_isolated`
+            // re-clones (safe: those just re-clone whatever the closure
+            // already captured, fresh per *call*), a `move` closure
+            // captures whatever outer-scope `$var` it references by
+            // *moving* it out of its enclosing environment at the point
+            // the closure *literal* is constructed, not deferred to when
+            // it's called. If both closures reference the same outer
+            // `$var` (one in scope from an *enclosing* `foreach`/`reduce`/
+            // `as`, e.g. `limit`'s own internal foreach nested inside a
+            // user-written one), constructing the first one here moves it
+            // away, leaving nothing for the second's own construction --
+            // a real, reproduced `E0507` (confirmed directly: `[foreach
+            // (1,2) as $x (0; [limit(3; while(true; .))])]` failed to
+            // compile before this fix). Each gets its own independent
+            // `snapshot_scope` fresh-clone *before* its own `move |...|`
+            // literal, so the two constructions never race to consume the
+            // same shared local -- the same "two siblings sharing scope
+            // each need their own isolated copy" reasoning as
+            // `compile_isolated` itself, just applied one level further
+            // out (at closure-*construction* time, not just inside each
+            // closure's body).
+            let (extract_snap_stmt, _) = snapshot_scope(input, scope);
             let extract_closure = match extract_c {
                 Some(ec) => quote! {
                     {
+                        #extract_snap_stmt
                         #[allow(unused_variables)]
                         let __jqc_extract = move |#jv: &#value_ty, __state: &#value_ty| -> #jgen_ty {
                             #owned_prelude
@@ -776,8 +801,10 @@ fn compile_raw(expr: &Expr, input: &TokenStream, scope: &mut Vec<String>) -> CRe
                     quote! { move |_: &#value_ty, __state: &#value_ty| -> #jgen_ty { #push_state } }
                 }
             };
+            let (update_snap_stmt, _) = snapshot_scope(input, scope);
             let update_closure = quote! {
                 {
+                    #update_snap_stmt
                     #[allow(unused_variables)]
                     let __jqc_update = move |#jv: &#value_ty, __state: &#value_ty| -> #jgen_ty {
                         #owned_prelude
@@ -804,7 +831,40 @@ fn compile_raw(expr: &Expr, input: &TokenStream, scope: &mut Vec<String>) -> CRe
             // call, not `'static` -- converted to an owned local, once,
             // before `body` (whose returned `JGen` must be `'static`)
             // ever runs.
-            let body_c = compile(body, &quote!(&__jqc_owned_in), scope)?;
+            //
+            // `body` is compiled against a *fresh, empty* scope, not
+            // `scope` itself: a plain Rust `fn` item (unlike a closure)
+            // can never capture anything from its enclosing scope, so an
+            // ambient `$var`/label that happens to be in scope at this
+            // `def`'s own call site genuinely isn't accessible from
+            // inside `body` once it's compiled as one -- real jq's own
+            // `def`s are proper closures that *can* reference their
+            // lexical environment even when recursive, which jqc's
+            // "recursive 0-arg def becomes a real `fn`" strategy doesn't
+            // support; confirmed directly (`. as $limit | def r: if . >=
+            // $limit then . else (.+1|r) end; 0|r` fails to compile).
+            // Passing `scope` through unchanged here would silently emit
+            // code referencing a Rust local that doesn't exist inside
+            // `fn #fname`'s own body -- a confusing downstream rustc
+            // capture error (also reproduced directly: any of this
+            // crate's own `while`/`until`/`repeat`/`recurse(f)` nested
+            // inside so much as one enclosing `foreach`/`reduce`/`as`/
+            // `label`, *even when its own `cond`/`update`/`f` argument
+            // never references that outer binding at all*, failed to
+            // compile before this fix -- `compile_isolated`'s own
+            // unconditional "re-clone every in-scope variable, a harmless
+            // extra clone either way" doesn't hold *here*: inside a `fn`
+            // item there is no outer variable to clone from at all). An
+            // empty scope instead makes a genuine free reference surface
+            // as this crate's own, already-existing "undefined variable"/
+            // "undefined label" diagnostic (`Expr::VarRef`/`Expr::Break`
+            // below) at the point `body` actually uses it, rather than a
+            // wall of rustc output -- the same "reject cleanly instead of
+            // emitting code that can't work" choice as the recursive-
+            // with-parameters check above, just discovered one level down
+            // instead of pre-checked here.
+            let mut body_scope = Vec::new();
+            let body_c = compile(body, &quote!(&__jqc_owned_in), &mut body_scope)?;
             let rest_c = compile(rest, input, scope)?;
             Ok(quote! {
                 {
@@ -1494,7 +1554,25 @@ fn compile_by(
     // `compile_top`'s `__jqc_owned_input`: converted to an owned local,
     // once per iteration, before `key_c` (whose compiled `JGen` must be
     // `'static`) ever runs.
-    let key_c = compile(&args[0], &quote!(&__item_owned), scope)?;
+    //
+    // Isolated (see `compile_isolated`), not just `compile`d plain: this
+    // `for` loop runs once per array element, same as `Reduce`'s own
+    // per-item loop (which already isolates its `update_c` the same way)
+    // -- if the key filter references an in-scope `$var` from an
+    // enclosing `foreach`/`reduce`/`as` (not just `__item_owned`), a bare
+    // `compile` would splice one fixed copy of that reference into the
+    // loop body; the *first* runtime iteration whose compiled code builds
+    // a `'static` closure (nearly every non-leaf node does, via
+    // `flat_map_gen` et al.) would capture-by-move the single shared
+    // outer local, leaving nothing for the second iteration to clone --
+    // a real, reproduced `E0382` (confirmed directly: `[foreach (1,2,3)
+    // as $x (0; sort_by((2.4|fabs))?)]` failed to compile before this
+    // fix, "use of moved value: `__jv_x`... in previous iteration of
+    // loop"). `compile_isolated` re-clones every in-scope variable fresh
+    // *inside* the loop body text, so each runtime iteration gets its own
+    // clone to move from, never touching the shared outer one more than
+    // once.
+    let key_c = compile_isolated(&args[0], &quote!(&__item_owned), scope)?;
     let result = if wrap_array {
         quote!(::std::result::Result::Ok(#value_ty::Array(#helper(__items, __keys)?)))
     } else {
