@@ -59,6 +59,7 @@
             pkgs.cargo-tarpaulin
             pkgs.cargo-criterion
             pkgs.gnuplot
+            pkgs.just
           ] ++ extraJqBins;
           RUST_BACKTRACE = "1";
           # jqc-manual-tests-macros reads jq's own manual examples from

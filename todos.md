@@ -45,11 +45,3 @@ https://crates.io/crates?sort=downloads
 
 Consider using a different allocator as per
 https://docs.rs/simd-json/latest/simd_json/#allocator
-
-Audit all the ways this project can be tested (cargo test --workspace, the
-nix-gated jqc-manual-tests/jqc-c-tests suites, cargo clippy/fmt, the ignored
---release benchmark/scaling tests, cargo bench, nix build/flake check, the
-cargo-tarpaulin coverage setup, the ultrareview-style fuzz --ignored targets,
-...), and create a justfile collecting them as recipes, to make testing more
-reproducible (right now each of these lives only as a remembered or
-docs-buried command).

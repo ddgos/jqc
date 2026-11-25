@@ -177,6 +177,10 @@ below), and builtins: `map`, `select`, `values`, `recurse(;f)`, `in`,
 
 ## Testing
 
+Every command below is also a `just` recipe (`just --list` inside `nix
+develop`, which now provides `just`) -- `justfile` collects them so
+nothing here only lives as a remembered or docs-buried command.
+
 - `cargo test -p jqc --test differential` -- the main correctness suite:
   ~120 filters (all with no `version` argument, i.e. targeting this
   build's newest enabled jq version) run through both the compiled
