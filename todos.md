@@ -37,6 +37,34 @@ https://crates.io/crates?sort=downloads
 Consider using a different allocator as per
 https://docs.rs/simd-json/latest/simd_json/#allocator
 
+Re-investigate whether `serde_json::Value` is really the right fit, more
+skeptically than the `serde-audit` todo-report did -- that audit concluded
+"keep it", but two concrete, confirmed issues have since traced directly to
+`serde_json::Value`/`Number`'s own design, not just a cost paid for
+convenience:
+1. `serde_json::Number` cannot represent NaN or infinity at all
+   (`Number::from_f64` returns `None` for both). Real jq's own number type
+   *can* hold a non-finite value and keeps reporting it as "a number"
+   (`type`, `has`, further arithmetic, …) all the way through the pipeline,
+   only converting to `null`/a clamped finite value at the final JSON-output
+   step. Confirmed directly: `((-2)|sqrt) | type` gives `"number"` in real
+   jq, `"null"` in jqc; `((-2)|sqrt) | has("a")` errors in real jq, succeeds
+   in jqc; `((-2)|sqrt) + 1` is `null` in real jq (NaN propagates), `1` in
+   jqc. See README's "Known limitations" and the `nan_consumed_before_
+   print_diverges_from_real_jq` test in `jqc/tests/differential.rs`.
+2. `serde_json::Value`'s `Drop` is recursive and, being a foreign type,
+   can't be made non-recursive -- a value nested past ~500 levels can
+   overflow the stack from construction/drop alone, independent of which
+   operation touches it. See README's "Extremely deeply nested values" bullet.
+Both stem from the same root cause: `jqc-core::Value` is a direct re-export
+of `serde_json::Value`, not a owned/custom type, so jqc has no way to fix
+either without replacing the value representation outright. Investigate
+properly whether a custom `Value` enum (plain `f64` field instead of
+`serde_json::Number`, non-recursive `Drop`) is actually worth the rewrite --
+estimate the real scope of the change (how much of `jqc-core`/`jqc-cli`
+touches `Value` directly), and only implement if the answer is genuinely
+yes, not just "it would fix these two issues in isolation".
+
 Allow the `import`/`include` feature to work (currently unimplemented --
 see README's "Not implemented" list). Since `jq!`'s filter is a compile-time
 literal, a module whose content isn't known until runtime can't be compiled
