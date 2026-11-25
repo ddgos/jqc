@@ -7,11 +7,13 @@
 //! None of this crate parses or interprets jq syntax at runtime.
 
 mod error;
+mod gen;
 mod helpers;
 #[cfg(feature = "codegen-simd")]
 mod simd;
 
-pub use error::{bubble, bubble1, partial_for, JResult, JqError};
+pub use error::{JResult, JqError};
+pub use gen::{alt_gen, catch_gen, collect_gen, flat_map_gen, lazy_chain, ForeachGen, JGen};
 pub use helpers::*;
 pub use serde_json::{json, Map, Number, Value};
 #[cfg(feature = "codegen-simd")]

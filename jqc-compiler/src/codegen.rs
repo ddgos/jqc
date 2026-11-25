@@ -3,12 +3,16 @@
 //! Every [`compile`] call takes `input`, a token stream that must be a valid
 //! Rust expression of type `&jqc::core::Value` (the current `.`), and
 //! returns a token stream that is a valid Rust expression of type
-//! `jqc::core::JResult<Vec<jqc::core::Value>>`. Composite nodes (pipe,
-//! comma, binops, …) are cartesian products over their operands' output
-//! streams, matching jq's generator semantics; each sub-expression is
-//! compiled into its own nested block, so plain repeated local names are
-//! safe across sibling/nested calls (ordinary Rust block scoping keeps them
-//! from colliding) and no fresh-name counter is needed.
+//! `jqc::core::JGen` -- a lazy, pull-based generator (see
+//! `jqc-core/src/gen.rs`'s module doc for why: it's what lets a genuinely
+//! infinite generator (`repeat`, `while(true;.)`) be bounded from outside
+//! (`limit`, `label`/`break`, `first`) without needing to finish first).
+//! Composite nodes (pipe, comma, binops, …) lazily flatten their operands'
+//! generators together, matching jq's own generator semantics; each
+//! sub-expression is compiled into its own nested closure, so plain
+//! repeated local names are safe across sibling/nested calls (ordinary Rust
+//! closure scoping keeps them from colliding) and no fresh-name counter is
+//! needed.
 
 use proc_macro2::{Ident, TokenStream};
 use quote::{format_ident, quote};
@@ -173,127 +177,238 @@ fn label_key(name: &str) -> String {
     format!("\0label\0{name}")
 }
 
-/// `let #binding = #fetch_or_bubble(...)` fetches a fallible step's own
-/// `Vec<Value>` result into `binding` (for further per-element processing
-/// right there, unlike [`partial_aware_for`]'s pass-through case) while
-/// still merging a pre-existing `__out: Vec<Value>` accumulator into the
-/// error's `emitted` on failure, the same way [`core::bubble`] would --
-/// used by `Expr::Reduce`/`Expr::Foreach`'s `update` clause, which must
-/// fetch (not just extend-and-discard) its own result to drive the next
-/// iteration's state, but can still fail (e.g. a `break` from inside it)
-/// after `__out` already holds completed earlier iterations' output. A
-/// bare `(#expr)?` here -- what this replaced -- would propagate that
-/// error while silently discarding everything `__out` already had.
-fn fetch_or_bubble(binding: TokenStream, expr: TokenStream) -> TokenStream {
+/// Many composite nodes need to reference the ambient `.` from more than
+/// one place, with at least one of those places ending up inside a
+/// closure that must be `'static` (passed to `flat_map_gen`/`lazy_chain`/
+/// `catch_gen`/`alt_gen`/`ForeachGen`). `input` may ultimately trace back
+/// to a borrowed `&Value` *parameter* (the top-level filter closure's own
+/// argument, a recursive `fn`'s parameter, …) whose lifetime is tied to
+/// one particular call, not `'static` -- merely *referencing* that
+/// parameter (even just to `.clone()` it) from inside such a closure's
+/// body is already a hard lifetime error, since the closure then captures
+/// a non-`'static` reference as part of its own type.
+///
+/// The fix: clone `input`'s value into a fresh, block-scoped, owned local
+/// *before* (lexically outside) constructing the closure, and compile
+/// whatever needs to go *inside* that closure against a `&`-reference to
+/// *that* local instead -- since the local is an owned `Value` (no
+/// lifetime parameter at all), a closure capturing *it* is trivially
+/// `'static`, however many further closures it's nested inside. The
+/// returned `stmt` must be spliced immediately before, in the same block
+/// as, the combinator call that builds the closure; `tok` is what to pass
+/// as that inner compilation's `input`.
+fn snapshot_input(input: &TokenStream) -> (TokenStream, TokenStream) {
+    let value_ty = core_path("Value");
+    let amb = quote!(__jqc_amb);
+    // `#[allow(unused_variables)]`: some callers apply this defensively
+    // (e.g. at every level of an N-ary nesting chain) without separately
+    // proving each individual level's body actually goes on to reference
+    // it -- a harmless extra clone either way, but without this a level
+    // that happens not to need it would otherwise warn in every crate
+    // that depends on `jqc` and uses the affected construct.
+    let stmt = quote! {
+        #[allow(unused_variables)]
+        let #amb: #value_ty = (#input).clone();
+    };
+    (stmt, quote!(&#amb))
+}
+
+/// As [`snapshot_input`], but also re-clones every `$`-bound variable
+/// currently in `scope` (not just the ambient input) into a fresh local
+/// shadowing its own name -- a bound variable is exactly as liable to be
+/// captured-by-move into one sibling's own internal `'static` closure
+/// (practically every non-leaf node builds one, via [`flat_map_for`] or
+/// similar) as the ambient input is, which would otherwise leave nothing
+/// for another sibling -- compiled separately, in the same scope -- that
+/// also references it. Label markers (see `label_key`) are skipped; only
+/// real variables need a Rust local to shadow.
+fn snapshot_scope(input: &TokenStream, scope: &[String]) -> (TokenStream, TokenStream) {
+    let (mut stmt, new_input) = snapshot_input(input);
+    let value_ty = core_path("Value");
+    for name in scope {
+        if name.starts_with('\0') {
+            continue;
+        }
+        let jv = jv_ident(name);
+        stmt.extend(quote! {
+            #[allow(unused_variables)]
+            let #jv: #value_ty = #jv.clone();
+        });
+    }
+    (stmt, new_input)
+}
+
+/// Compiles `expr` as a fully self-contained, isolated block: its own
+/// fresh clone of the ambient input and every in-scope variable (see
+/// [`snapshot_scope`]), consumed only by its own code. Use this (instead
+/// of a bare [`compile`]) for *every* child of a node with two or more
+/// children that share the same enclosing scope -- `If`'s `cond`/`then`/
+/// `else`, `BinOp`'s/`Index`'s/`Pipe`'s/`And`/`Or`'s/`Alt`'s/`Comma`'s two
+/// operands, `cartesian_args`'s N arguments, `Slice`'s/`range`'s up-to-
+/// three bounds, `VarBind`'s `source`/`body`, `TryCatch`'s `body`/`catch`
+/// -- since *any* of them might itself be (or contain) a node that builds
+/// its own internal `'static` closure, and that closure's capture would
+/// otherwise consume a shared local out from under a sibling compiled
+/// separately, whether that sibling runs earlier (as this node's own
+/// eager argument) or later (nested inside a closure this node builds).
+fn compile_isolated(
+    expr: &Expr,
+    input: &TokenStream,
+    scope: &mut Vec<String>,
+) -> CResult<TokenStream> {
+    let (stmt, new_input) = snapshot_scope(input, scope);
+    let code = compile(expr, &new_input, scope)?;
+    Ok(quote! { { #stmt #code } })
+}
+
+/// Builds a `JGen`-typed expression that lazily flat-maps `sub_c`'s own
+/// generator: for each item it pulls, binds it to `item_ident` and
+/// evaluates `body` (itself a `JGen`-typed expression). The codegen-side
+/// counterpart of `jqc_core::flat_map_gen` -- every pass-through node
+/// (`Pipe`, `Field`, `BinOp`'s operands, …) nests this exactly where it
+/// nests the sub-expression structurally in the source.
+fn flat_map_for(sub_c: &TokenStream, item_ident: &TokenStream, body: TokenStream) -> TokenStream {
+    let flat_map_gen = core_path("flat_map_gen");
+    let value_ty = core_path("Value");
+    let jgen_ty = core_path("JGen");
     quote! {
-        let #binding = match #expr {
-            ::std::result::Result::Ok(v) => v,
-            ::std::result::Result::Err(mut e) => {
-                let mut __taken = ::std::mem::take(&mut __out);
-                __taken.append(&mut e.emitted);
-                e.emitted = __taken;
-                return Err(e);
-            }
-        };
+        #flat_map_gen((#sub_c), move |#item_ident: #value_ty| -> #jgen_ty { #body })
     }
 }
 
-/// Builds a `JResult<Vec<Value>>`-typed expression that iterates `sub_c`'s
-/// output, binding each element to `item_ident` and running `body` once
-/// per element -- `body` extends/pushes onto its `__out: &mut Vec<Value>`
-/// parameter (directly, or via `#core_path("bubble"/"bubble1")`, which
-/// take `&mut Vec<Value>` the same way, if it can itself fail).
-///
-/// This is for *pass-through* nodes, where each element `sub_c` produces
-/// directly feeds a piece of this node's own output (e.g. `Pipe`'s operand,
-/// `Field`'s base, `BinOp`'s operands) -- as opposed to *collector* nodes
-/// (`ArrayConstruct`, string interpolation, …) where `sub_c`'s elements are
-/// folded into one combined output and never individually observable.
-///
-/// For pass-through nodes, jq's lazy generators mean a `try`/`?` around
-/// this node must still see whatever elements were already produced before
-/// an error -- both elements `body` already pushed for earlier `sub_c`
-/// items, *and*, if `sub_c` itself fails partway through generating items,
-/// the items `sub_c` had already produced. [`core::partial_for`] (the
-/// runtime function this calls) handles that; a `return Err(e)` inside
-/// `body` only exits `body`'s own closure, becoming that function's `Err`
-/// the normal way, which it then merges with the accumulator exactly like
-/// a `body` that failed via `?` through `bubble`/`bubble1`.
-///
-/// Deliberately a call into a real function, not raw tokens inlined at
-/// every call site: nesting this per level of pass-through structure in
-/// the source composes additively in *generated code size*, rather than
-/// each level re-inlining the loop/merge shape as more raw tokens (what
-/// this used to do -- see `partial_for`'s own doc comment for the real
-/// blowup that caused).
-fn partial_aware_for(
-    sub_c: &TokenStream,
-    item_ident: &TokenStream,
-    body: TokenStream,
-) -> TokenStream {
-    let partial_for = core_path("partial_for");
-    let value_ty = core_path("Value");
+/// A `JGen` yielding exactly one item: `expr`, which must itself be
+/// `JResult<Value>`-typed (`Ok(v)` or `Err(e)`) -- most atomic,
+/// non-generator steps (field access, binops, unary helpers, …) compile
+/// straight to this, since `jqc-core`'s own helpers already return
+/// `JResult<Value>` directly, with nothing left to unwrap-and-rewrap the
+/// way the old `Vec`-based codegen needed.
+fn gen_once(expr: TokenStream) -> TokenStream {
+    let jgen_ty = core_path("JGen");
+    quote! { (::std::boxed::Box::new(::std::iter::once(#expr)) as #jgen_ty) }
+}
+
+/// As [`gen_once`], but for a multi-statement `body` that needs its own
+/// `?`-propagation context (chaining more than one fallible call) --
+/// wraps `body` in a `(|| -> JResult<Value> { ... })()` IIFE first, the
+/// same "pin the type right where it's produced" anchor [`compile`]
+/// itself uses, then feeds the result to [`gen_once`].
+fn gen_once_try(body: TokenStream) -> TokenStream {
     let jresult_ty = core_path("JResult");
+    let value_ty = core_path("Value");
+    gen_once(quote! { (|| -> #jresult_ty<#value_ty> { #body })() })
+}
+
+/// The empty `JGen` -- `empty`, an optional (`?`) lookup that found
+/// nothing, a caught error with nothing to substitute, …
+fn gen_empty() -> TokenStream {
+    let jgen_ty = core_path("JGen");
+    quote! { (::std::boxed::Box::new(::std::iter::empty()) as #jgen_ty) }
+}
+
+/// A `JGen` yielding exactly one `Err(expr)` -- `expr` must be
+/// `JqError`-typed.
+fn gen_err(expr: TokenStream) -> TokenStream {
+    gen_once(quote! { ::std::result::Result::Err(#expr) })
+}
+
+/// A `JGen` built from `compute`, a `JResult<Vec<Value>>`-typed
+/// expression (typically an IIFE that eagerly, fully drains one or more
+/// sub-generators to build a combined result) -- for *collector* nodes
+/// (`[...]`, string interpolation, object construction, `range`, …)
+/// where jq itself has no choice but to enumerate everything (or, for
+/// `range`, where the whole output is already a plain `Vec` from a
+/// single arithmetic sweep) before any of it is observable. `Ok(vs)`
+/// becomes a `JGen` yielding each of `vs` in turn; `Err(e)` becomes a
+/// `JGen` yielding just that one error.
+fn gen_from_vec(compute: TokenStream) -> TokenStream {
+    let jgen_ty = core_path("JGen");
     quote! {
-        #partial_for((#sub_c), |__out: &mut ::std::vec::Vec<#value_ty>, #item_ident: #value_ty| -> #jresult_ty<()> {
-            #body
-            Ok(())
-        })
+        match (#compute) {
+            ::std::result::Result::Ok(vs) => {
+                ::std::boxed::Box::new(vs.into_iter().map(::std::result::Result::Ok)) as #jgen_ty
+            }
+            ::std::result::Result::Err(e) => (::std::boxed::Box::new(::std::iter::once(::std::result::Result::Err(e))) as #jgen_ty),
+        }
+    }
+}
+
+/// `match #result_expr { Ok(v) => <one-item gen>, Err(e) => <empty if
+/// `optional`, else propagate> }` -- the shared shape of `Field`/
+/// `Index`/`Slice`'s per-base-item lookup (all fallible, single-result,
+/// `?`-postfix-able).
+fn gen_from_lookup(result_expr: TokenStream, optional: bool) -> TokenStream {
+    let ok_arm = gen_once(quote!(::std::result::Result::Ok(v)));
+    let err_arm = if optional {
+        gen_empty()
+    } else {
+        gen_err(quote!(e))
+    };
+    quote! {
+        match #result_expr {
+            ::std::result::Result::Ok(v) => #ok_arm,
+            ::std::result::Result::Err(e) => #err_arm,
+        }
     }
 }
 
 pub fn compile_top(expr: &Expr) -> CResult<TokenStream> {
     let mut scope: Vec<String> = Vec::new();
     let input_ident = format_ident!("__jqc_input");
-    let input_tok = quote!(#input_ident);
-    let body = compile(expr, &input_tok, &mut scope)?;
     let value_ty = core_path("Value");
+    // The filter closure's own parameter is a borrowed `&Value` tied to
+    // one particular call -- not `'static`. Every compiled `JGen` must be
+    // `'static` (nothing in it may hold a non-`'static` reference), so
+    // this is converted to an owned local, exactly once, before anything
+    // else runs; `compile`/`compile_raw` only ever see `&__jqc_owned`
+    // (and `compile_isolated`'s own fresh clones of *that*) from here on,
+    // never the original borrowed parameter directly.
+    let owned_input = quote!(__jqc_owned_input);
+    let body = compile(expr, &quote!(&#owned_input), &mut scope)?;
     let jresult_ty = core_path("JResult");
+    let collect_gen = core_path("collect_gen");
     Ok(quote! {
         move |#input_ident: &#value_ty| -> #jresult_ty<::std::vec::Vec<#value_ty>> {
-            #body
+            let #owned_input: #value_ty = #input_ident.clone();
+            #collect_gen(#body)
         }
     })
 }
 
-/// Compiles `expr` and wraps the result as `(|| -> JResult<Vec<Value>> {
-/// ... })()`. The explicit return-type annotation pins both the value type
-/// and the error type for this node right where it's produced, instead of
-/// leaving a bare `{ ...; Ok(x) }` block's type to be inferred from
-/// whatever the caller eventually does with it -- which in practice can be
-/// several `for`/`?` layers away and not always enough for rustc to solve
-/// without this anchor. A `return` inside the wrapped closure only exits
-/// that closure, turning it into an `Err` the normal way; every caller
-/// consumes nested results via `(...)?`, so this still aborts the whole
-/// filter on error, just via cascading `?` instead of a raw unwind -- same
-/// observable result, and trivial enough for LLVM to inline away in
-/// release builds.
+/// Compiles `expr` and wraps the result as `(|| -> JGen { ... })()`. The
+/// explicit return-type annotation pins the type right where it's
+/// produced, instead of leaving a bare `{ ... }` block's type to be
+/// inferred from whatever the caller eventually does with it -- which in
+/// practice can be several combinator layers away and not always enough
+/// for rustc to solve without this anchor.
 fn compile(expr: &Expr, input: &TokenStream, scope: &mut Vec<String>) -> CResult<TokenStream> {
     let inner = compile_raw(expr, input, scope)?;
     Ok(wrap_fallible(inner))
 }
 
 fn wrap_fallible(inner: TokenStream) -> TokenStream {
-    let jresult_ty = core_path("JResult");
-    let value_ty = core_path("Value");
+    let jgen_ty = core_path("JGen");
     quote! {
-        (|| -> #jresult_ty<::std::vec::Vec<#value_ty>> { #inner })()
+        (|| -> #jgen_ty { #inner })()
     }
 }
 
 fn compile_raw(expr: &Expr, input: &TokenStream, scope: &mut Vec<String>) -> CResult<TokenStream> {
     match expr {
-        Expr::Identity => Ok(quote!(Ok(::std::vec![(#input).clone()]))),
+        Expr::Identity => Ok(gen_once(
+            quote!(::std::result::Result::Ok((#input).clone())),
+        )),
         Expr::RecurseDefault => Err(Diagnostic::new(
             "internal error: RecurseDefault should have been lowered",
         )),
         Expr::Null => {
             let value_ty = core_path("Value");
-            Ok(quote!(Ok(::std::vec![#value_ty::Null])))
+            Ok(gen_once(quote!(::std::result::Result::Ok(#value_ty::Null))))
         }
         Expr::Bool(b) => {
             let value_ty = core_path("Value");
-            Ok(quote!(Ok(::std::vec![#value_ty::Bool(#b)])))
+            Ok(gen_once(
+                quote!(::std::result::Result::Ok(#value_ty::Bool(#b))),
+            ))
         }
         Expr::Number(n) => {
             let value_ty = core_path("Value");
@@ -315,9 +430,9 @@ fn compile_raw(expr: &Expr, input: &TokenStream, scope: &mut Vec<String>) -> CRe
             } else {
                 quote!(::std::primitive::f64::NEG_INFINITY)
             };
-            Ok(quote!(Ok(
-                ::std::vec![#value_ty::Number(#number_from_f64(#n_expr))]
-            )))
+            Ok(gen_once(quote!(::std::result::Result::Ok(
+                #value_ty::Number(#number_from_f64(#n_expr))
+            ))))
         }
         Expr::Str(parts) => compile_str(parts, input, scope),
         Expr::Field {
@@ -327,13 +442,8 @@ fn compile_raw(expr: &Expr, input: &TokenStream, scope: &mut Vec<String>) -> CRe
         } => {
             let index_field = core_path("index_field");
             let base_c = compile(base, input, scope)?;
-            let body = quote! {
-                match #index_field(&__base, #name) {
-                    Ok(v) => __out.push(v),
-                    Err(e) => if !#optional { return Err(e); },
-                }
-            };
-            Ok(partial_aware_for(&base_c, &quote!(__base), body))
+            let body = gen_from_lookup(quote!(#index_field(&__base, #name)), *optional);
+            Ok(flat_map_for(&base_c, &quote!(__base), body))
         }
         Expr::Index {
             base,
@@ -341,25 +451,15 @@ fn compile_raw(expr: &Expr, input: &TokenStream, scope: &mut Vec<String>) -> CRe
             optional,
         } => {
             let index_value = core_path("index_value");
-            let base_c = compile(base, input, scope)?;
-            let index_c = compile(index, input, scope)?;
-            // As with binops, jq evaluates the bracket expression's
-            // generator as the outer loop, the base as the inner one;
-            // nesting `partial_aware_for` for both means a failure in
-            // either generator (or a non-optional lookup itself) still
-            // keeps whatever lookups already completed.
-            let inner_body = quote! {
-                match #index_value(&__base, &__key) {
-                    Ok(v) => __out.push(v),
-                    Err(e) => if !#optional { return Err(e); },
-                }
-            };
-            let inner = partial_aware_for(&base_c, &quote!(__base), inner_body);
-            let bubble = core_path("bubble");
-            let outer_body = quote! {
-                #bubble(__out, (#inner))?;
-            };
-            Ok(partial_aware_for(&index_c, &quote!(__key), outer_body))
+            // jq evaluates the bracket expression's generator as the outer
+            // loop, the base as the inner one; both are isolated (see
+            // `compile_isolated`) since each may reference the same
+            // in-scope variable the other does.
+            let index_c = compile_isolated(index, input, scope)?;
+            let base_c = compile_isolated(base, input, scope)?;
+            let inner_body = gen_from_lookup(quote!(#index_value(&__base, &__key)), *optional);
+            let inner = flat_map_for(&base_c, &quote!(__base), inner_body);
+            Ok(flat_map_for(&index_c, &quote!(__key), inner))
         }
         Expr::Slice {
             base,
@@ -377,45 +477,51 @@ fn compile_raw(expr: &Expr, input: &TokenStream, scope: &mut Vec<String>) -> CRe
         Expr::IterateAll { base, optional } => {
             let iterate = core_path("iterate");
             let base_c = compile(base, input, scope)?;
+            let jgen_ty = core_path("JGen");
+            let err_arm = if *optional {
+                gen_empty()
+            } else {
+                gen_err(quote!(e))
+            };
             let body = quote! {
                 match #iterate(&__base) {
-                    Ok(vs) => __out.extend(vs),
-                    Err(e) => if !#optional { return Err(e); },
+                    ::std::result::Result::Ok(vs) => {
+                        ::std::boxed::Box::new(vs.into_iter().map(::std::result::Result::Ok)) as #jgen_ty
+                    }
+                    ::std::result::Result::Err(e) => #err_arm,
                 }
             };
-            Ok(partial_aware_for(&base_c, &quote!(__base), body))
+            Ok(flat_map_for(&base_c, &quote!(__base), body))
         }
         Expr::Pipe(lhs, rhs) => {
-            let lhs_c = compile(lhs, input, scope)?;
-            let rhs_c = compile(rhs, &quote!(&__piped), scope)?;
-            let bubble = core_path("bubble");
-            let body = quote! {
-                #bubble(__out, (#rhs_c))?;
-            };
-            Ok(partial_aware_for(&lhs_c, &quote!(__piped), body))
+            // `rhs` is rebound to the piped-through item (`__piped`), but
+            // may still reference an *outer* in-scope variable `lhs` also
+            // references -- both isolated, same reasoning as `Index`.
+            let lhs_c = compile_isolated(lhs, input, scope)?;
+            let rhs_c = compile_isolated(rhs, &quote!(&__piped), scope)?;
+            Ok(flat_map_for(&lhs_c, &quote!(__piped), rhs_c))
         }
         Expr::Comma(lhs, rhs) => {
-            let lhs_c = compile(lhs, input, scope)?;
-            let rhs_c = compile(rhs, input, scope)?;
-            let bubble = core_path("bubble");
+            let lhs_c = compile_isolated(lhs, input, scope)?;
+            let rhs_c = compile_isolated(rhs, input, scope)?;
+            let lazy_chain = core_path("lazy_chain");
+            let jgen_ty = core_path("JGen");
             Ok(quote! {
-                {
-                    let mut __out = ::std::vec::Vec::new();
-                    #bubble(&mut __out, (#lhs_c))?;
-                    #bubble(&mut __out, (#rhs_c))?;
-                    Ok(__out)
-                }
+                #lazy_chain((#lhs_c), move || -> #jgen_ty { #rhs_c })
             })
         }
         Expr::ArrayConstruct(inner) => {
             let value_ty = core_path("Value");
             match inner {
-                None => Ok(quote!(Ok(
-                    ::std::vec![#value_ty::Array(::std::vec::Vec::new())]
-                ))),
+                None => Ok(gen_once(quote!(::std::result::Result::Ok(
+                    #value_ty::Array(::std::vec::Vec::new())
+                )))),
                 Some(e) => {
                     let inner_c = compile(e, input, scope)?;
-                    Ok(quote!(Ok(::std::vec![#value_ty::Array((#inner_c)?)])))
+                    let collect_gen = core_path("collect_gen");
+                    Ok(gen_once(
+                        quote!(#collect_gen(#inner_c).map(#value_ty::Array)),
+                    ))
                 }
             }
         }
@@ -423,129 +529,103 @@ fn compile_raw(expr: &Expr, input: &TokenStream, scope: &mut Vec<String>) -> CRe
         Expr::Neg(x) => {
             let neg_value = core_path("neg_value");
             let x_c = compile(x, input, scope)?;
-            let bubble1 = core_path("bubble1");
-            let body = quote! {
-                #bubble1(__out, #neg_value(__val))?;
-            };
-            Ok(partial_aware_for(&x_c, &quote!(__val), body))
+            let body = gen_once(quote!(#neg_value(__val)));
+            Ok(flat_map_for(&x_c, &quote!(__val), body))
         }
         Expr::BinOp(op, lhs, rhs) => compile_binop(*op, lhs, rhs, input, scope),
         Expr::And(lhs, rhs) => compile_and_or(lhs, rhs, input, scope, true),
         Expr::Or(lhs, rhs) => compile_and_or(lhs, rhs, input, scope, false),
         Expr::Alt(lhs, rhs) => {
-            let lhs_c = compile(lhs, input, scope)?;
-            let rhs_c = compile(rhs, input, scope)?;
+            let lhs_c = compile_isolated(lhs, input, scope)?;
+            let rhs_c = compile_isolated(rhs, input, scope)?;
             let truthy = core_path("truthy");
+            let alt_gen = core_path("alt_gen");
+            let jgen_ty = core_path("JGen");
             // `a // b` keeps only `a`'s non-`false`/`null` outputs,
             // falling back to `b` only if that filtered set ends up
-            // empty -- unlike `?`/`try`, an error in `a` is *not*
-            // caught; it propagates (verified against real jq), so
-            // `partial_aware_for` is exactly right here: it already
-            // keeps whatever `a` had filtered-and-pushed before a later
-            // failure and re-raises with that as `emitted`.
-            let body = quote! {
-                if #truthy(&__v) {
-                    __out.push(__v);
-                }
-            };
-            let lhs_block = partial_aware_for(&lhs_c, &quote!(__v), body);
+            // empty -- unlike `try`/`?`, an error in `a` is *not*
+            // caught; it propagates (verified against real jq).
+            // `alt_gen` implements exactly this by pulling one item
+            // ahead of the truthy-filtered stream below.
+            let gen_once_ok_v = gen_once(quote!(::std::result::Result::Ok(__v)));
+            let gen_empty_arm = gen_empty();
+            let filtered = flat_map_for(
+                &lhs_c,
+                &quote!(__v),
+                quote! {
+                    if #truthy(&__v) { #gen_once_ok_v } else { #gen_empty_arm }
+                },
+            );
             Ok(quote! {
-                {
-                    let __filtered = (#lhs_block)?;
-                    if !__filtered.is_empty() {
-                        Ok(__filtered)
-                    } else {
-                        #rhs_c
-                    }
-                }
+                #alt_gen((#filtered), move || -> #jgen_ty { #rhs_c })
             })
         }
         Expr::If(branches, else_branch) => {
             compile_if(branches, else_branch.as_deref(), input, scope)
         }
         Expr::TryCatch(body, catch) => {
-            let value_ty = core_path("Value");
-            let jresult_ty = core_path("JResult");
-            let bubble = core_path("bubble");
-            let body_c = compile(body, input, scope)?;
-            // jq's `try`/`?` only suppresses the error signal -- any
-            // values `body` already produced before erroring were already
-            // streamed out, so they stay in the result (`e.emitted`); a
-            // `catch` handler's own outputs are appended after those.
+            let body_c = compile_isolated(body, input, scope)?;
+            let catch_gen = core_path("catch_gen");
+            let jq_error_ty = core_path("JqError");
             // `break` is *not* specially exempted here -- confirmed
             // against real jq (`label $out | try break $out catch "x"`
             // produces `"x"`, not an uncaught break): only a `break`'s
-            // *own matching label* is guaranteed to see it, by virtue of
-            // being the nearest thing downstream that specifically checks
-            // for it (`Expr::Label` below); any `try`/`catch` in between
-            // catches it exactly like any other error, which is why
-            // `label`-using code (e.g. this crate's own `limit` prelude
-            // def) must avoid wrapping its own `break` in a `try`/`?` it
-            // doesn't want to swallow it.
+            // *own matching label* ([`Expr::Label`] below) is guaranteed
+            // to see it.
             let handler = match catch {
                 Some(c) => {
-                    let catch_c = compile(c, &quote!(&__caught), scope)?;
+                    let catch_c = compile_isolated(c, &quote!(&__caught), scope)?;
                     quote! {
-                        Err(mut e) => {
-                            let mut __out = ::std::mem::take(&mut e.emitted);
+                        move |e: #jq_error_ty| {
                             let __caught = e.into_value();
-                            #bubble(&mut __out, (#catch_c))?;
-                            Ok(__out)
+                            ::std::result::Result::Ok(#catch_c)
                         }
                     }
                 }
-                None => quote! { Err(mut e) => Ok(::std::mem::take(&mut e.emitted)) },
-            };
-            Ok(quote! {
-                {
-                    let __result: #jresult_ty<::std::vec::Vec<#value_ty>> = (|| #body_c)();
-                    match __result {
-                        Ok(v) => Ok(v),
-                        #handler
+                None => {
+                    let empty = gen_empty();
+                    quote! {
+                        move |_e: #jq_error_ty| ::std::result::Result::Ok(#empty)
                     }
                 }
-            })
+            };
+            Ok(quote! { #catch_gen((#body_c), #handler) })
         }
         Expr::Optional(body) => {
-            let value_ty = core_path("Value");
-            let jresult_ty = core_path("JResult");
             let body_c = compile(body, input, scope)?;
-            Ok(quote! {
-                {
-                    let __result: #jresult_ty<::std::vec::Vec<#value_ty>> = (|| #body_c)();
-                    match __result {
-                        Ok(v) => Ok(v),
-                        // `?` catches a `break` exactly like any other
-                        // error -- see the longer note on `Expr::TryCatch`.
-                        Err(mut e) => Ok(::std::mem::take(&mut e.emitted)),
-                    }
-                }
-            })
+            let catch_gen = core_path("catch_gen");
+            let jq_error_ty = core_path("JqError");
+            let empty = gen_empty();
+            // `?` catches a `break` exactly like any other error -- see
+            // the longer note on `Expr::TryCatch`.
+            let handler = quote! {
+                move |_e: #jq_error_ty| ::std::result::Result::Ok(#empty)
+            };
+            Ok(quote! { #catch_gen((#body_c), #handler) })
         }
         Expr::Label(name, body) => {
-            let value_ty = core_path("Value");
-            let jresult_ty = core_path("JResult");
             scope.push(label_key(name));
             let body_c = compile(body, input, scope);
             scope.pop();
             let body_c = body_c?;
-            Ok(quote! {
-                {
-                    let __result: #jresult_ty<::std::vec::Vec<#value_ty>> = (|| #body_c)();
-                    match __result {
-                        // Only a `break` naming *this* label is ours to
-                        // catch -- anything else (a real error, or a
-                        // `break` for a differently-named, or outer,
-                        // label) propagates unchanged, so it keeps
-                        // unwinding to whichever `label`/`try` it
-                        // actually belongs to.
-                        Err(mut e) if e.break_label.as_deref() == Some(#name) => {
-                            Ok(::std::mem::take(&mut e.emitted))
-                        }
-                        other => other,
+            let catch_gen = core_path("catch_gen");
+            let jq_error_ty = core_path("JqError");
+            let empty = gen_empty();
+            // Only a `break` naming *this* label is ours to catch --
+            // anything else (a real error, or a `break` for a
+            // differently-named, or outer, label) propagates unchanged,
+            // so it keeps unwinding to whichever `label`/`try` it
+            // actually belongs to.
+            let handler = quote! {
+                move |e: #jq_error_ty| {
+                    if e.break_label.as_deref() == ::std::option::Option::Some(#name) {
+                        ::std::result::Result::Ok(#empty)
+                    } else {
+                        ::std::result::Result::Err(e)
                     }
                 }
-            })
+            };
+            Ok(quote! { #catch_gen((#body_c), #handler) })
         }
         Expr::Break(name, span) => {
             let key = label_key(name);
@@ -561,7 +641,7 @@ fn compile_raw(expr: &Expr, input: &TokenStream, scope: &mut Vec<String>) -> CRe
                 return Err(err);
             }
             let jq_error = core_path("JqError");
-            Ok(quote!(Err(#jq_error::brk(#name))))
+            Ok(gen_err(quote!(#jq_error::brk(#name))))
         }
         Expr::VarBind(source, pattern, body) => {
             let name = match pattern {
@@ -574,16 +654,16 @@ fn compile_raw(expr: &Expr, input: &TokenStream, scope: &mut Vec<String>) -> CRe
                 }
             };
             let jv = jv_ident(name);
-            let source_c = compile(source, input, scope)?;
+            // `body` may reference the ambient `.`/outer variables too
+            // (`as` doesn't rebind `.`), ending up nested inside `source`'s
+            // own (`'static`) closure below -- isolated, same as every
+            // other multi-child node (see `compile_isolated`).
+            let source_c = compile_isolated(source, input, scope)?;
             scope.push(name.clone());
-            let body_c = compile(body, input, scope);
+            let body_c = compile_isolated(body, input, scope);
             scope.pop();
             let body_c = body_c?;
-            let bubble = core_path("bubble");
-            let body = quote! {
-                #bubble(__out, (#body_c))?;
-            };
-            Ok(partial_aware_for(&source_c, &quote!(#jv), body))
+            Ok(flat_map_for(&source_c, &quote!(#jv), body_c))
         }
         Expr::VarRef(name, span) => {
             if !scope.iter().any(|s| s == name) {
@@ -602,7 +682,7 @@ fn compile_raw(expr: &Expr, input: &TokenStream, scope: &mut Vec<String>) -> CRe
                 return Err(err);
             }
             let jv = jv_ident(name);
-            Ok(quote!(Ok(::std::vec![#jv.clone()])))
+            Ok(gen_once(quote!(::std::result::Result::Ok(#jv.clone()))))
         }
         Expr::Reduce {
             source,
@@ -611,28 +691,33 @@ fn compile_raw(expr: &Expr, input: &TokenStream, scope: &mut Vec<String>) -> CRe
             update,
         } => {
             let jv = jv_ident(var);
-            let source_c = compile(source, input, scope)?;
-            let init_c = compile(init, input, scope)?;
+            // `init`, `source`, and (each loop iteration) `update` are
+            // independent siblings sharing this scope -- each isolated
+            // (see `compile_isolated`).
+            let init_c = compile_isolated(init, input, scope)?;
+            let source_c = compile_isolated(source, input, scope)?;
             scope.push(var.clone());
-            let update_c = compile(update, &quote!(&__state), scope);
+            let update_c = compile_isolated(update, &quote!(&__state), scope);
             scope.pop();
             let update_c = update_c?;
             let value_ty = core_path("Value");
-            let fetch_updates = fetch_or_bubble(quote!(__updates), quote!(#update_c));
-            Ok(quote! {
-                {
-                    let mut __out = ::std::vec::Vec::new();
-                    for __init in (#init_c)? {
-                        let mut __state = __init;
-                        for #jv in (#source_c)? {
-                            #fetch_updates
-                            __state = __updates.into_iter().last().unwrap_or(#value_ty::Null);
-                        }
-                        __out.push(__state);
+            let per_init = quote! {
+                let mut __state = __init;
+                for #jv in (#source_c) {
+                    let #jv = #jv?;
+                    let mut __last: #value_ty = #value_ty::Null;
+                    for __u in (#update_c) {
+                        __last = __u?;
                     }
-                    Ok(__out)
+                    __state = __last;
                 }
-            })
+                ::std::result::Result::Ok(__state)
+            };
+            Ok(flat_map_for(
+                &init_c,
+                &quote!(__init),
+                gen_once_try(per_init),
+            ))
         }
         Expr::Foreach {
             source,
@@ -642,38 +727,69 @@ fn compile_raw(expr: &Expr, input: &TokenStream, scope: &mut Vec<String>) -> CRe
             extract,
         } => {
             let jv = jv_ident(var);
-            let source_c = compile(source, input, scope)?;
-            let init_c = compile(init, input, scope)?;
+            let value_ty = core_path("Value");
+            let jgen_ty = core_path("JGen");
+            // `init`, `source`, `update`, and `extract` are independent
+            // siblings sharing this scope -- each isolated (see
+            // `compile_isolated`).
+            let init_c = compile_isolated(init, input, scope)?;
+            let source_c = compile_isolated(source, input, scope)?;
             scope.push(var.clone());
-            let update_c = compile(update, &quote!(&__state), scope);
+            // `ForeachGen`'s `update`/`extract` closures take `jv`/`state`
+            // as borrowed `&Value` *parameters* -- fine on their own (a
+            // closure parameter's lifetime is universally quantified per
+            // call, not part of the closure's own `'static` capture
+            // requirement), but if `update`/`extract` themselves contain
+            // a node that defers part of its own compilation into a
+            // *further* `'static` closure (`Comma`, `try`/`catch`,
+            // `label`, `//`), that inner closure would need to capture
+            // the borrowed parameter directly -- same `'static` violation
+            // as `compile_top`'s `__jqc_owned_input`. Shadowed with an
+            // owned clone, once, before `update_c`/`extract_c` (compiled
+            // against `&__state`/`#jv` from here on) ever run.
+            let owned_prelude = quote! {
+                let #jv: #value_ty = #jv.clone();
+                let __state: #value_ty = __state.clone();
+            };
+            let update_c = compile_isolated(update, &quote!(&__state), scope);
             let extract_c = extract
                 .as_ref()
-                .map(|e| compile(e, &quote!(&__state), scope))
+                .map(|e| compile_isolated(e, &quote!(&__state), scope))
                 .transpose();
             scope.pop();
             let update_c = update_c?;
-            let bubble = core_path("bubble");
-            let extract_push = match extract_c? {
-                Some(ec) => quote!(#bubble(&mut __out, (#ec))?;),
-                None => quote!(__out.push(__state.clone());),
-            };
-            let fetch_updates = fetch_or_bubble(quote!(__updates), quote!(#update_c));
-            Ok(quote! {
-                {
-                    let mut __out = ::std::vec::Vec::new();
-                    for __init in (#init_c)? {
-                        let mut __state = __init;
-                        for #jv in (#source_c)? {
-                            #fetch_updates
-                            for __next_state in __updates {
-                                __state = __next_state;
-                                #extract_push
-                            }
-                        }
+            let extract_c = extract_c?;
+            let foreach_gen = core_path("ForeachGen");
+            let extract_closure = match extract_c {
+                Some(ec) => quote! {
+                    {
+                        #[allow(unused_variables)]
+                        let __jqc_extract = move |#jv: &#value_ty, __state: &#value_ty| -> #jgen_ty {
+                            #owned_prelude
+                            #ec
+                        };
+                        __jqc_extract
                     }
-                    Ok(__out)
+                },
+                None => {
+                    let push_state = gen_once(quote!(::std::result::Result::Ok(__state.clone())));
+                    quote! { move |_: &#value_ty, __state: &#value_ty| -> #jgen_ty { #push_state } }
                 }
-            })
+            };
+            let update_closure = quote! {
+                {
+                    #[allow(unused_variables)]
+                    let __jqc_update = move |#jv: &#value_ty, __state: &#value_ty| -> #jgen_ty {
+                        #owned_prelude
+                        #update_c
+                    };
+                    __jqc_update
+                }
+            };
+            let body = quote! {
+                #foreach_gen::new((#source_c), __init, #update_closure, #extract_closure)
+            };
+            Ok(flat_map_for(&init_c, &quote!(__init), body))
         }
         Expr::RecCall(name) => {
             let fname = fn_ident(name);
@@ -682,12 +798,18 @@ fn compile_raw(expr: &Expr, input: &TokenStream, scope: &mut Vec<String>) -> CRe
         Expr::RecFn0 { name, body, rest } => {
             let fname = fn_ident(name);
             let value_ty = core_path("Value");
-            let jresult_ty = core_path("JResult");
-            let body_c = compile(body, &quote!(__jqc_in), scope)?;
+            let jgen_ty = core_path("JGen");
+            // Same reasoning as `compile_top`'s own `__jqc_owned_input`:
+            // `__jqc_in` is a borrowed parameter tied to one particular
+            // call, not `'static` -- converted to an owned local, once,
+            // before `body` (whose returned `JGen` must be `'static`)
+            // ever runs.
+            let body_c = compile(body, &quote!(&__jqc_owned_in), scope)?;
             let rest_c = compile(rest, input, scope)?;
             Ok(quote! {
                 {
-                    fn #fname(__jqc_in: &#value_ty) -> #jresult_ty<::std::vec::Vec<#value_ty>> {
+                    fn #fname(__jqc_in: &#value_ty) -> #jgen_ty {
+                        let __jqc_owned_in: #value_ty = __jqc_in.clone();
                         #body_c
                     }
                     #rest_c
@@ -707,6 +829,7 @@ fn compile_str(
     scope: &mut Vec<String>,
 ) -> CResult<TokenStream> {
     let value_ty = core_path("Value");
+    let jresult_ty = core_path("JResult");
     let display = core_path("value_to_display_string");
     let mut steps = Vec::new();
     for part in parts {
@@ -715,12 +838,17 @@ fn compile_str(
                 __out = __out.into_iter().map(|prefix: ::std::string::String| prefix + #s).collect();
             }),
             StrPart::Interp(e) => {
-                let e_c = compile(e, input, scope)?;
+                // Isolated (see `compile_isolated`): more than one
+                // interpolation in the same string shares this scope, and
+                // each is a fully separate statement below, not nested
+                // inside one another.
+                let e_c = compile_isolated(e, input, scope)?;
                 steps.push(quote! {
                     __out = {
                         let mut __next = ::std::vec::Vec::new();
                         for __prefix in &__out {
-                            for __val in (#e_c)? {
+                            for __val in (#e_c) {
+                                let __val = __val?;
                                 __next.push(__prefix.clone() + &#display(&__val));
                             }
                         }
@@ -730,13 +858,14 @@ fn compile_str(
             }
         }
     }
-    Ok(quote! {
-        {
+    let compute = quote! {
+        (|| -> #jresult_ty<::std::vec::Vec<#value_ty>> {
             let mut __out: ::std::vec::Vec<::std::string::String> = ::std::vec![::std::string::String::new()];
             #(#steps)*
-            Ok(__out.into_iter().map(#value_ty::String).collect::<::std::vec::Vec<#value_ty>>())
-        }
-    })
+            ::std::result::Result::Ok(__out.into_iter().map(#value_ty::String).collect::<::std::vec::Vec<#value_ty>>())
+        })()
+    };
+    Ok(gen_from_vec(compute))
 }
 
 fn compile_object(
@@ -746,17 +875,23 @@ fn compile_object(
 ) -> CResult<TokenStream> {
     let value_ty = core_path("Value");
     let map_ty = core_path("Map");
+    let jresult_ty = core_path("JResult");
     let object_insert = core_path("object_insert");
     let mut steps = Vec::new();
     for entry in entries {
-        let key_c = compile(&entry.key, input, scope)?;
-        let val_c = compile(&entry.val, input, scope)?;
+        // Isolated (see `compile_isolated`): `key`/`val`, and separate
+        // entries, all share this scope, each a separate statement below
+        // rather than nested inside one another.
+        let key_c = compile_isolated(&entry.key, input, scope)?;
+        let val_c = compile_isolated(&entry.val, input, scope)?;
         steps.push(quote! {
             __partials = {
                 let mut __next: ::std::vec::Vec<#map_ty<::std::string::String, #value_ty>> = ::std::vec::Vec::new();
                 for __partial in &__partials {
-                    for __key in (#key_c)? {
-                        for __val in (#val_c)? {
+                    for __key in (#key_c) {
+                        let __key = __key?;
+                        for __val in (#val_c) {
+                            let __val = __val?;
                             __next.push(#object_insert(__partial.clone(), __key.clone(), __val)?);
                         }
                     }
@@ -765,13 +900,14 @@ fn compile_object(
             };
         });
     }
-    Ok(quote! {
-        {
+    let compute = quote! {
+        (|| -> #jresult_ty<::std::vec::Vec<#value_ty>> {
             let mut __partials: ::std::vec::Vec<#map_ty<::std::string::String, #value_ty>> = ::std::vec![#map_ty::new()];
             #(#steps)*
-            Ok(__partials.into_iter().map(#value_ty::Object).collect::<::std::vec::Vec<#value_ty>>())
-        }
-    })
+            ::std::result::Result::Ok(__partials.into_iter().map(#value_ty::Object).collect::<::std::vec::Vec<#value_ty>>())
+        })()
+    };
+    Ok(gen_from_vec(compute))
 }
 
 fn compile_binop(
@@ -781,14 +917,11 @@ fn compile_binop(
     input: &TokenStream,
     scope: &mut Vec<String>,
 ) -> CResult<TokenStream> {
-    let lhs_c = compile(lhs, input, scope)?;
-    let rhs_c = compile(rhs, input, scope)?;
+    let rhs_c = compile_isolated(rhs, input, scope)?;
+    let lhs_c = compile_isolated(lhs, input, scope)?;
     let value_ty = core_path("Value");
-    let bubble1 = core_path("bubble1");
     // Each op_call evaluates to `JResult<Value>` (even the infallible
-    // comparisons, wrapped in `Ok`) so it can be folded through `bubble1`
-    // uniformly below, preserving already-computed combinations if a later
-    // one fails.
+    // comparisons, wrapped in `Ok`), fed straight to `gen_once` below.
     let op_call = match op {
         BinOp::Add => {
             let f = core_path("add_values");
@@ -812,42 +945,33 @@ fn compile_binop(
         }
         BinOp::Eq => {
             let f = core_path("try_eq_values");
-            quote!(Ok(#value_ty::Bool(#f(&__lhs, &__rhs)?)))
+            quote!(::std::result::Result::Ok(#value_ty::Bool(#f(&__lhs, &__rhs)?)))
         }
         BinOp::Ne => {
             let f = core_path("try_eq_values");
-            quote!(Ok(#value_ty::Bool(!#f(&__lhs, &__rhs)?)))
+            quote!(::std::result::Result::Ok(#value_ty::Bool(!#f(&__lhs, &__rhs)?)))
         }
         BinOp::Lt => {
             let f = core_path("try_cmp_values");
-            quote!(Ok(#value_ty::Bool(#f(&__lhs, &__rhs)? == ::std::cmp::Ordering::Less)))
+            quote!(::std::result::Result::Ok(#value_ty::Bool(#f(&__lhs, &__rhs)? == ::std::cmp::Ordering::Less)))
         }
         BinOp::Le => {
             let f = core_path("try_cmp_values");
-            quote!(Ok(#value_ty::Bool(#f(&__lhs, &__rhs)? != ::std::cmp::Ordering::Greater)))
+            quote!(::std::result::Result::Ok(#value_ty::Bool(#f(&__lhs, &__rhs)? != ::std::cmp::Ordering::Greater)))
         }
         BinOp::Gt => {
             let f = core_path("try_cmp_values");
-            quote!(Ok(#value_ty::Bool(#f(&__lhs, &__rhs)? == ::std::cmp::Ordering::Greater)))
+            quote!(::std::result::Result::Ok(#value_ty::Bool(#f(&__lhs, &__rhs)? == ::std::cmp::Ordering::Greater)))
         }
         BinOp::Ge => {
             let f = core_path("try_cmp_values");
-            quote!(Ok(#value_ty::Bool(#f(&__lhs, &__rhs)? != ::std::cmp::Ordering::Less)))
+            quote!(::std::result::Result::Ok(#value_ty::Bool(#f(&__lhs, &__rhs)? != ::std::cmp::Ordering::Less)))
         }
     };
     // jq evaluates the right operand's generator as the outer loop (e.g.
-    // `(1,2) + (10,20)` yields `11,12,21,22`, not `11,21,12,22`); nesting
-    // `partial_aware_for` for both keeps already-computed combinations if
-    // a later one (or either generator, partway through) fails.
-    let inner_body = quote! {
-        #bubble1(__out, (#op_call))?;
-    };
-    let inner = partial_aware_for(&lhs_c, &quote!(__lhs), inner_body);
-    let bubble = core_path("bubble");
-    let outer_body = quote! {
-        #bubble(__out, (#inner))?;
-    };
-    Ok(partial_aware_for(&rhs_c, &quote!(__rhs), outer_body))
+    // `(1,2) + (10,20)` yields `11,12,21,22`, not `11,21,12,22`).
+    let inner = flat_map_for(&lhs_c, &quote!(__lhs), gen_once_try(op_call));
+    Ok(flat_map_for(&rhs_c, &quote!(__rhs), inner))
 }
 
 /// `and`/`or` short-circuit: the right operand is only evaluated (and only
@@ -862,27 +986,26 @@ fn compile_and_or(
 ) -> CResult<TokenStream> {
     let truthy = core_path("truthy");
     let value_ty = core_path("Value");
-    let lhs_c = compile(lhs, input, scope)?;
-    let rhs_c = compile(rhs, input, scope)?;
-    let bubble1 = core_path("bubble1");
+    let lhs_c = compile_isolated(lhs, input, scope)?;
+    let rhs_c = compile_isolated(rhs, input, scope)?;
     let (short_circuit_on, short_circuit_value) = if is_and {
         (quote!(!), false)
     } else {
         (quote!(), true)
     };
-    let rhs_body = quote! {
-        #bubble1(__out, Ok(#value_ty::Bool(#truthy(&__rhs))))?;
-    };
-    let rhs_block = partial_aware_for(&rhs_c, &quote!(__rhs), rhs_body);
-    let bubble = core_path("bubble");
+    let rhs_body = gen_once(quote!(::std::result::Result::Ok(#value_ty::Bool(#truthy(&__rhs)))));
+    let rhs_block = flat_map_for(&rhs_c, &quote!(__rhs), rhs_body);
+    let short_circuit_gen = gen_once(quote!(::std::result::Result::Ok(
+        #value_ty::Bool(#short_circuit_value)
+    )));
     let lhs_body = quote! {
         if #short_circuit_on #truthy(&__lhs) {
-            __out.push(#value_ty::Bool(#short_circuit_value));
+            #short_circuit_gen
         } else {
-            #bubble(__out, (#rhs_block))?;
+            #rhs_block
         }
     };
-    Ok(partial_aware_for(&lhs_c, &quote!(__lhs), lhs_body))
+    Ok(flat_map_for(&lhs_c, &quote!(__lhs), lhs_body))
 }
 
 fn compile_if(
@@ -892,25 +1015,38 @@ fn compile_if(
     scope: &mut Vec<String>,
 ) -> CResult<TokenStream> {
     if branches.is_empty() {
+        // The base case's result ends up nested inside some ancestor
+        // `If`'s `cond`-binding closure (see the isolation note below) --
+        // isolated the same as every other leaf reached that way.
         return match else_branch {
-            Some(e) => compile(e, input, scope),
-            None => compile(&Expr::Identity, input, scope),
+            Some(e) => compile_isolated(e, input, scope),
+            None => compile_isolated(&Expr::Identity, input, scope),
         };
     }
     let (cond, then_e) = &branches[0];
-    let cond_c = compile(cond, input, scope)?;
-    let then_c = compile(then_e, input, scope)?;
-    let else_c = wrap_fallible(compile_if(&branches[1..], else_branch, input, scope)?);
+    // `cond` and `then` are both embedded directly inside this level's
+    // own `cond`-binding closure and nothing deeper -- isolated against
+    // `input` directly is enough (see `compile_isolated`). `else`,
+    // though, is a *recursive* call: an `elif` chain nests each further
+    // branch's own `cond'`/`then'` *inside* this level's closure too, so
+    // (same reasoning as `compile_slice`'s `in_from`/`in_to`) it must be
+    // compiled against a fresh, local re-clone safe to use *from within*
+    // this closure, not `input` directly, or this closure would consume
+    // its own copy constructing the next `elif` level's closure.
+    let cond_c = compile_isolated(cond, input, scope)?;
+    let then_c = compile_isolated(then_e, input, scope)?;
+    let (in_else_snap, in_else) = snapshot_scope(input, scope);
+    let else_c = wrap_fallible(compile_if(&branches[1..], else_branch, &in_else, scope)?);
+    let else_c = quote! { { #in_else_snap #else_c } };
     let truthy = core_path("truthy");
-    let bubble = core_path("bubble");
     let body = quote! {
         if #truthy(&__cond) {
-            #bubble(__out, (#then_c))?;
+            #then_c
         } else {
-            #bubble(__out, (#else_c))?;
+            #else_c
         }
     };
-    Ok(partial_aware_for(&cond_c, &quote!(__cond), body))
+    Ok(flat_map_for(&cond_c, &quote!(__cond), body))
 }
 
 fn compile_slice(
@@ -921,41 +1057,49 @@ fn compile_slice(
     input: &TokenStream,
     scope: &mut Vec<String>,
 ) -> CResult<TokenStream> {
-    let base_c = compile(base, input, scope)?;
     let slice_value = core_path("slice_value");
     let to_i64 = core_path("value_to_i64");
-    let bubble = core_path("bubble");
 
-    let from_c = from.map(|e| compile(e, input, scope)).transpose()?;
-    let to_c = to.map(|e| compile(e, input, scope)).transpose()?;
+    // jq nests `from` around `to` around `base` (outer to inner): `to`
+    // ends up embedded inside `from`'s own resultant `'static` closure,
+    // and `base` inside `to`'s -- each deeper level must be compiled
+    // against a token safe to reference *from within* the enclosing
+    // level's closure, meaning a fresh, local re-clone introduced right
+    // there (`in_from`, `in_to`), not `input` directly. Reusing a single
+    // clone across more than one nested closure boundary would have the
+    // enclosing closure consume its own copy while constructing the next
+    // one down, breaking its own repeatability -- see `snapshot_input`'s
+    // doc. `from` itself (outermost, if present) is the one safe to
+    // compile directly against `input`, since nothing nests *around* it.
+    let from_c = from
+        .map(|e| compile_isolated(e, input, scope))
+        .transpose()?;
+    let (in_from_snap, in_from) = snapshot_scope(input, scope);
+    let to_c = to
+        .map(|e| compile_isolated(e, &in_from, scope))
+        .transpose()?;
+    let (in_to_snap, in_to) = snapshot_scope(&in_from, scope);
+    let base_c = compile_isolated(base, &in_to, scope)?;
 
     // jq nests these outer-to-inner as from, to, base (least significant),
     // mirroring how it treats the bracket expression as outer and the
-    // receiver as inner for plain indexing. Each level is built as its own
-    // `JResult<Vec<Value>>` block (via `partial_aware_for` when that level
-    // is itself a generator) and folded into the level above via `bubble`,
-    // so a failure anywhere -- the base lookup, a `from`/`to` bound failing
-    // to convert, or either bound's generator failing partway through --
-    // still keeps whatever slices were already produced.
-    let base_body = quote! {
-        match #slice_value(&__base, __from, __to) {
-            Ok(v) => __out.push(v),
-            Err(e) => if !#optional { return Err(e); },
-        }
-    };
-    let base_block = partial_aware_for(&base_c, &quote!(__base), base_body);
+    // receiver as inner for plain indexing.
+    let base_body = gen_from_lookup(quote!(#slice_value(&__base, __from, __to)), optional);
+    let base_block = flat_map_for(&base_c, &quote!(__base), base_body);
+    let base_block = quote! { { #in_to_snap #base_block } };
     let with_to = match to_c {
         Some(c) => {
+            let gen_err_arm = gen_err(quote!(e));
             let to_body = quote! {
                 match #to_i64(&__to_src) {
-                    Ok(__to_val) => {
+                    ::std::result::Result::Ok(__to_val) => {
                         let __to: ::std::option::Option<i64> = ::std::option::Option::Some(__to_val);
-                        #bubble(__out, (#base_block))?;
+                        #base_block
                     }
-                    Err(e) => return Err(e),
+                    ::std::result::Result::Err(e) => #gen_err_arm,
                 }
             };
-            partial_aware_for(&c, &quote!(__to_src), to_body)
+            flat_map_for(&c, &quote!(__to_src), to_body)
         }
         None => quote! {
             {
@@ -964,18 +1108,20 @@ fn compile_slice(
             }
         },
     };
+    let with_to = quote! { { #in_from_snap #with_to } };
     let with_from = match from_c {
         Some(c) => {
+            let gen_err_arm = gen_err(quote!(e));
             let from_body = quote! {
                 match #to_i64(&__from_src) {
-                    Ok(__from_val) => {
+                    ::std::result::Result::Ok(__from_val) => {
                         let __from: ::std::option::Option<i64> = ::std::option::Option::Some(__from_val);
-                        #bubble(__out, (#with_to))?;
+                        #with_to
                     }
-                    Err(e) => return Err(e),
+                    ::std::result::Result::Err(e) => #gen_err_arm,
                 }
             };
-            partial_aware_for(&c, &quote!(__from_src), from_body)
+            flat_map_for(&c, &quote!(__from_src), from_body)
         }
         None => quote! {
             {
@@ -989,42 +1135,46 @@ fn compile_slice(
 }
 
 /// Generic N-ary cartesian product over a builtin call's arguments: each
-/// arg's compiled output is bound to `__a0`, `__a1`, … (outermost to
+/// arg's compiled generator is bound to `__a0`, `__a1`, … (outermost to
 /// innermost, left to right), and `build` receives those idents to produce
-/// the single pushed expression.
+/// the single yielded expression.
 fn cartesian_args(
     args: &[Expr],
     input: &TokenStream,
     scope: &mut Vec<String>,
-    mut build: impl FnMut(&[TokenStream]) -> TokenStream,
+    mut build: impl FnMut(&TokenStream, &[TokenStream]) -> TokenStream,
 ) -> CResult<TokenStream> {
+    // Every arg is an independent sibling sharing this scope -- each
+    // isolated (see `compile_isolated`), regardless of how many levels of
+    // nesting (one per other arg) it ends up embedded within below: a
+    // `compile_isolated` block re-clones whatever it needs fresh every
+    // time it's actually reached, so it doesn't matter how deep.
+    //
+    // `build`'s own direct use of the ambient input (`eff_input`, if any
+    // -- e.g. `has_key(input, &arg)`) is a separate, codegen-internal
+    // concern: today every caller passes exactly one arg, so `eff_input`
+    // never crosses more than the one closure boundary that introduces
+    // it and needs no extra treatment. A future 2+-arg use would need the
+    // same per-level re-clone `compile_range`'s `__from`/`__to` get, for
+    // the same reason (a shared `Value` surviving more than one nested
+    // `'static` closure).
+    let (snap_stmt, snap_input) = snapshot_scope(input, scope);
     let compiled: Vec<TokenStream> = args
         .iter()
-        .map(|a| compile(a, input, scope))
+        .map(|a| compile_isolated(a, input, scope))
         .collect::<CResult<Vec<_>>>()?;
     let names: Vec<Ident> = (0..args.len()).map(|i| format_ident!("__a{i}")).collect();
     let name_toks: Vec<TokenStream> = names.iter().map(|n| quote!(#n)).collect();
     // `build` must produce a `JResult<Value>`-typed expression (fallible
-    // helpers used directly, infallible ones `Ok`-wrapped by the caller).
-    let pushed = build(&name_toks);
-    let bubble1 = core_path("bubble1");
-    let bubble = core_path("bubble");
-    // Innermost: push one combination's result, merging it with whatever
-    // earlier combinations already pushed if it fails.
-    let mut block: TokenStream = quote! {
-        {
-            let mut __out = ::std::vec::Vec::new();
-            #bubble1(&mut __out, (#pushed))?;
-            Ok(__out)
-        }
-    };
+    // helpers used directly, infallible ones `Ok`-wrapped by the caller),
+    // referencing the ambient input (if at all) via the first argument
+    // passed to it, not whatever token its own caller closed over.
+    let pushed = build(&snap_input, &name_toks);
+    let mut block: TokenStream = gen_once(pushed);
     for (name, c) in names.iter().zip(compiled.iter()).rev() {
-        let body = quote! {
-            #bubble(__out, (#block))?;
-        };
-        block = partial_aware_for(c, &quote!(#name), body);
+        block = flat_map_for(c, &quote!(#name), block);
     }
-    Ok(block)
+    Ok(quote! { { #snap_stmt #block } })
 }
 
 /// `NAME(arg)` builtins that are directly jqc-core's own `fn(&Value,
@@ -1039,31 +1189,53 @@ fn compile_core_fn2(
     scope: &mut Vec<String>,
 ) -> CResult<TokenStream> {
     let f = core_path(fn_name);
-    cartesian_args(args, input, scope, |a| {
+    cartesian_args(args, input, scope, |eff_input, a| {
         let arg = &a[0];
-        quote!(#f(#input, &#arg))
+        quote!(#f(#eff_input, &#arg))
     })
 }
 
-/// `first(f)`/`last(f)`: take the `.next()`/`.last()` element of `f`'s own
-/// (fully materialized -- jqc being eager, not lazy) output, discarding
-/// the rest -- `method` is `next`/`last` verbatim, the only difference
-/// between the two builtins.
-fn compile_first_or_last_1(
-    method: &str,
+/// `first(f)`: a genuinely lazy one-pull take of `f`'s own generator,
+/// discarding the rest -- unlike the old eager model (which had to fully
+/// materialize `f`'s output just to call `.next()` on it), this never
+/// evaluates more of `f` than the single item it needs, so `first(repeat(1))`
+/// no longer has to fully evaluate `repeat(1)` first.
+fn compile_first_1(
     arg: &Expr,
     input: &TokenStream,
     scope: &mut Vec<String>,
 ) -> CResult<TokenStream> {
     let arg_c = compile(arg, input, scope)?;
-    let method = format_ident!("{method}");
-    let value_ty = core_path("Value");
+    let jgen_ty = core_path("JGen");
+    let empty_arm = gen_empty();
     Ok(quote! {
         {
-            let __items = (#arg_c)?;
-            Ok(__items.into_iter().#method().into_iter().collect::<::std::vec::Vec<#value_ty>>())
+            let mut __g = (#arg_c);
+            match __g.next() {
+                ::std::option::Option::Some(r) => (::std::boxed::Box::new(::std::iter::once(r)) as #jgen_ty),
+                ::std::option::Option::None => #empty_arm,
+            }
         }
     })
+}
+
+/// `last(f)`: must still fully drain `f`'s generator, same as real jq.
+fn compile_last_1(
+    arg: &Expr,
+    input: &TokenStream,
+    scope: &mut Vec<String>,
+) -> CResult<TokenStream> {
+    let arg_c = compile(arg, input, scope)?;
+    let value_ty = core_path("Value");
+    let jresult_ty = core_path("JResult");
+    let collect_gen = core_path("collect_gen");
+    let compute = quote! {
+        (|| -> #jresult_ty<::std::vec::Vec<#value_ty>> {
+            let __items = #collect_gen(#arg_c)?;
+            ::std::result::Result::Ok(__items.into_iter().last().into_iter().collect())
+        })()
+    };
+    Ok(gen_from_vec(compute))
 }
 
 fn compile_call(
@@ -1075,61 +1247,61 @@ fn compile_call(
 ) -> CResult<TokenStream> {
     let value_ty = core_path("Value");
     match (name, args.len()) {
-        ("empty", 0) => Ok(quote!(Ok(::std::vec::Vec::new()))),
+        ("empty", 0) => Ok(gen_empty()),
         ("error", 0) => {
             let err = core_path("JqError");
-            Ok(quote!(Err(#err::value((#input).clone()))))
+            Ok(gen_err(quote!(#err::value((#input).clone()))))
         }
         ("length", 0) => {
             let f = core_path("length_of");
-            Ok(quote!(Ok(::std::vec![#f(#input)?])))
+            Ok(gen_once(quote!(#f(#input))))
         }
         ("type", 0) => {
             let f = core_path("type_name");
-            Ok(quote!(Ok(
-                ::std::vec![#value_ty::String(#f(#input).to_string())]
-            )))
+            Ok(gen_once(quote!(::std::result::Result::Ok(
+                #value_ty::String(#f(#input).to_string())
+            ))))
         }
         ("keys", 0) => {
             let f = core_path("keys_of");
-            Ok(quote!(Ok(::std::vec![#f(#input, true)?])))
+            Ok(gen_once(quote!(#f(#input, true))))
         }
         ("keys_unsorted", 0) => {
             let f = core_path("keys_of");
-            Ok(quote!(Ok(::std::vec![#f(#input, false)?])))
+            Ok(gen_once(quote!(#f(#input, false))))
         }
         ("add", 0) => {
             let as_array = core_path("as_array");
             let f = core_path("add_all");
-            Ok(quote!(Ok(::std::vec![#f(#as_array(#input)?)?])))
+            Ok(gen_once_try(quote!(#f(#as_array(#input)?))))
         }
         ("reverse", 0) => {
             let f = core_path("reverse_value");
-            Ok(quote!(Ok(::std::vec![#f(#input)?])))
+            Ok(gen_once(quote!(#f(#input))))
         }
         ("sort", 0) => {
             let as_array = core_path("as_array");
             let f = core_path("sort_values");
-            Ok(quote!(Ok(
-                ::std::vec![#value_ty::Array(#f(#as_array(#input)?.clone())?)]
-            )))
+            Ok(gen_once_try(quote!(::std::result::Result::Ok(
+                #value_ty::Array(#f(#as_array(#input)?.clone())?)
+            ))))
         }
         ("unique", 0) => {
             let as_array = core_path("as_array");
             let f = core_path("unique_values");
-            Ok(quote!(Ok(
-                ::std::vec![#value_ty::Array(#f(#as_array(#input)?.clone())?)]
-            )))
+            Ok(gen_once_try(quote!(::std::result::Result::Ok(
+                #value_ty::Array(#f(#as_array(#input)?.clone())?)
+            ))))
         }
         ("min", 0) => {
             let as_array = core_path("as_array");
             let f = core_path("min_values");
-            Ok(quote!(Ok(::std::vec![#f(#as_array(#input)?)?])))
+            Ok(gen_once_try(quote!(#f(#as_array(#input)?))))
         }
         ("max", 0) => {
             let as_array = core_path("as_array");
             let f = core_path("max_values");
-            Ok(quote!(Ok(::std::vec![#f(#as_array(#input)?)?])))
+            Ok(gen_once_try(quote!(#f(#as_array(#input)?))))
         }
         ("floor", 0) => simple_unary("floor_value", input),
         ("ceil", 0) => simple_unary("ceil_value", input),
@@ -1148,18 +1320,18 @@ fn compile_call(
         ("tonumber", 0) => simple_unary("to_number_value", input),
         ("tostring", 0) => {
             let f = core_path("to_string_value");
-            Ok(quote!(Ok(::std::vec![#f(#input)])))
+            Ok(gen_once(quote!(::std::result::Result::Ok(#f(#input)))))
         }
         ("first", 0) => {
             let f = core_path("index_value");
-            Ok(quote!(Ok(::std::vec![#f(#input, &#value_ty::from(0))?])))
+            Ok(gen_once(quote!(#f(#input, &#value_ty::from(0)))))
         }
         ("last", 0) => {
             let f = core_path("index_value");
-            Ok(quote!(Ok(::std::vec![#f(#input, &#value_ty::from(-1))?])))
+            Ok(gen_once(quote!(#f(#input, &#value_ty::from(-1)))))
         }
-        ("first", 1) => compile_first_or_last_1("next", &args[0], input, scope),
-        ("last", 1) => compile_first_or_last_1("last", &args[0], input, scope),
+        ("first", 1) => compile_first_1(&args[0], input, scope),
+        ("last", 1) => compile_last_1(&args[0], input, scope),
         // Every one of these is jqc-core's own `fn(&Value, &Value) ->
         // JResult<Value>` called directly on `input` and the (cartesian-
         // expanded) argument -- see `compile_core_fn2`.
@@ -1174,23 +1346,22 @@ fn compile_call(
         // than `JResult<Value>`, needing the extra `.map`.
         ("contains", 1) => {
             let f = core_path(backend_fn_name("contains_value", "simd_contains_value"));
-            cartesian_args(args, input, scope, |a| {
+            cartesian_args(args, input, scope, |eff_input, a| {
                 let arg = &a[0];
-                quote!(#f(#input, &#arg).map(#value_ty::Bool))
+                quote!(#f(#eff_input, &#arg).map(#value_ty::Bool))
             })
         }
         ("range", 1) => {
             let range_values = core_path("range_values");
             let arg_c = compile(&args[0], input, scope)?;
             let to_f64 = core_path("value_to_f64");
-            let bubble = core_path("bubble");
             let jresult_ty = core_path("JResult");
-            let body = quote! {
-                #bubble(__out, (|| -> #jresult_ty<::std::vec::Vec<#value_ty>> {
-                    Ok(#range_values(0.0, #to_f64(&__to)?, 1.0))
-                })())?;
+            let compute = quote! {
+                (|| -> #jresult_ty<::std::vec::Vec<#value_ty>> {
+                    ::std::result::Result::Ok(#range_values(0.0, #to_f64(&__to)?, 1.0))
+                })()
             };
-            Ok(partial_aware_for(&arg_c, &quote!(__to), body))
+            Ok(flat_map_for(&arg_c, &quote!(__to), gen_from_vec(compute)))
         }
         ("range", 2) => compile_range(&args[0], &args[1], None, input, scope),
         ("range", 3) => compile_range(&args[0], &args[1], Some(&args[2]), input, scope),
@@ -1239,7 +1410,7 @@ fn backend_fn_name(scalar_name: &'static str, simd_name: &'static str) -> &'stat
 
 fn simple_unary(fn_name: &str, input: &TokenStream) -> CResult<TokenStream> {
     let f = core_path(fn_name);
-    Ok(quote!(Ok(::std::vec![#f(#input)?])))
+    Ok(gen_once(quote!(#f(#input))))
 }
 
 fn compile_range(
@@ -1249,35 +1420,57 @@ fn compile_range(
     input: &TokenStream,
     scope: &mut Vec<String>,
 ) -> CResult<TokenStream> {
-    let from_c = compile(from, input, scope)?;
-    let to_c = compile(to, input, scope)?;
+    // `from` -> `to` -> `step` nest outer-to-inner (`to` ends up embedded
+    // inside `from`'s own resultant `'static` closure, `step` inside
+    // `to`'s), so each deeper one is compiled against a fresh, local
+    // re-clone of the ambient input safe to use *from within* its
+    // enclosing level's closure, not `input` directly -- same reasoning
+    // as `compile_slice`'s `in_from`/`in_to`.
+    let from_c = compile_isolated(from, input, scope)?;
+    let (in_from_snap, in_from) = snapshot_scope(input, scope);
+    let to_c = compile_isolated(to, &in_from, scope)?;
     let to_f64 = core_path("value_to_f64");
     let range_values = core_path("range_values");
-    let bubble = core_path("bubble");
     let jresult_ty = core_path("JResult");
     let value_ty = core_path("Value");
     let to_body = match step {
         Some(s) => {
-            let step_c = compile(s, input, scope)?;
-            let step_body = quote! {
-                #bubble(__out, (|| -> #jresult_ty<::std::vec::Vec<#value_ty>> {
-                    Ok(#range_values(#to_f64(&__from)?, #to_f64(&__to)?, #to_f64(&__step)?))
-                })())?;
+            let (in_to_snap, in_to) = snapshot_scope(&in_from, scope);
+            let step_c = compile_isolated(s, &in_to, scope)?;
+            let compute = quote! {
+                (|| -> #jresult_ty<::std::vec::Vec<#value_ty>> {
+                    ::std::result::Result::Ok(#range_values(#to_f64(&__from)?, #to_f64(&__to)?, #to_f64(&__step)?))
+                })()
             };
-            let step_block = partial_aware_for(&step_c, &quote!(__step), step_body);
-            quote! { #bubble(__out, (#step_block))?; }
+            // `__from`/`__to` are *this* (`to`'s) closure's own captured
+            // fields (bound by the outer `from`/`to` closures, not this
+            // one's own parameter) -- re-clone them immediately before
+            // constructing `step`'s nested closure, so this closure's own
+            // copies are only ever borrowed, never moved, keeping it
+            // safely callable more than once -- same reasoning as
+            // `compile_isolated`, just for generator-bound `Value`s
+            // introduced by codegen itself rather than a jq variable.
+            let reclone_outer = quote! {
+                #[allow(unused_variables)]
+                let __from: #value_ty = __from.clone();
+                #[allow(unused_variables)]
+                let __to: #value_ty = __to.clone();
+            };
+            let wrapped = flat_map_for(&step_c, &quote!(__step), gen_from_vec(compute));
+            quote! { { #in_to_snap #reclone_outer #wrapped } }
         }
-        None => quote! {
-            #bubble(__out, (|| -> #jresult_ty<::std::vec::Vec<#value_ty>> {
-                Ok(#range_values(#to_f64(&__from)?, #to_f64(&__to)?, 1.0))
-            })())?;
-        },
+        None => {
+            let compute = quote! {
+                (|| -> #jresult_ty<::std::vec::Vec<#value_ty>> {
+                    ::std::result::Result::Ok(#range_values(#to_f64(&__from)?, #to_f64(&__to)?, 1.0))
+                })()
+            };
+            gen_from_vec(compute)
+        }
     };
-    let to_block = partial_aware_for(&to_c, &quote!(__to), to_body);
-    let from_body = quote! {
-        #bubble(__out, (#to_block))?;
-    };
-    Ok(partial_aware_for(&from_c, &quote!(__from), from_body))
+    let to_block = flat_map_for(&to_c, &quote!(__to), to_body);
+    let to_block = quote! { { #in_from_snap #to_block } };
+    Ok(flat_map_for(&from_c, &quote!(__from), to_block))
 }
 
 /// Shared shape for `sort_by`/`group_by`/`unique_by`/`min_by`/`max_by`:
@@ -1295,20 +1488,25 @@ fn compile_by(
     let value_ty = core_path("Value");
     let as_array = core_path("as_array");
     let helper = core_path(helper_name);
-    let key_c = compile(&args[0], &quote!(__item), scope)?;
+    let collect_gen = core_path("collect_gen");
+    // `__item` (the loop variable below) is a borrowed `&Value` tied to
+    // one loop iteration, not `'static` -- same reasoning as
+    // `compile_top`'s `__jqc_owned_input`: converted to an owned local,
+    // once per iteration, before `key_c` (whose compiled `JGen` must be
+    // `'static`) ever runs.
+    let key_c = compile(&args[0], &quote!(&__item_owned), scope)?;
     let result = if wrap_array {
-        quote!(Ok(::std::vec![#value_ty::Array(#helper(__items, __keys)?)]))
+        quote!(::std::result::Result::Ok(#value_ty::Array(#helper(__items, __keys)?)))
     } else {
-        quote!(Ok(::std::vec![#helper(__items, __keys)?]))
+        quote!(#helper(__items, __keys))
     };
-    Ok(quote! {
-        {
-            let __items = #as_array(#input)?.clone();
-            let mut __keys = ::std::vec::Vec::with_capacity(__items.len());
-            for __item in &__items {
-                __keys.push(#value_ty::Array((#key_c)?));
-            }
-            #result
+    Ok(gen_once_try(quote! {
+        let __items = #as_array(#input)?.clone();
+        let mut __keys = ::std::vec::Vec::with_capacity(__items.len());
+        for __item in &__items {
+            let __item_owned: #value_ty = __item.clone();
+            __keys.push(#value_ty::Array(#collect_gen(#key_c)?));
         }
-    })
+        #result
+    }))
 }
