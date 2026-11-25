@@ -9,11 +9,6 @@ git. Do these in whichever order makes the most sense.
 
 ## Tasks
 
-Audit the current usage of serde. Is it a good fit for the project? This project
-is only concerned with json data, so using a specialist crate might provide
-advantages. Futhermore, some of the default behaviour provided by serde may not
-be a good match for this project, making the code rough around the edges.
-
 Work on the known limitations. Fix any which can reasonably be fixed. Only
 remove this task once limitations that are genuine limitations of the project
 remain. If at any point new bugs are identified, they should be isolated with
