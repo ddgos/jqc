@@ -37,3 +37,12 @@ https://crates.io/crates?sort=downloads
 
 Consider using a different allocator as per
 https://docs.rs/simd-json/latest/simd_json/#allocator
+
+Allow the `import`/`include` feature to work (currently unimplemented --
+see README's "Not implemented" list). Since `jq!`'s filter is a compile-time
+literal, a module whose content isn't known until runtime can't be compiled
+statically the way everything else is. Consider implementing a way to
+import a *runtime* jq script instead -- have the generated process shell
+out to a real `jq` binary for that specific piece, rather than trying to
+compile it in -- to let users of jqc provide their own functionality at
+runtime despite jqc's otherwise compile-time-only model.
