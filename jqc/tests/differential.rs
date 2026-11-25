@@ -193,6 +193,45 @@ difftest!(
 );
 difftest!(type_builtin, "[.[] | type]", r#"[1,"a",null,true,[1],{}]"#);
 difftest!(add_builtin, "add", "[1,2,3]");
+difftest!(
+    add_object_values,
+    // `add`'s real jq definition (`reduce .[] as $x (null; . + $x)`)
+    // iterates object *values* the same as array elements -- a real bug
+    // found by fuzzing: jqc's `add` previously required `as_array`
+    // outright, erroring "object is not an array" on any object input.
+    "add",
+    r#"{"a":1,"b":2}"#
+);
+difftest!(add_empty_object, "add", "{}");
+difftest!(
+    sqrt_negative_is_null,
+    // Real jq's `sqrt(-1)` is `null`, not an error and not `0` -- a real
+    // bug found by fuzzing: `number_from_f64` fell back to the number
+    // `0` for any non-finite float (`Number::from_f64` rejects NaN/
+    // infinity, and the old fallback didn't distinguish "this must
+    // become `null`" from "just pick something"), silently producing a
+    // wrong numeric answer instead of jq's own null-for-NaN behavior.
+    "sqrt",
+    "-1"
+);
+difftest!(
+    arithmetic_overflow_to_infinity_clamps_to_f64_max,
+    // `1e308 * 10` overflows f64 arithmetic to +infinity -- real jq
+    // clamps that to `f64::MAX` on output (`1.7976931348623157e+308`),
+    // not literal `Infinity` (which JSON can't encode) and not `null`
+    // (unlike NaN) -- confirmed directly against real jq.
+    "[1e308 * 10, -1e308 * 10]",
+    "null"
+);
+difftest!(
+    tonumber_nan_and_infinity_strings,
+    // Same number_from_f64 fix as sqrt_negative_is_null/
+    // infinite_builtin_clamps_to_f64_max, reached through a different
+    // path: Rust's f64 parser accepts "nan"/"infinity" same as real jq's
+    // own number parser does.
+    r#"[("nan" | tonumber), ("infinity" | tonumber)]"#,
+    "null"
+);
 difftest!(reverse_array, "reverse", "[1,2,3]");
 difftest!(range_1, "[range(5)]", "null");
 difftest!(range_2, "[range(2;5)]", "null");
@@ -256,16 +295,19 @@ fn overflowing_number_literal_does_not_panic_codegen() {
     // `1e999999999` overflows f64 to infinity at lex time -- a bare
     // float literal can't spell that in generated Rust (`quote`'s
     // `ToTokens` for `f64` asserts `is_finite()`), so this used to panic
-    // macro expansion outright rather than merely producing output that
-    // disagrees with real jq (which keeps the literal's exact decimal
-    // text rather than evaluating it as a plain f64, printing it back as
-    // `1E+999999999` -- a real, accepted divergence given jqc's `Value`
-    // is a plain f64, not worth chasing; this test only guards against
-    // the crash, not a `jq`-equivalent result).
+    // macro expansion outright. `number_from_f64` clamps infinity to
+    // `f64::MAX` (matching real jq's own behavior for an *operation*
+    // that overflows, confirmed directly: `jq -n '1e308 * 10'` prints
+    // the same `1.7976931348623157e+308`) -- real jq's bare *literal*
+    // instead keeps the exact decimal text as typed, printing it back as
+    // `1E+999999999` verbatim, a real, accepted divergence given jqc's
+    // `Value` is a plain f64 with no literal-text side channel, not
+    // worth chasing; this test only guards against the crash, not a
+    // `jq`-equivalent result for the *literal* case specifically.
     let filter = jqc::jq!("1e999999999");
     let input = jqc::core::json!(null);
     let got = filter(&input).expect("should compile and run without panicking");
-    assert_eq!(got, vec![jqc::core::json!(0)]);
+    assert_eq!(got, vec![jqc::core::json!(f64::MAX)]);
 }
 difftest!(
     nested_def_shadows_outer_same_name_in_its_own_rest,

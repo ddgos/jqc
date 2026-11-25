@@ -21,7 +21,6 @@ theory be tested. Do not stop until both of these are true. Also test
 arbitrary bytes (not just arbitrary valid utf-8) as input -- piped data isn't
 guaranteed to be valid utf-8, so differences from real `jq` on invalid-utf-8
 input could currently be going unnoticed.
-Also test arbitrary input being given to an arbitrary script.
 
 Identify some area of the code that could be tidied up, and refactor as desired.
 An example of this would be seemingly duplicate functions for `fn run_real_jq`.

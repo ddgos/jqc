@@ -34,6 +34,8 @@
 //! syntax" rule above, fuzzer-breaking) undefined-variable compile error,
 //! not a `jqc` bug.
 
+mod common;
+
 use jqc::core::Value;
 use proptest::prelude::*;
 use proptest::strategy::ValueTree;
@@ -310,16 +312,14 @@ fn arb_body_maybe_call_f(depth: u32) -> impl Strategy<Value = (String, String)> 
     (def_body, rest)
 }
 
+/// Genuinely arbitrary input (`common::arb_json`), not a handful of fixed
+/// examples -- both axes of this fuzzer (script *and* input) are random
+/// now, not just the script with input along for the ride. Shares the
+/// same `a`/`b`/`c`/`active`/`score`/`items` key alphabet `arb_filter`'s
+/// leaves reference, so a generated filter indexing one of those actually
+/// hits real data some of the time instead of (almost) always missing.
 fn arb_input() -> impl Strategy<Value = Value> {
-    prop_oneof![
-        Just(Value::Null),
-        (-10i64..10).prop_map(|n| serde_json::json!(n)),
-        Just(serde_json::json!({"a": 1, "b": 2, "c": 3})),
-        Just(serde_json::json!({"a": [1, 2], "b": "x", "c": null})),
-        Just(serde_json::json!([1, 2, 3])),
-        Just(serde_json::json!("hello")),
-        Just(serde_json::json!({"a": "café", "b": "", "c": "a\nb\tc"})),
-    ]
+    common::arb_json(3)
 }
 
 struct Scratch {

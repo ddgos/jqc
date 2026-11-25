@@ -411,7 +411,6 @@ fn compile_raw(expr: &Expr, input: &TokenStream, scope: &mut Vec<String>) -> CRe
             ))
         }
         Expr::Number(n) => {
-            let value_ty = core_path("Value");
             let number_from_f64 = core_path("number_from_f64");
             // A bare float literal token can't represent a non-finite
             // value (`quote`'s `ToTokens` for `f64` asserts `is_finite()`
@@ -420,7 +419,11 @@ fn compile_raw(expr: &Expr, input: &TokenStream, scope: &mut Vec<String>) -> CRe
             // text and prints them back verbatim; jqc's `Value` is a
             // plain `f64`, so this is already a divergence, not a new
             // one) parses to `f64::INFINITY` and must be spelled as that
-            // expression instead of a literal.
+            // expression instead of a literal. `number_from_f64` itself
+            // now clamps that to `f64::MAX`/`NEG_INFINITY` to `f64::MIN`
+            // (matching real jq's own behavior for an *operation* that
+            // overflows, confirmed directly) rather than erroring or
+            // panicking on the non-finite value.
             let n_expr = if n.is_finite() {
                 quote!(#n)
             } else if n.is_nan() {
@@ -430,9 +433,9 @@ fn compile_raw(expr: &Expr, input: &TokenStream, scope: &mut Vec<String>) -> CRe
             } else {
                 quote!(::std::primitive::f64::NEG_INFINITY)
             };
-            Ok(gen_once(quote!(::std::result::Result::Ok(
-                #value_ty::Number(#number_from_f64(#n_expr))
-            ))))
+            Ok(gen_once(quote!(::std::result::Result::Ok(#number_from_f64(
+                #n_expr
+            )))))
         }
         Expr::Str(parts) => compile_str(parts, input, scope),
         Expr::Field {
@@ -1331,9 +1334,16 @@ fn compile_call(
             Ok(gen_once(quote!(#f(#input, false))))
         }
         ("add", 0) => {
-            let as_array = core_path("as_array");
+            // `add`'s real jq definition is `reduce .[] as $x (null; . +
+            // $x)` -- `.[]` iterates object *values* same as array
+            // elements, so `add` must too (confirmed directly: real jq's
+            // `add` on `{"a":1,"b":2}` gives `3`, same as `[1,2]`) --
+            // `as_array` would reject any object outright, including `{}`
+            // (whose correct answer, matching the empty-array case, is
+            // `null`, not an error).
+            let iterate = core_path("iterate");
             let f = core_path("add_all");
-            Ok(gen_once_try(quote!(#f(#as_array(#input)?))))
+            Ok(gen_once_try(quote!(#f(&#iterate(#input)?))))
         }
         ("reverse", 0) => {
             let f = core_path("reverse_value");

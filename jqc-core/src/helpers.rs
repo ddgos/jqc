@@ -55,11 +55,26 @@ fn num_f64(n: &Number) -> f64 {
 /// jq prints whole-number results without a decimal point (`6`, not
 /// `6.0`); `serde_json::Number::from_f64` always keeps float formatting, so
 /// every number produced by generated code is built through this instead.
-pub fn number_from_f64(f: f64) -> Number {
-    if f.is_finite() && f == f.trunc() && f.abs() < 1e18 {
-        Number::from(f as i64)
+///
+/// Also handles the two non-finite cases every f64-producing operation
+/// (arithmetic, `sqrt`/`floor`/`ceil`/…) can hit, matching real jq's own
+/// behavior exactly (confirmed directly against it, not just reasoned
+/// about): `NaN` becomes `null` (`sqrt(-1)` -> `null`, not a `0` -- JSON
+/// has no NaN to encode it as, and jq's own jv_number normalizes to a
+/// JSON `null` the same way rather than erroring), and +-infinity clamps
+/// to +-`f64::MAX` (`real jq's own `infinite`/`-infinite` builtins, and
+/// any arithmetic overflowing to it, print as `1.7976931348623157e+308`/
+/// its negation -- not literal `Infinity`, which also has no JSON
+/// encoding, and not `null` either, unlike `NaN`).
+pub fn number_from_f64(f: f64) -> Value {
+    if f.is_nan() {
+        Value::Null
+    } else if f.is_infinite() {
+        Value::Number(Number::from_f64(if f > 0.0 { f64::MAX } else { f64::MIN }).unwrap())
+    } else if f == f.trunc() && f.abs() < 1e18 {
+        Value::Number(Number::from(f as i64))
     } else {
-        Number::from_f64(f).unwrap_or_else(|| Number::from(0))
+        Value::Number(Number::from_f64(f).unwrap_or_else(|| Number::from(0)))
     }
 }
 
@@ -174,9 +189,7 @@ fn type_err(op: &str, lhs: &Value, rhs: &Value) -> JqError {
 pub fn add_values(lhs: Value, rhs: Value) -> JResult<Value> {
     Ok(match (lhs, rhs) {
         (Value::Null, x) | (x, Value::Null) => x,
-        (Value::Number(x), Value::Number(y)) => {
-            Value::Number(number_from_f64(num_f64(&x) + num_f64(&y)))
-        }
+        (Value::Number(x), Value::Number(y)) => number_from_f64(num_f64(&x) + num_f64(&y)),
         (Value::String(x), Value::String(y)) => Value::String(x + &y),
         (Value::Array(mut x), Value::Array(y)) => {
             x.extend(y);
@@ -194,9 +207,7 @@ pub fn add_values(lhs: Value, rhs: Value) -> JResult<Value> {
 
 pub fn sub_values(lhs: Value, rhs: Value) -> JResult<Value> {
     Ok(match (&lhs, &rhs) {
-        (Value::Number(x), Value::Number(y)) => {
-            Value::Number(number_from_f64(num_f64(x) - num_f64(y)))
-        }
+        (Value::Number(x), Value::Number(y)) => number_from_f64(num_f64(x) - num_f64(y)),
         (Value::Array(x), Value::Array(y)) => {
             Value::Array(x.iter().filter(|e| !y.contains(e)).cloned().collect())
         }
@@ -212,9 +223,7 @@ const MAX_STRING_REPEAT_BYTES: i64 = i32::MAX as i64;
 
 pub fn mul_values(lhs: Value, rhs: Value) -> JResult<Value> {
     Ok(match (&lhs, &rhs) {
-        (Value::Number(x), Value::Number(y)) => {
-            Value::Number(number_from_f64(num_f64(x) * num_f64(y)))
-        }
+        (Value::Number(x), Value::Number(y)) => number_from_f64(num_f64(x) * num_f64(y)),
         (Value::String(s), Value::Number(n)) | (Value::Number(n), Value::String(s)) => {
             let n = num_f64(n);
             // Real jq truncates (not floors) the count and treats negative
@@ -275,7 +284,7 @@ pub fn div_values(lhs: Value, rhs: Value) -> JResult<Value> {
                     "{lhs} and {rhs} cannot be divided because the divisor is zero"
                 )));
             }
-            Value::Number(number_from_f64(num_f64(x) / yv))
+            number_from_f64(num_f64(x) / yv)
         }
         (Value::String(x), Value::String(y)) => Value::Array(
             x.split(y.as_str())
@@ -304,7 +313,7 @@ pub fn mod_values(lhs: Value, rhs: Value) -> JResult<Value> {
 
 pub fn neg_value(v: Value) -> JResult<Value> {
     match v {
-        Value::Number(n) => Ok(Value::Number(number_from_f64(-num_f64(&n)))),
+        Value::Number(n) => Ok(number_from_f64(-num_f64(&n))),
         other => Err(JqError::msg(format!(
             "{} ({}) cannot be negated",
             type_name(&other),
@@ -414,7 +423,7 @@ pub fn length_of(v: &Value) -> JResult<Value> {
                 v
             )))
         }
-        Value::Number(n) => Value::Number(number_from_f64(num_f64(n).abs())),
+        Value::Number(n) => number_from_f64(num_f64(n).abs()),
         Value::String(s) => Value::Number(Number::from(s.chars().count() as i64)),
         Value::Array(a) => Value::Number(Number::from(a.len() as i64)),
         Value::Object(m) => Value::Number(Number::from(m.len() as i64)),
@@ -614,13 +623,13 @@ pub fn range_values(from: f64, to: f64, step: f64) -> Vec<Value> {
     if step > 0.0 {
         let mut x = from;
         while x < to {
-            out.push(Value::Number(number_from_f64(x)));
+            out.push(number_from_f64(x));
             x += step;
         }
     } else if step < 0.0 {
         let mut x = from;
         while x > to {
-            out.push(Value::Number(number_from_f64(x)));
+            out.push(number_from_f64(x));
             x += step;
         }
     }
@@ -939,7 +948,7 @@ pub fn to_number_value(v: &Value) -> JResult<Value> {
             .trim()
             .parse::<f64>()
             .ok()
-            .map(|f| Value::Number(number_from_f64(f)))
+            .map(number_from_f64)
             .ok_or_else(|| JqError::msg(format!("Cannot parse '{s}' as number"))),
         other => Err(JqError::msg(format!(
             "Cannot parse {} as number",
@@ -950,7 +959,7 @@ pub fn to_number_value(v: &Value) -> JResult<Value> {
 
 fn num_unary(v: &Value, f: impl Fn(f64) -> f64) -> JResult<Value> {
     match v {
-        Value::Number(n) => Ok(Value::Number(number_from_f64(f(num_f64(n))))),
+        Value::Number(n) => Ok(number_from_f64(f(num_f64(n)))),
         other => Err(JqError::msg(format!(
             "{} is not a number",
             type_name(other)
