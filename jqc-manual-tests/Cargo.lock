@@ -77,6 +77,7 @@ dependencies = [
  "jqc",
  "jqc-compiler",
  "jqc-manual-tests-macros",
+ "jqc-test-support",
  "serde_json",
 ]
 
@@ -90,6 +91,13 @@ dependencies = [
  "serde",
  "serde_yaml",
  "syn",
+]
+
+[[package]]
+name = "jqc-test-support"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
 ]
 
 [[package]]

@@ -402,6 +402,7 @@ dependencies = [
  "criterion",
  "jqc-core",
  "jqc-macros",
+ "jqc-test-support",
  "proptest",
  "serde_json",
 ]
@@ -458,6 +459,13 @@ dependencies = [
  "jqc-compiler",
  "proc-macro2",
  "syn 3.0.10",
+]
+
+[[package]]
+name = "jqc-test-support"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
 ]
 
 [[package]]

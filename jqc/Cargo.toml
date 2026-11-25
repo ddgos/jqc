@@ -13,6 +13,7 @@ jqc-macros = { path = "../jqc-macros", version = "0.1.0", default-features = fal
 serde_json = "1"
 proptest = "1"
 criterion = "0.8"
+jqc-test-support = { path = "../jqc-test-support", version = "0.1.0" }
 
 [features]
 default = ["jq-1-8", "codegen-simd"]

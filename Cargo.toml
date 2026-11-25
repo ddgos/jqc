@@ -7,6 +7,7 @@ members = [
     "jqc",
     "jqc-cli",
     "jqc-build",
+    "jqc-test-support",
     "examples",
 ]
 # jqc-manual-tests(-macros) and jqc-c-tests(-macros) need $JQ_SRC (a jq

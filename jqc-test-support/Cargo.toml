@@ -1,0 +1,10 @@
+[package]
+name = "jqc-test-support"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Shared differential-test helper (shells out to real jq) used by jqc's and jqc-manual-tests' test suites. Not meant to be depended on outside this repo."
+publish = false
+
+[dependencies]
+serde_json = "1"
