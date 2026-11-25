@@ -600,9 +600,17 @@ pub fn max_values(items: &[Value]) -> JResult<Value> {
     finish_structural(&too_deep, "Comparison too deep", result)
 }
 
-/// Matches real jq (1.8): `reverse` only accepts arrays and `null`, even
-/// though strings are "reversible" -- jq implements it as `[.[]] | ...`,
-/// which errors on indexing a string by number.
+/// Matches real jq (1.8): `reverse` is defined generically as
+/// `[.[length-1-range(0;length)]]` (`src/builtin.jq`), not specially for
+/// each type -- a genuinely surprising consequence, confirmed directly
+/// against real jq, is that this *succeeds* with `[]` for *any* input
+/// whose own `length` is `0`, not just an empty array: `0 | reverse`,
+/// `"" | reverse`, and `{} | reverse` all give `[]` too (`range(0; 0)` is
+/// empty, so the indexing step -- the only place a non-array could ever
+/// error -- never actually runs). Only a *non-zero*-length non-array
+/// (`5 | reverse`, `"ab" | reverse`, `{"a":1} | reverse`) hits the
+/// indexing-by-number error; a boolean errors instead via `length`
+/// itself, which doesn't accept one at all.
 pub fn reverse_value(v: &Value) -> JResult<Value> {
     match v {
         Value::Array(a) => {
@@ -611,6 +619,13 @@ pub fn reverse_value(v: &Value) -> JResult<Value> {
             Ok(Value::Array(a))
         }
         Value::Null => Ok(Value::Array(vec![])),
+        Value::String(s) if s.is_empty() => Ok(Value::Array(vec![])),
+        Value::Object(m) if m.is_empty() => Ok(Value::Array(vec![])),
+        Value::Number(n) if num_f64(n) == 0.0 => Ok(Value::Array(vec![])),
+        Value::Bool(_) => Err(JqError::msg(format!(
+            "{} ({v}) has no length",
+            type_name(v)
+        ))),
         other => Err(JqError::msg(format!(
             "Cannot index {} with number",
             type_name(other)

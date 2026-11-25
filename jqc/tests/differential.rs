@@ -271,6 +271,41 @@ fn nan_consumed_before_print_diverges_from_real_jq() {
     );
 }
 difftest!(reverse_array, "reverse", "[1,2,3]");
+difftest!(
+    reverse_empty_array,
+    // Real jq's `reverse` is defined generically as
+    // `[.[length-1-range(0;length)]]`, not specially per type -- a
+    // surprising consequence, confirmed directly against real jq and a
+    // real bug found by fuzzing: it *succeeds* with `[]` for *any* input
+    // whose own `length` is `0`, not just an empty array (`range(0; 0)`
+    // is empty, so the indexing step that would otherwise error on a
+    // non-array never runs). jqc's `reverse` previously special-cased
+    // only `Array`/`null`, erroring on every other type unconditionally
+    // -- including these zero-length ones that real jq actually accepts.
+    "reverse",
+    "[]"
+);
+difftest!(reverse_zero_number, "reverse", "0");
+difftest!(reverse_empty_string, "reverse", r#""""#);
+difftest!(reverse_empty_object, "reverse", "{}");
+
+#[test]
+fn reverse_nonzero_non_array_errors_like_real_jq() {
+    // Same generic-indexing-based `reverse` semantics as the zero-length
+    // cases above, the other side of it: a *non-zero*-length non-array
+    // hits the indexing-by-number error real jq's own definition would
+    // (confirmed directly: `5 | reverse`, `"ab" | reverse`, `{"a":1} |
+    // reverse` all error in real jq), and a boolean errors via `length`
+    // itself refusing one outright, same as real jq.
+    for input_json in ["5", r#""ab""#, r#"{"a":1}"#, "true"] {
+        let compiled = jqc::jq!("reverse");
+        let input: Value = serde_json::from_str(input_json).unwrap();
+        assert!(
+            compiled(&input).is_err(),
+            "reverse should error on {input_json}, matching real jq"
+        );
+    }
+}
 difftest!(range_1, "[range(5)]", "null");
 difftest!(range_2, "[range(2;5)]", "null");
 difftest!(range_3, "[range(0;10;3)]", "null");
