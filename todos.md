@@ -43,3 +43,12 @@ so that I can run `"$(nix build <flake> <script>)"` and it would run.
 
 Audit the existing code for situations where an external crate may allow for
 simplifying this project.
+The most downloaded crates will be good candidates
+https://crates.io/crates?sort=downloads
+
+Codegen backends should be enabled via feature flags. If a user is sure they
+want a certain backend then they shouldn't have to compile the code for other
+backends. This should be similar to the supported versions implementation.
+
+Consider using a different allocator as per
+https://docs.rs/simd-json/latest/simd_json/#allocator
